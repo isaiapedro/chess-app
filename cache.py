@@ -3,34 +3,42 @@ import hashlib
 import json
 import os
 import pathlib
-import time
 import requests
 
-# Ensure cache directory structure exists
 CACHE_BASE = pathlib.Path(".cache")
 CACHE_BASE.mkdir(exist_ok=True)
 
+EXPLORER_BASE = os.environ.get(
+    "LICHESS_EXPLORER_BASE", "https://explorer.lichess.org"
+)
+
+
+def _lichess_headers() -> dict:
+    headers = {
+        "User-Agent": "ChessWrappedDashboard/1.0 (contact: local-dev)",
+        "Accept": "application/json",
+    }
+    token = os.environ.get("LICHESS_TOKEN") or os.environ.get("LICHESS_API_TOKEN")
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
 
 def disk_cache(subdir: str):
-    """Decorator to cache API JSON responses locally in .cache/<subdir>/"""
-
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             cache_dir = CACHE_BASE / subdir
             cache_dir.mkdir(parents=True, exist_ok=True)
 
-            # Generate a unique MD5 hash for the function call parameters
             param_str = json.dumps({"args": args, "kwargs": kwargs}, sort_keys=True)
             param_hash = hashlib.md5(param_str.encode("utf-8")).hexdigest()
             cache_file = cache_dir / f"{param_hash}.json"
 
-            # Return cached version if exists
             if cache_file.exists():
                 with open(cache_file, "r", encoding="utf-8") as f:
                     return json.load(f)
 
-            # Otherwise execute API call and cache result
             result = func(*args, **kwargs)
             if result is not None:
                 with open(cache_file, "w", encoding="utf-8") as f:
@@ -42,42 +50,42 @@ def disk_cache(subdir: str):
     return decorator
 
 
-# --- COLD LAYER API FUNCTIONS ---
-
-
 @disk_cache("explorer_lichess")
 def get_lichess_stats(
     fen: str,
     speeds: str = "blitz,rapid",
     ratings: str = "1600,1800,2000",
 ):
-    """FF: Population move statistics (explorer.lichess.ovh/lichess)"""
-    url = "https://explorer.lichess.ovh/lichess"
+    url = f"{EXPLORER_BASE}/lichess"
     params = {"fen": fen, "speeds": speeds, "ratings": ratings}
-    res = requests.get(url, params=params)
+    res = requests.get(url, params=params, headers=_lichess_headers(), timeout=20)
     return res.json() if res.status_code == 200 else None
 
 
 @disk_cache("explorer_masters")
 def get_gm_games(fen: str):
-    """WC: GM Over-the-board database (explorer.lichess.ovh/masters)"""
-    url = "https://explorer.lichess.ovh/masters"
-    res = requests.get(url, params={"fen": fen})
+    url = f"{EXPLORER_BASE}/masters"
+    res = requests.get(
+        url, params={"fen": fen}, headers=_lichess_headers(), timeout=20
+    )
     return res.json() if res.status_code == 200 else None
 
 
 @disk_cache("explorer_player")
 def get_player_prep(username: str, color: str, fen: str):
-    """MO: Player Opening Preparation Explorer (explorer.lichess.ovh/player)"""
-    url = "https://explorer.lichess.ovh/player"
+    url = f"{EXPLORER_BASE}/player"
     params = {"player": username.lower(), "color": color, "fen": fen}
-    res = requests.get(url, params=params)
+    res = requests.get(url, params=params, headers=_lichess_headers(), timeout=20)
     return res.json() if res.status_code == 200 else None
 
 
 @disk_cache("cloud_eval")
 def get_position_eval(fen: str, multi_pv: int = 1):
-    """TL: Cloud Engine Position Insights (lichess.org/api/cloud-eval)"""
     url = "https://lichess.org/api/cloud-eval"
-    res = requests.get(url, params={"fen": fen, "multiPv": multi_pv})
+    res = requests.get(
+        url,
+        params={"fen": fen, "multiPv": multi_pv},
+        headers=_lichess_headers(),
+        timeout=20,
+    )
     return res.json() if res.status_code == 200 else None

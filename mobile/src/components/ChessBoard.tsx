@@ -1,0 +1,221 @@
+import React, { useMemo, useState } from "react";
+import {
+  LayoutChangeEvent,
+  Pressable,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { Chess, Square } from "chess.js";
+import { colors } from "../theme";
+
+const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
+const RANKS_WHITE = [8, 7, 6, 5, 4, 3, 2, 1] as const;
+const RANKS_BLACK = [1, 2, 3, 4, 5, 6, 7, 8] as const;
+
+const PIECE_GLYPH: Record<string, string> = {
+  wK: "♔",
+  wQ: "♕",
+  wR: "♖",
+  wB: "♗",
+  wN: "♘",
+  wP: "♙",
+  bK: "♚",
+  bQ: "♛",
+  bR: "♜",
+  bB: "♝",
+  bN: "♞",
+  bP: "♟",
+};
+
+type Props = {
+  fen: string;
+  orientation?: "white" | "black";
+  interactive?: boolean;
+  onMove?: (uci: string, san: string, fenAfter: string) => void;
+  highlightUci?: string | null;
+};
+
+function squareColor(fileIdx: number, rankIdx: number): string {
+  return (fileIdx + rankIdx) % 2 === 0 ? "#b58863" : "#f0d9b5";
+}
+
+export function ChessBoard({
+  fen,
+  orientation = "white",
+  interactive = true,
+  onMove,
+  highlightUci,
+}: Props) {
+  const [size, setSize] = useState(320);
+  const [selected, setSelected] = useState<Square | null>(null);
+
+  const chess = useMemo(() => {
+    try {
+      return new Chess(fen);
+    } catch {
+      return new Chess();
+    }
+  }, [fen]);
+
+  const ranks = orientation === "white" ? [...RANKS_WHITE] : [...RANKS_BLACK];
+  const files =
+    orientation === "white" ? [...FILES] : [...FILES].reverse();
+
+  const fromHi = highlightUci?.slice(0, 2) as Square | undefined;
+  const toHi = highlightUci?.slice(2, 4) as Square | undefined;
+
+  const onLayout = (e: LayoutChangeEvent) => {
+    const w = e.nativeEvent.layout.width;
+    if (w > 0) setSize(w);
+  };
+
+  const sqSize = size / 8;
+
+  const legalTargets = useMemo(() => {
+    if (!selected) return new Set<string>();
+    return new Set(
+      chess.moves({ square: selected, verbose: true }).map((m) => m.to)
+    );
+  }, [chess, selected]);
+
+  const handlePress = (sq: Square) => {
+    if (!interactive) return;
+    const piece = chess.get(sq);
+
+    if (!selected) {
+      if (piece && piece.color === chess.turn()) {
+        setSelected(sq);
+      }
+      return;
+    }
+
+    if (selected === sq) {
+      setSelected(null);
+      return;
+    }
+
+    if (piece && piece.color === chess.turn()) {
+      setSelected(sq);
+      return;
+    }
+
+    const trial = new Chess(fen);
+    try {
+      const result = trial.move({
+        from: selected,
+        to: sq,
+        promotion: "q",
+      });
+      if (result) {
+        const uci = `${result.from}${result.to}${result.promotion || ""}`;
+        onMove?.(uci, result.san, trial.fen());
+      }
+    } catch {
+      /* illegal */
+    }
+    setSelected(null);
+  };
+
+  return (
+    <View style={styles.wrap} onLayout={onLayout}>
+      <View style={[styles.board, { width: size, height: size }]}>
+        {ranks.map((rank, rankIdx) => (
+          <View key={`r${rank}`} style={styles.row}>
+            {files.map((file, fileIdx) => {
+              const sq = `${file}${rank}` as Square;
+              const piece = chess.get(sq);
+              const glyph = piece
+                ? PIECE_GLYPH[`${piece.color}${piece.type.toUpperCase()}`]
+                : "";
+              const isSel = selected === sq;
+              const isTarget = legalTargets.has(sq);
+              const isHi = sq === fromHi || sq === toHi;
+              return (
+                <Pressable
+                  key={sq}
+                  onPress={() => handlePress(sq)}
+                  style={[
+                    styles.square,
+                    {
+                      width: sqSize,
+                      height: sqSize,
+                      backgroundColor: squareColor(fileIdx, rankIdx),
+                    },
+                    isSel && styles.selected,
+                    isHi && styles.highlight,
+                  ]}
+                >
+                  {isTarget && !piece ? <View style={styles.dot} /> : null}
+                  {isTarget && piece ? (
+                    <View style={styles.captureRing} />
+                  ) : null}
+                  <Text
+                    style={[
+                      styles.piece,
+                      { fontSize: sqSize * 0.62 },
+                      piece?.color === "w" ? styles.whitePiece : styles.blackPiece,
+                    ]}
+                  >
+                    {glyph}
+                  </Text>
+                </Pressable>
+              );
+            })}
+          </View>
+        ))}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  wrap: {
+    width: "100%",
+    alignItems: "center",
+  },
+  board: {
+    borderWidth: 2,
+    borderColor: colors.border,
+    overflow: "hidden",
+  },
+  row: {
+    flexDirection: "row",
+  },
+  square: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  selected: {
+    borderWidth: 2,
+    borderColor: colors.accent,
+  },
+  highlight: {
+    backgroundColor: "#81b64c88",
+  },
+  piece: {
+    fontWeight: "600",
+  },
+  whitePiece: {
+    color: "#fff",
+    textShadowColor: "#000",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 2,
+  },
+  blackPiece: {
+    color: "#111",
+  },
+  dot: {
+    position: "absolute",
+    width: 12,
+    height: 12,
+    borderRadius: 6,
+    backgroundColor: "rgba(0,0,0,0.25)",
+  },
+  captureRing: {
+    ...StyleSheet.absoluteFillObject,
+    borderWidth: 3,
+    borderColor: "rgba(0,0,0,0.3)",
+    borderRadius: 4,
+  },
+});

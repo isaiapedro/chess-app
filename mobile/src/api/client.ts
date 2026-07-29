@@ -1,0 +1,188 @@
+import Constants from "expo-constants";
+import type {
+  Platform,
+  Timeframe,
+  RecapResponse,
+  InsightsResponse,
+} from "./types";
+
+function resolveApiBase(): string {
+  const fromEnv = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, "");
+  if (fromEnv) return fromEnv;
+
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
+  if (hostUri) {
+    return `http://${hostUri}`;
+  }
+  return "http://127.0.0.1:8081";
+}
+
+const API_BASE = resolveApiBase();
+
+export type QueryFilters = {
+  username: string;
+  platform: Platform;
+  timeframe: Timeframe;
+  speed?: string | null;
+  color?: "white" | "black" | null;
+  result?: "Win" | "Loss" | "Draw" | null;
+  dateFrom?: string | null;
+  dateTo?: string | null;
+};
+
+export type MistakeItem = {
+  game_id: string;
+  created_at: string;
+  opening_name?: string;
+  opening_eco?: string;
+  user_color: string;
+  result: string;
+  ply: number;
+  fen: string;
+  played_uci: string;
+  played_san: string;
+  best_uci: string | null;
+  best_san: string | null;
+  eval_before_cp: number;
+  eval_after_cp: number;
+  eval_drop_cp: number;
+  comment: string;
+};
+
+export type ExplorerMove = {
+  uci?: string;
+  san?: string;
+  white: number;
+  draws: number;
+  black: number;
+  averageRating?: number;
+};
+
+function buildParams(filters: QueryFilters): URLSearchParams {
+  const params = new URLSearchParams();
+  params.set("username", filters.username);
+  params.set("platform", filters.platform);
+  params.set("timeframe", filters.timeframe);
+  if (filters.speed) params.set("speed", filters.speed);
+  if (filters.color) params.set("color", filters.color);
+  if (filters.result) params.set("result", filters.result);
+  if (filters.dateFrom) params.set("date_from", filters.dateFrom);
+  if (filters.dateTo) params.set("date_to", filters.dateTo);
+  return params;
+}
+
+async function getJson<T>(path: string, params?: URLSearchParams): Promise<T> {
+  const qs = params?.toString();
+  const url = `${API_BASE}${path}${qs ? `?${qs}` : ""}`;
+  const res = await fetch(url);
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const body = await res.json();
+      detail = body.detail || JSON.stringify(body);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`${res.status}: ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    let detail = res.statusText;
+    try {
+      const data = await res.json();
+      detail = data.detail || JSON.stringify(data);
+    } catch {
+      /* ignore */
+    }
+    throw new Error(`${res.status}: ${detail}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+export function getApiBase(): string {
+  return API_BASE;
+}
+
+export async function fetchRecap(filters: QueryFilters): Promise<RecapResponse> {
+  return getJson<RecapResponse>("/api/v1/stats/recap", buildParams(filters));
+}
+
+export async function fetchInsights(
+  filters: QueryFilters
+): Promise<InsightsResponse> {
+  return getJson<InsightsResponse>(
+    "/api/v1/stats/insights",
+    buildParams(filters)
+  );
+}
+
+export async function fetchMistakes(
+  filters: QueryFilters,
+  limit = 5
+): Promise<{ meta: Record<string, unknown>; mistakes: MistakeItem[] }> {
+  const params = buildParams(filters);
+  params.set("limit", String(limit));
+  params.set("max_games", "3");
+  return getJson("/api/v1/study/mistakes", params);
+}
+
+export async function fetchEval(fen: string, multiPv = 3) {
+  const params = new URLSearchParams({
+    fen,
+    multi_pv: String(multiPv),
+  });
+  return getJson<{
+    fen: string;
+    best_uci: string | null;
+    best_san: string | null;
+    eval_cp_white: number | null;
+    pvs: unknown[];
+  }>("/api/v1/study/eval", params);
+}
+
+export async function fetchExplorer(
+  fen: string,
+  source: "lichess" | "masters" | "player" = "lichess",
+  username?: string,
+  color?: "white" | "black"
+) {
+  const params = new URLSearchParams({ fen, source });
+  if (username) params.set("username", username);
+  if (color) params.set("color", color);
+  return getJson<{
+    fen: string;
+    source: string;
+    moves: ExplorerMove[];
+    opening?: { eco?: string; name?: string };
+    white: number;
+    draws: number;
+    black: number;
+  }>("/api/v1/study/explorer", params);
+}
+
+export async function validateQuizMove(
+  fen: string,
+  userUci: string,
+  bestUci: string
+) {
+  return postJson<{
+    correct: boolean;
+    legal: boolean;
+    user_san: string | null;
+    accepted_as_top_line: boolean;
+  }>("/api/v1/study/quiz/validate", {
+    fen,
+    user_uci: userUci,
+    best_uci: bestUci,
+  });
+}
