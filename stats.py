@@ -1,13 +1,92 @@
 import io
+import re
 import chess
 import chess.pgn
 import pandas as pd
+from eco_names import build_eco_name_map, format_eco_label
 
 
-def normalize_opening_name(raw_name: str) -> str:
-    if not raw_name or raw_name == "Unknown":
-        return "Unknown"
-    return raw_name.split(":")[0].split(",")[0].strip()
+def normalize_opening_eco(raw_eco: str) -> str:
+    if not raw_eco or raw_eco == "UNK":
+        return "UNK"
+    return str(raw_eco).strip().upper()
+
+
+def parse_clk_to_seconds(clk: str) -> float:
+    parts = clk.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(clk)
+
+
+def parse_time_control(tc: str):
+    if not tc or "/" in str(tc):
+        return None, 0.0
+    tc = str(tc)
+    if "+" in tc:
+        base, inc = tc.split("+", 1)
+        try:
+            return float(base), float(inc)
+        except ValueError:
+            return None, 0.0
+    try:
+        return float(tc), 0.0
+    except ValueError:
+        return None, 0.0
+
+
+def extract_move_times_from_pgn(pgn_str: str, time_control: str, user_color: str):
+    if not pgn_str:
+        return None
+    base, inc = parse_time_control(time_control)
+    if base is None:
+        tc_match = re.search(r'\[TimeControl "([^"]+)"\]', pgn_str)
+        if tc_match:
+            base, inc = parse_time_control(tc_match.group(1))
+    if base is None:
+        return None
+
+    tags = re.findall(r"\{\[%clk ([^\]]+)\]\}", pgn_str)
+    if len(tags) < 2:
+        return None
+
+    try:
+        rem_times = [parse_clk_to_seconds(t) for t in tags]
+    except ValueError:
+        return None
+
+    white_times = []
+    black_times = []
+    prev_w = base
+    prev_b = base
+    for i, rem in enumerate(rem_times):
+        if i % 2 == 0:
+            think = prev_w - rem + inc
+            white_times.append(max(think, 0.0))
+            prev_w = rem
+        else:
+            think = prev_b - rem + inc
+            black_times.append(max(think, 0.0))
+            prev_b = rem
+
+    if user_color == "white":
+        user_times, opp_times = white_times, black_times
+    else:
+        user_times, opp_times = black_times, white_times
+
+    if not user_times or not opp_times:
+        return None
+
+    return {
+        "user_avg": sum(user_times) / len(user_times),
+        "opp_avg": sum(opp_times) / len(opp_times),
+        "user_longest": max(user_times),
+        "opp_longest": max(opp_times),
+        "user_moves": len(user_times),
+        "opp_moves": len(opp_times),
+    }
 
 
 # --- BULLET 1: HEADLINE STATS ---
@@ -79,20 +158,25 @@ def calculate_opening_stats(df: pd.DataFrame, min_games: int = 3) -> dict:
         return {}
 
     df = df.copy()
-    df["opening_family"] = df["opening_name"].apply(normalize_opening_name)
+    df["opening_eco"] = df["opening_eco"].apply(normalize_opening_eco)
+    df["opening_variation"] = df["opening_name"].fillna("Unknown")
 
     white_df = df[df["user_color"] == "white"]
     black_df = df[df["user_color"] == "black"]
 
-    sig_white = (
-        white_df["opening_family"].mode()[0] if not white_df.empty else "N/A"
-    )
-    sig_black = (
-        black_df["opening_family"].mode()[0] if not black_df.empty else "N/A"
-    )
+    eco_map = build_eco_name_map(df)
 
-    op_group = (
-        df.groupby("opening_family")
+    sig_white_eco = (
+        white_df["opening_eco"].mode()[0] if not white_df.empty else "N/A"
+    )
+    sig_black_eco = (
+        black_df["opening_eco"].mode()[0] if not black_df.empty else "N/A"
+    )
+    sig_white = format_eco_label(sig_white_eco, eco_map)
+    sig_black = format_eco_label(sig_black_eco, eco_map)
+
+    eco_group = (
+        df.groupby("opening_eco")
         .agg(
             total=("id", "count"),
             wins=("result", lambda x: (x == "Win").sum()),
@@ -101,23 +185,42 @@ def calculate_opening_stats(df: pd.DataFrame, min_games: int = 3) -> dict:
         )
         .reset_index()
     )
+    eco_group["win_rate"] = (eco_group["wins"] / eco_group["total"]) * 100
+    eco_group["eco_label"] = eco_group["opening_eco"].map(
+        lambda eco: format_eco_label(eco, eco_map)
+    )
 
-    op_group["win_rate"] = (op_group["wins"] / op_group["total"]) * 100
-    filtered_ops = op_group[op_group["total"] >= min_games]
+    var_group = (
+        df.groupby("opening_variation")
+        .agg(
+            total=("id", "count"),
+            wins=("result", lambda x: (x == "Win").sum()),
+            losses=("result", lambda x: (x == "Loss").sum()),
+            draws=("result", lambda x: (x == "Draw").sum()),
+        )
+        .reset_index()
+    )
+    var_group["win_rate"] = (var_group["wins"] / var_group["total"]) * 100
+    filtered_vars = var_group[var_group["total"] >= min_games]
 
-    if not filtered_ops.empty:
-        best_op_row = filtered_ops.sort_values(
+    if not filtered_vars.empty:
+        best_var = filtered_vars.sort_values(
             "win_rate", ascending=False
         ).iloc[0]
-        worst_op_row = filtered_ops.sort_values(
+        worst_var = filtered_vars.sort_values(
             "win_rate", ascending=True
         ).iloc[0]
-
-        secret_weapon = f"{best_op_row['opening_family']} ({best_op_row['win_rate']:.0f}% win | {best_op_row['total']}g)"
-        nemesis = f"{worst_op_row['opening_family']} ({worst_op_row['win_rate']:.0f}% win | {worst_op_row['total']}g)"
+        secret_weapon = (
+            f"{best_var['opening_variation']} "
+            f"({best_var['win_rate']:.0f}% win | {best_var['total']}g)"
+        )
+        nemesis = (
+            f"{worst_var['opening_variation']} "
+            f"({worst_var['win_rate']:.0f}% win | {worst_var['total']}g)"
+        )
     else:
-        secret_weapon = "Need min 3 games"
-        nemesis = "Need min 3 games"
+        secret_weapon = f"Need min {min_games} games"
+        nemesis = f"Need min {min_games} games"
 
     gambit_mask = df["opening_name"].str.contains(
         "gambit", case=False, na=False
@@ -134,11 +237,113 @@ def calculate_opening_stats(df: pd.DataFrame, min_games: int = 3) -> dict:
     return {
         "sig_white": sig_white,
         "sig_black": sig_black,
+        "sig_white_eco": sig_white_eco,
+        "sig_black_eco": sig_black_eco,
         "secret_weapon": secret_weapon,
         "nemesis": nemesis,
         "total_gambits": total_gambits,
         "gambit_win_rate": round(gambit_win_rate, 1),
-        "op_group": op_group,
+        "op_group": eco_group,
+        "var_group": var_group,
+        "eco_map": eco_map,
+    }
+
+
+def calculate_clock_stats(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {}
+
+    user_timeouts = int(
+        (df["termination"].astype(str).str.lower() == "timeout").sum()
+    )
+    opp_timeouts = 0
+    if "opp_termination" in df.columns:
+        opp_timeouts = int(
+            (df["opp_termination"].astype(str).str.lower() == "timeout").sum()
+        )
+
+    user_avgs = []
+    opp_avgs = []
+    user_longests = []
+    opp_longests = []
+    clock_rows = []
+
+    for _, row in df.iterrows():
+        parsed = extract_move_times_from_pgn(
+            row.get("pgn_str", ""),
+            row.get("time_control", ""),
+            row.get("user_color", "white"),
+        )
+        if not parsed:
+            continue
+        user_avgs.append(parsed["user_avg"])
+        opp_avgs.append(parsed["opp_avg"])
+        user_longests.append(parsed["user_longest"])
+        opp_longests.append(parsed["opp_longest"])
+        clock_rows.append(
+            {
+                "result": row.get("result"),
+                "user_avg": parsed["user_avg"],
+                "opp_avg": parsed["opp_avg"],
+                "user_longest": parsed["user_longest"],
+                "opp_longest": parsed["opp_longest"],
+                "user_timeout": str(row.get("termination", "")).lower()
+                == "timeout",
+                "opp_timeout": str(row.get("opp_termination", "")).lower()
+                == "timeout",
+            }
+        )
+
+    clock_df = pd.DataFrame(clock_rows) if clock_rows else pd.DataFrame()
+    games_with_clock = len(clock_rows)
+
+    def _mean(vals):
+        return round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    def _wr_from_df(subset):
+        if subset is None or subset.empty:
+            return 0.0
+        return round(float((subset["result"] == "Win").mean() * 100), 1)
+
+    user_to_mask = df["termination"].astype(str).str.lower() == "timeout"
+    if "opp_termination" in df.columns:
+        opp_to_mask = (
+            df["opp_termination"].astype(str).str.lower() == "timeout"
+        )
+        timeout_decided = df[user_to_mask | opp_to_mask]
+        won_on_time_wr = _wr_from_df(df[opp_to_mask])
+        lost_on_time_wr = _wr_from_df(df[user_to_mask])
+    else:
+        timeout_decided = df[user_to_mask]
+        won_on_time_wr = 0.0
+        lost_on_time_wr = _wr_from_df(timeout_decided)
+
+    slower_avg_wr = 0.0
+    longer_think_wr = 0.0
+    if not clock_df.empty:
+        slower_avg_wr = _wr_from_df(
+            clock_df[clock_df["user_avg"] > clock_df["opp_avg"]]
+        )
+        longer_think_wr = _wr_from_df(
+            clock_df[clock_df["user_longest"] > clock_df["opp_longest"]]
+        )
+
+    timeout_decided_wr = _wr_from_df(timeout_decided)
+
+    return {
+        "user_timeouts": user_timeouts,
+        "opp_timeouts": opp_timeouts,
+        "timeout_decided_games": len(timeout_decided),
+        "timeout_decided_wr": timeout_decided_wr,
+        "games_with_clock": games_with_clock,
+        "avg_time_per_move_user": _mean(user_avgs),
+        "avg_time_per_move_opp": _mean(opp_avgs),
+        "avg_longest_move_user": _mean(user_longests),
+        "avg_longest_move_opp": _mean(opp_longests),
+        "won_on_time_wr": won_on_time_wr,
+        "lost_on_time_wr": lost_on_time_wr,
+        "slower_avg_wr": slower_avg_wr,
+        "longer_think_wr": longer_think_wr,
     }
 
 

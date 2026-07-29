@@ -7,8 +7,9 @@ from stats import (
     calculate_headline_stats,
     calculate_notation_stats,
     calculate_opening_stats,
-    normalize_opening_name,
+    normalize_opening_eco,
 )
+from eco_names import format_eco_label
 
 # Apply dark theme style
 sns.set_theme(style="darkgrid")
@@ -25,7 +26,7 @@ def render_dashboard(
         return
 
     df = df.copy()
-    df["opening_family"] = df["opening_name"].apply(normalize_opening_name)
+    df["opening_eco"] = df["opening_eco"].apply(normalize_opening_eco)
 
     # Calculate statistics across all features
     headline = calculate_headline_stats(df)
@@ -203,39 +204,51 @@ def render_dashboard(
     # ROW 3: OPENING PERFORMANCE
     # ==========================================
 
-    # Panel 2,0: Top Opening Families
-    top_families = df["opening_family"].value_counts().head(5).index
-    df_top_fam = df[df["opening_family"].isin(top_families)]
+    # Panel 2,0: Top ECO Openings
+    eco_map = opening.get("eco_map", {})
+    top_ecos = df["opening_eco"].value_counts().head(5).index
+    df_top_eco = df[df["opening_eco"].isin(top_ecos)].copy()
+    df_top_eco["eco_label"] = df_top_eco["opening_eco"].map(
+        lambda eco: format_eco_label(eco, eco_map)
+    )
+    label_order = [format_eco_label(eco, eco_map) for eco in top_ecos]
     sns.countplot(
-        data=df_top_fam,
-        y="opening_family",
+        data=df_top_eco,
+        y="eco_label",
         hue="result",
         ax=axes[2, 0],
-        order=top_families,
+        order=label_order,
     )
     axes[2, 0].set_title(
-        "Top 5 Opening Families Played", fontweight="bold", fontsize=14
+        "Top 5 ECO Openings Played", fontweight="bold", fontsize=14
     )
     axes[2, 0].set_ylabel("")
     axes[2, 0].set_xlabel("Games Count")
 
-    # Panel 2,1: Highest Win-Rate Openings
+    # Panel 2,1: Highest Win-Rate ECO Openings
     op_group = opening["op_group"]
     filtered_ops = op_group[op_group["total"] >= 3].sort_values(
         "win_rate", ascending=False
     )
     if not filtered_ops.empty:
+        plot_ops = filtered_ops.head(5).copy()
+        if "eco_label" not in plot_ops.columns:
+            plot_ops["eco_label"] = plot_ops["opening_eco"].map(
+                lambda eco: format_eco_label(eco, eco_map)
+            )
         sns.barplot(
-            data=filtered_ops.head(5),
+            data=plot_ops,
             x="win_rate",
-            y="opening_family",
-            hue="opening_family",
+            y="eco_label",
+            hue="eco_label",
             legend=False,
             ax=axes[2, 1],
             palette="Greens_r",
         )
     axes[2, 1].set_title(
-        "Highest Win-Rate Openings (Min 3 games)", fontweight="bold", fontsize=14
+        "Highest Win-Rate ECO Openings (Min 3 games)",
+        fontweight="bold",
+        fontsize=14,
     )
     axes[2, 1].set_xlim(0, 100)
     axes[2, 1].set_xlabel("Win Rate (%)")

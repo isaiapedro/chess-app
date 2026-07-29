@@ -124,6 +124,26 @@ def _parse_lichess_games(raw_games: list, username: str) -> pd.DataFrame:
         opening_info = g.get("opening", {})
         moves_str = g.get("moves", "")
         move_count = len(moves_str.split()) // 2 if moves_str else 30
+        opp_color = "black" if user_color == "white" else "white"
+        status = g.get("status", "normal")
+        user_term = status
+        opp_term = status
+        if status == "timeout":
+            if winner == user_color:
+                user_term = "win"
+                opp_term = "timeout"
+            elif winner == opp_color:
+                user_term = "timeout"
+                opp_term = "win"
+
+        clock = g.get("clock") or {}
+        initial_ms = clock.get("initial")
+        if initial_ms is not None:
+            time_control = (
+                f"{int(initial_ms) // 1000}+{int(clock.get('increment', 0)) // 1000}"
+            )
+        else:
+            time_control = ""
 
         parsed.append(
             {
@@ -137,7 +157,7 @@ def _parse_lichess_games(raw_games: list, username: str) -> pd.DataFrame:
                 .get(user_color, {})
                 .get("rating"),
                 "opp_rating": g.get("players", {})
-                .get("black" if user_color == "white" else "white", {})
+                .get(opp_color, {})
                 .get("rating"),
                 "result": result,
                 "opening_name": opening_info.get("name", "Unknown"),
@@ -145,7 +165,9 @@ def _parse_lichess_games(raw_games: list, username: str) -> pd.DataFrame:
                 "move_count": max(move_count, 1),
                 "moves_str": moves_str,
                 "pgn_str": "",
-                "termination": g.get("status", "normal").title(),
+                "time_control": time_control,
+                "termination": str(user_term).title(),
+                "opp_termination": str(opp_term).title(),
             }
         )
     return pd.DataFrame(parsed)
@@ -179,17 +201,23 @@ def _parse_chesscom_games(raw_games: list, username: str) -> pd.DataFrame:
         else:
             result = "Loss"
 
+        pgn_str = g.get("pgn", "")
+        eco_match = re.search(r'\[ECO "([^"]+)"\]', pgn_str)
+        opening_eco = eco_match.group(1) if eco_match else "UNK"
+
         eco_url = g.get("eco", "")
+        if not eco_url:
+            eco_url_match = re.search(r'\[ECOUrl "([^"]+)"\]', pgn_str)
+            eco_url = eco_url_match.group(1) if eco_url_match else ""
         if eco_url:
             raw_opening = eco_url.split("/")[-1].replace("-", " ")
             opening_name = re.sub(r"\d+$", "", raw_opening).strip()
         else:
             opening_name = "Unknown"
 
-        pgn_str = g.get("pgn", "")
-        # Extract move count from PGN text if present
         move_matches = re.findall(r"\d+\.\s", pgn_str)
         move_count = len(move_matches) if move_matches else 35
+        opp_result = opp_data.get("result", "")
 
         parsed.append(
             {
@@ -201,11 +229,13 @@ def _parse_chesscom_games(raw_games: list, username: str) -> pd.DataFrame:
                 "opp_rating": opp_data.get("rating"),
                 "result": result,
                 "opening_name": opening_name,
-                "opening_eco": "UNK",
+                "opening_eco": opening_eco,
                 "move_count": max(move_count, 1),
                 "moves_str": "",
                 "pgn_str": pgn_str,
+                "time_control": g.get("time_control", ""),
                 "termination": user_result.title() if user_result else "Normal",
+                "opp_termination": opp_result.title() if opp_result else "Normal",
             }
         )
     return pd.DataFrame(parsed)
