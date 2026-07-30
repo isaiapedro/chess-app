@@ -5,7 +5,8 @@ import os
 import pathlib
 import requests
 
-CACHE_BASE = pathlib.Path(".cache")
+PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+CACHE_BASE = PROJECT_ROOT / ".cache"
 CACHE_BASE.mkdir(exist_ok=True)
 
 EXPLORER_BASE = os.environ.get(

@@ -18,7 +18,10 @@ streamlit run app.py
 
 ## FastAPI (Phase 1 backend)
 
+Run from the repository root (not from `mobile/`), otherwise `api` is not importable:
+
 ```bash
+cd /path/to/chess
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
@@ -58,15 +61,17 @@ API port `8000` may be blocked on LAN by the host firewall while Metro `8081` st
 Metro proxies `/api/*` and `/health` → `http://127.0.0.1:8000`. Point the app at Metro:
 
 ```bash
-# terminal 1 — API
+# terminal 1 — API (from repo root)
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 
-# terminal 2 — Expo (use :8081, not :8000)
+# terminal 2 — Expo
 cd mobile
-EXPO_PUBLIC_API_URL=http://192.168.1.9:8081 npx expo start -c
+npx expo start -c
 ```
 
-If `EXPO_PUBLIC_API_URL` unset, app derives base from Expo `hostUri` (Metro).
+Leave `EXPO_PUBLIC_API_URL` unset: the app derives its base URL from Expo `hostUri`, so it
+follows Metro even when the machine's LAN IP changes. Only set it to override, and always
+use Metro's port `8081` (never `:8000`, which is blocked on LAN by the host firewall).
 
 Optional: open firewall instead — `sudo ufw allow 8000/tcp` — then you can hit `:8000` directly.
 
