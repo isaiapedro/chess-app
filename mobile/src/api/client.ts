@@ -5,6 +5,7 @@ import type {
   RecapResponse,
   InsightsResponse,
 } from "./types";
+import { readThroughCache } from "../storage/cache";
 
 function resolveApiBase(): string {
   const fromEnv = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, "");
@@ -73,21 +74,35 @@ function buildParams(filters: QueryFilters): URLSearchParams {
   return params;
 }
 
-async function getJson<T>(path: string, params?: URLSearchParams): Promise<T> {
+async function getJson<T>(
+  path: string,
+  params?: URLSearchParams,
+  forceNetwork = false
+): Promise<T> {
   const qs = params?.toString();
   const url = `${API_BASE}${path}${qs ? `?${qs}` : ""}`;
-  const res = await fetch(url);
-  if (!res.ok) {
-    let detail = res.statusText;
-    try {
-      const body = await res.json();
-      detail = body.detail || JSON.stringify(body);
-    } catch {
-      /* ignore */
+  const cacheKey = `${path}${qs ? `?${qs}` : ""}`;
+  return readThroughCache<T>(
+    cacheKey,
+    async () => {
+      const res = await fetch(url);
+      if (!res.ok) {
+        let detail = res.statusText;
+        try {
+          const body = await res.json();
+          detail = body.detail || JSON.stringify(body);
+        } catch {
+          detail = res.statusText;
+        }
+        throw new Error(`${res.status}: ${detail}`);
+      }
+      return res.json() as Promise<T>;
+    },
+    {
+      forceNetwork,
+      ttlMs: path.includes("/games/") ? 60 * 60 * 1000 : 15 * 60 * 1000,
     }
-    throw new Error(`${res.status}: ${detail}`);
-  }
-  return res.json() as Promise<T>;
+  );
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
@@ -113,16 +128,38 @@ export function getApiBase(): string {
   return API_BASE;
 }
 
-export async function fetchRecap(filters: QueryFilters): Promise<RecapResponse> {
-  return getJson<RecapResponse>("/api/v1/stats/recap", buildParams(filters));
+export async function fetchRecap(
+  filters: QueryFilters,
+  forceNetwork = false
+): Promise<RecapResponse> {
+  return getJson<RecapResponse>(
+    "/api/v1/stats/recap",
+    buildParams(filters),
+    forceNetwork
+  );
 }
 
 export async function fetchInsights(
-  filters: QueryFilters
+  filters: QueryFilters,
+  forceNetwork = false
 ): Promise<InsightsResponse> {
   return getJson<InsightsResponse>(
     "/api/v1/stats/insights",
-    buildParams(filters)
+    buildParams(filters),
+    forceNetwork
+  );
+}
+
+export async function fetchGames(
+  filters: QueryFilters,
+  forceNetwork = false
+): Promise<{ count: number; games: Array<Record<string, unknown>> }> {
+  const params = buildParams(filters);
+  params.delete("username");
+  return getJson(
+    `/api/v1/games/${encodeURIComponent(filters.username)}`,
+    params,
+    forceNetwork
   );
 }
 

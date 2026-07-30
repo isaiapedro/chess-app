@@ -7,8 +7,9 @@ import {
   Text,
   View,
 } from "react-native";
-import { fetchRecap } from "../api/client";
+import { fetchGames, fetchRecap } from "../api/client";
 import type { RecapResponse } from "../api/types";
+import { RatingChart } from "../components/AnalyticsCharts";
 import { BadgeCard, ComparisonCard, MetricCard } from "../components/RecapCards";
 import { useFilters } from "../context/FilterContext";
 import { colors, spacing } from "../theme";
@@ -19,12 +20,13 @@ export function RecapScreen() {
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (forceNetwork = false) => {
     setLoading(true);
     setError(null);
     try {
-      const res = await fetchRecap(queryFilters);
+      const res = await fetchRecap(queryFilters, forceNetwork);
       setData(res);
+      fetchGames(queryFilters, forceNetwork).catch(() => undefined);
     } catch (e) {
       setData(null);
       setError(e instanceof Error ? e.message : "Failed to load recap");
@@ -76,7 +78,7 @@ export function RecapScreen() {
       refreshControl={
         <RefreshControl
           refreshing={loading}
-          onRefresh={load}
+          onRefresh={() => load(true)}
           tintColor={colors.accent}
         />
       }
@@ -85,6 +87,9 @@ export function RecapScreen() {
       <Text style={styles.sub}>
         {data?.meta.username} · {data?.meta.platform} · {games} games
       </Text>
+      <View style={styles.cacheBadge}>
+        <Text style={styles.cacheBadgeText}>Offline cache enabled</Text>
+      </View>
 
       <View style={styles.grid}>
         <MetricCard
@@ -118,6 +123,9 @@ export function RecapScreen() {
           }
         />
       </View>
+
+      <Text style={styles.section}>Performance</Text>
+      <RatingChart points={ratingSeries} />
 
       <Text style={styles.section}>Real-world equivalents</Text>
       <View style={styles.comparisons}>
@@ -175,8 +183,21 @@ const styles = StyleSheet.create({
   },
   sub: {
     color: colors.textMuted,
-    marginBottom: spacing.md,
     marginTop: 4,
+  },
+  cacheBadge: {
+    alignSelf: "flex-start",
+    backgroundColor: colors.accentDim,
+    borderRadius: 12,
+    marginBottom: spacing.md,
+    marginTop: spacing.sm,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+  },
+  cacheBadgeText: {
+    color: colors.accent,
+    fontSize: 11,
+    fontWeight: "600",
   },
   section: {
     color: colors.text,

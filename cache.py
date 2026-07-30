@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import pathlib
+import time
 import requests
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
@@ -12,6 +13,30 @@ CACHE_BASE.mkdir(exist_ok=True)
 EXPLORER_BASE = os.environ.get(
     "LICHESS_EXPLORER_BASE", "https://explorer.lichess.org"
 )
+
+REQUEST_TIMEOUT = 10
+
+
+# region agent log
+def _dbg(payload: dict) -> None:
+    try:
+        log_dir = PROJECT_ROOT / ".cursor"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_dir / "debug-6840b8.log", "a", encoding="utf-8") as handle:
+            handle.write(
+                json.dumps(
+                    {
+                        "sessionId": "6840b8",
+                        "runId": "post-fix",
+                        "timestamp": int(time.time() * 1000),
+                        **payload,
+                    }
+                )
+                + "\n"
+            )
+    except Exception:
+        pass
+# endregion
 
 
 def _lichess_headers() -> dict:
@@ -23,6 +48,57 @@ def _lichess_headers() -> dict:
     if token:
         headers["Authorization"] = f"Bearer {token}"
     return headers
+
+
+def lichess_get(url: str, params: dict, label: str):
+    """GET JSON from Lichess, returning None on any transport or HTTP error."""
+    started = time.monotonic()
+    try:
+        res = requests.get(
+            url,
+            params=params,
+            headers=_lichess_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException as exc:
+        # region agent log
+        _dbg(
+            {
+                "hypothesisId": "H2",
+                "location": "cache.py:lichess_get",
+                "message": "lichess request raised",
+                "data": {
+                    "label": label,
+                    "error": type(exc).__name__,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                },
+            }
+        )
+        # endregion
+        return None
+
+    # region agent log
+    _dbg(
+        {
+            "hypothesisId": "H1",
+            "location": "cache.py:lichess_get",
+            "message": "lichess response",
+            "data": {
+                "label": label,
+                "status": res.status_code,
+                "elapsed_ms": int((time.monotonic() - started) * 1000),
+                "retry_after": res.headers.get("Retry-After"),
+            },
+        }
+    )
+    # endregion
+
+    if res.status_code != 200:
+        return None
+    try:
+        return res.json()
+    except ValueError:
+        return None
 
 
 def disk_cache(subdir: str):
@@ -59,34 +135,23 @@ def get_lichess_stats(
 ):
     url = f"{EXPLORER_BASE}/lichess"
     params = {"fen": fen, "speeds": speeds, "ratings": ratings}
-    res = requests.get(url, params=params, headers=_lichess_headers(), timeout=20)
-    return res.json() if res.status_code == 200 else None
+    return lichess_get(url, params, "explorer_lichess")
 
 
 @disk_cache("explorer_masters")
 def get_gm_games(fen: str):
     url = f"{EXPLORER_BASE}/masters"
-    res = requests.get(
-        url, params={"fen": fen}, headers=_lichess_headers(), timeout=20
-    )
-    return res.json() if res.status_code == 200 else None
+    return lichess_get(url, {"fen": fen}, "explorer_masters")
 
 
 @disk_cache("explorer_player")
 def get_player_prep(username: str, color: str, fen: str):
     url = f"{EXPLORER_BASE}/player"
     params = {"player": username.lower(), "color": color, "fen": fen}
-    res = requests.get(url, params=params, headers=_lichess_headers(), timeout=20)
-    return res.json() if res.status_code == 200 else None
+    return lichess_get(url, params, "explorer_player")
 
 
 @disk_cache("cloud_eval")
 def get_position_eval(fen: str, multi_pv: int = 1):
     url = "https://lichess.org/api/cloud-eval"
-    res = requests.get(
-        url,
-        params={"fen": fen, "multiPv": multi_pv},
-        headers=_lichess_headers(),
-        timeout=20,
-    )
-    return res.json() if res.status_code == 200 else None
+    return lichess_get(url, {"fen": fen, "multiPv": multi_pv}, "cloud_eval")

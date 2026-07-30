@@ -7,6 +7,7 @@ import pandas as pd
 from fastapi import HTTPException
 
 from cache import (
+    _dbg,
     get_gm_games,
     get_lichess_stats,
     get_player_prep,
@@ -15,6 +16,7 @@ from cache import (
 
 
 START_FEN = chess.STARTING_FEN
+MAX_CONSECUTIVE_EVAL_FAILURES = 6
 
 
 def _score_cp(pvs: list, side_to_move_white: bool) -> Optional[float]:
@@ -205,8 +207,13 @@ def find_critical_mistakes(
     )
 
     found: list[dict] = []
+    eval_calls = 0
+    consecutive_failures = 0
+    aborted = False
 
     for _, row in candidates.iterrows():
+        if aborted:
+            break
         moves = _iter_game_moves(row)
         if len(moves) < 6:
             continue
@@ -230,16 +237,28 @@ def find_critical_mistakes(
             played_uci = move.uci()
 
             try:
+                eval_calls += 1
                 before = eval_position(fen_before, multi_pv=1)
+                consecutive_failures = 0
             except HTTPException:
+                consecutive_failures += 1
                 board.push(move)
+                if consecutive_failures >= MAX_CONSECUTIVE_EVAL_FAILURES:
+                    aborted = True
+                    break
                 continue
 
             board.push(move)
             fen_after = board.fen()
             try:
+                eval_calls += 1
                 after = eval_position(fen_after, multi_pv=1)
+                consecutive_failures = 0
             except HTTPException:
+                consecutive_failures += 1
+                if consecutive_failures >= MAX_CONSECUTIVE_EVAL_FAILURES:
+                    aborted = True
+                    break
                 continue
 
             before_cp = before.get("eval_cp_white")
@@ -289,6 +308,23 @@ def find_critical_mistakes(
 
         if best_for_game:
             found.append(best_for_game)
+
+    # region agent log
+    _dbg(
+        {
+            "hypothesisId": "H3",
+            "location": "api/services/study.py:find_critical_mistakes",
+            "message": "mistake scan finished",
+            "data": {
+                "games_scanned": int(len(candidates)),
+                "eval_calls": eval_calls,
+                "consecutive_failures": consecutive_failures,
+                "aborted": aborted,
+                "mistakes_found": len(found),
+            },
+        }
+    )
+    # endregion
 
     found.sort(key=lambda x: x["eval_drop_cp"], reverse=True)
     return found[:limit]

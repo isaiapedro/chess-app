@@ -55,7 +55,7 @@ curl "http://localhost:8000/api/v1/study/eval?fen=rnbqkbnr/pppppppp/8/8/8/8/PPPP
 ```
 
 Optional for full opening explorer DB: set `LICHESS_TOKEN` (see `.env.example`). Without it, repertoire falls back to cloud-eval lines.
-## Mobile (Phase 2 Expo)
+## Mobile (Expo SDK 54)
 
 API port `8000` may be blocked on LAN by the host firewall while Metro `8081` stays reachable.
 Metro proxies `/api/*` and `/health` → `http://127.0.0.1:8000`. Point the app at Metro:
@@ -75,6 +75,9 @@ use Metro's port `8081` (never `:8000`, which is blocked on LAN by the host fire
 
 Optional: open firewall instead — `sudo ufw allow 8000/tcp` — then you can hit `:8000` directly.
 
-- Tabs: Recap | Insights (placeholder) | Study (mistakes quiz + repertoire explorer).
+- Tabs: Recap | Insights | Study (mistakes quiz + repertoire explorer).
 - Sticky filter header: username, platform, timeframe, date presets (Year/Month/Week/Day/Custom), speed, color.
 - Study board uses `chess.js` + custom squares (Expo Go friendly; no Skia).
+- AsyncStorage caches parsed games for one hour and analytics for 15 minutes, with stale-cache fallback when offline.
+- Pull-to-refresh bypasses cache and refreshes local data from the API.
+- Recap includes an animated Elo progression line; Insights includes animated donut charts and deep-dive panels.
