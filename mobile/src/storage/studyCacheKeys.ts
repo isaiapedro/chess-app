@@ -18,7 +18,7 @@ export function studyFiltersKey(filters: QueryFilters): string {
 }
 
 export function studyMistakesCacheKey(filters: QueryFilters): string {
-  return `study:mistakes:v9:${studyFiltersKey(filters)}`;
+  return `study:mistakes:v11:${studyFiltersKey(filters)}`;
 }
 
 export function studyOpeningCacheKey(
@@ -26,7 +26,7 @@ export function studyOpeningCacheKey(
   color: "white" | "black",
   openingKey: string
 ): string {
-  return `study:opening:v9:${studyFiltersKey(filters)}:${color}:${part(
+  return `study:opening:v15:${studyFiltersKey(filters)}:${color}:${part(
     openingKey
   ).toLowerCase()}`;
 }

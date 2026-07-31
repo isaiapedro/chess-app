@@ -61,6 +61,7 @@ export type RecapResponse = {
     total_hours?: number;
     max_win_streak?: number;
     max_unbeaten_streak?: number;
+    current_win_streak?: number;
     peak_day?: string;
     peak_hour?: string;
   };

@@ -156,6 +156,9 @@ export function RecapScreen() {
               {view.ratingChange}
             </Pill>
           ) : null}
+          {view.currentWinStreak >= 2 ? (
+            <Pill color="#E4572E">{`🔥 ${view.currentWinStreak}`}</Pill>
+          ) : null}
         </View>
       </View>
 

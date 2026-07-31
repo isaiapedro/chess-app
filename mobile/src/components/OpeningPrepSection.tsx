@@ -32,7 +32,9 @@ import {
   type OpeningChoice,
   type OpeningMoment,
   type OpeningProgress,
+  type ThresholdPass,
 } from "../engine/analyzeOpenings";
+import { resolveFamilyByName } from "../engine/ecoFamilies";
 import { useStockfish } from "../engine/StockfishProvider";
 import { applyUciMove } from "../engine/chessMoves";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
@@ -51,7 +53,18 @@ type OpeningCachePayload = {
   pendingCandidates: OpeningMoment[];
   scannedGameIds: string[];
   remaining: number;
+  thresholdPass?: ThresholdPass;
+  baselineAvailable?: boolean;
 };
+
+function openingHeaderLabel(
+  opening: OpeningChoice | null,
+  color: "white" | "black" | null
+): string {
+  const name = opening?.name || "Opening";
+  const side = color || "";
+  return side ? `${name} · ${side}` : name;
+}
 
 function parseOpeningCache(
   raw: OpeningCachePayload | OpeningMoment[] | null
@@ -71,6 +84,8 @@ function parseOpeningCache(
       pendingCandidates: raw.pendingCandidates || [],
       scannedGameIds: raw.scannedGameIds || [],
       remaining: raw.remaining ?? 0,
+      thresholdPass: raw.thresholdPass || "strict",
+      baselineAvailable: Boolean(raw.baselineAvailable),
     };
   }
   return null;
@@ -147,6 +162,8 @@ export function OpeningPrepSection(_props: Props = {}) {
   const pendingCandidatesRef = useRef<OpeningMoment[]>([]);
   const filteredGamesRef = useRef<StudyGame[]>([]);
   const momentsRef = useRef<OpeningMoment[]>([]);
+  const thresholdPassRef = useRef<ThresholdPass>("strict");
+  const baselineAvailableRef = useRef(false);
   momentsRef.current = moments;
 
   const [quizFeedback, setQuizFeedback] = useState<string | null>(null);
@@ -266,6 +283,19 @@ export function OpeningPrepSection(_props: Props = {}) {
     setSelectedOpening(null);
     setCustomOpening("");
     setDraftOpening(null);
+    setAllDone(false);
+    setShowScanMore(false);
+    setScanExhausted(false);
+    setMoments([]);
+    setIdx(0);
+    scannedIdsRef.current = [];
+    pendingCandidatesRef.current = [];
+    filteredGamesRef.current = [];
+    thresholdPassRef.current = "strict";
+    baselineAvailableRef.current = false;
+    setRemainingGames(0);
+    setPendingCount(0);
+    setError(null);
     setPhase("opening");
   };
 
@@ -282,11 +312,15 @@ export function OpeningPrepSection(_props: Props = {}) {
     setError(null);
     setMoments([]);
     setIdx(0);
+    setAllDone(false);
+    setShowScanMore(false);
     setScanExhausted(false);
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
+    thresholdPassRef.current = "strict";
+    baselineAvailableRef.current = false;
     setPendingCount(0);
-    setShowScanMore(false);
+    setRemainingGames(0);
     setAnalyzeLog([]);
     setAnalyzeProgress(null);
 
@@ -305,8 +339,12 @@ export function OpeningPrepSection(_props: Props = {}) {
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
+        thresholdPassRef.current = cached.thresholdPass || "strict";
+        baselineAvailableRef.current = Boolean(cached.baselineAvailable);
         setScanExhausted(
-          cached.remaining <= 0 && !(cached.pendingCandidates || []).length
+          thresholdPassRef.current === "baseline" &&
+            cached.remaining <= 0 &&
+            !(cached.pendingCandidates || []).length
         );
         const filtered = filterGamesByOpening(allGames, color, opening);
         filteredGamesRef.current = filtered;
@@ -342,6 +380,7 @@ export function OpeningPrepSection(_props: Props = {}) {
         userRating: rating,
         evaluate,
         signal,
+        thresholdPass: "strict",
         fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
         fetchExplorer: async (fen, source, ratings) => {
           const res = await fetchExplorer(
@@ -363,7 +402,7 @@ export function OpeningPrepSection(_props: Props = {}) {
         onProgress: (p) => {
           setAnalyzeProgress(p);
           setAnalyzeStatus(p.status);
-          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-20), p.log!]);
+          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
         },
       });
       if (signal.cancelled) return;
@@ -371,8 +410,12 @@ export function OpeningPrepSection(_props: Props = {}) {
       pendingCandidatesRef.current = batch.pendingCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
+      thresholdPassRef.current = batch.thresholdPass;
+      baselineAvailableRef.current = batch.baselineAvailable;
       setScanExhausted(
-        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+        batch.thresholdPass === "baseline" &&
+          batch.remaining <= 0 &&
+          batch.pendingCandidates.length === 0
       );
       setMoments(batch.moments);
       setIdx(0);
@@ -386,6 +429,8 @@ export function OpeningPrepSection(_props: Props = {}) {
         pendingCandidates: batch.pendingCandidates,
         scannedGameIds: batch.scannedGameIds,
         remaining: batch.remaining,
+        thresholdPass: batch.thresholdPass,
+        baselineAvailable: batch.baselineAvailable,
       } satisfies OpeningCachePayload);
       setPhase("quiz");
     } catch (e) {
@@ -403,14 +448,23 @@ export function OpeningPrepSection(_props: Props = {}) {
       !selectedOpening ||
       !engineReady ||
       scanningMore ||
-      (remainingGames <= 0 && pendingCount <= 0)
+      scanExhausted
     ) {
+      return;
+    }
+    const canBaseline =
+      baselineAvailableRef.current ||
+      (thresholdPassRef.current === "strict" &&
+        remainingGames <= 0 &&
+        pendingCount <= 0);
+    if (remainingGames <= 0 && pendingCount <= 0 && !canBaseline) {
       return;
     }
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
     const keptMoments = momentsRef.current;
+    const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
     setShowScanMore(false);
     setAllDone(false);
     pendingCandidatesRef.current = [];
@@ -422,11 +476,18 @@ export function OpeningPrepSection(_props: Props = {}) {
       found: 0,
       candidates: 0,
       selected: 0,
-      status: "Scanning next batch…",
+      status:
+        nextPass === "baseline"
+          ? "Baseline pass · broader threshold…"
+          : "Scanning next batch…",
       phase: "scan",
       engine: "Stockfish",
     });
-    setAnalyzeStatus("Scanning next batch…");
+    setAnalyzeStatus(
+      nextPass === "baseline"
+        ? "Baseline pass · broader threshold…"
+        : "Scanning next batch…"
+    );
     setScanningMore(true);
     const cacheKey = studyOpeningCacheKey(
       queryFilters,
@@ -447,11 +508,12 @@ export function OpeningPrepSection(_props: Props = {}) {
         userRating: rating,
         evaluate,
         signal,
-        excludeGameIds: scannedIdsRef.current,
+        excludeGameIds: nextPass === "baseline" ? [] : scannedIdsRef.current,
         existingMoments: keptMoments,
         existingCandidates: [],
         appendCount: APPEND_MOMENTS,
-        stopOnStrict: true,
+        stopOnStrict: nextPass === "strict",
+        thresholdPass: nextPass,
         fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
         fetchExplorer: async (fen, source, ratings) => {
           const res = await fetchExplorer(
@@ -473,17 +535,19 @@ export function OpeningPrepSection(_props: Props = {}) {
         onProgress: (p) => {
           setAnalyzeProgress(p);
           setAnalyzeStatus(p.status);
-          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-20), p.log!]);
+          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
         },
       });
       if (signal.cancelled) return;
-      scannedIdsRef.current = [
-        ...scannedIdsRef.current,
-        ...batch.scannedGameIds,
-      ];
+      scannedIdsRef.current =
+        nextPass === "baseline"
+          ? batch.scannedGameIds
+          : [...scannedIdsRef.current, ...batch.scannedGameIds];
       pendingCandidatesRef.current = batch.pendingCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
+      thresholdPassRef.current = batch.thresholdPass;
+      baselineAvailableRef.current = batch.baselineAvailable;
       setMoments(batch.moments);
       setIdx(
         batch.moments.length > keptMoments.length
@@ -491,17 +555,25 @@ export function OpeningPrepSection(_props: Props = {}) {
           : Math.max(0, batch.moments.length - 1)
       );
       setScanExhausted(
-        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+        batch.thresholdPass === "baseline" &&
+          batch.remaining <= 0 &&
+          batch.pendingCandidates.length === 0
       );
       await writeCache(cacheKey, {
         moments: batch.moments,
         pendingCandidates: batch.pendingCandidates,
         scannedGameIds: scannedIdsRef.current,
         remaining: batch.remaining,
+        thresholdPass: batch.thresholdPass,
+        baselineAvailable: batch.baselineAvailable,
       } satisfies OpeningCachePayload);
       if (batch.moments.length <= keptMoments.length) {
         setError("No further opening improvement moments found.");
-        if (batch.remaining > 0 || batch.pendingCandidates.length > 0) {
+        if (
+          batch.remaining > 0 ||
+          batch.pendingCandidates.length > 0 ||
+          batch.baselineAvailable
+        ) {
           setShowScanMore(true);
         } else {
           setAllDone(true);
@@ -583,13 +655,18 @@ export function OpeningPrepSection(_props: Props = {}) {
     setCustomOpening("");
     setDraftOpening(null);
     setMoments([]);
+    setIdx(0);
     setError(null);
+    setAllDone(false);
+    setShowScanMore(false);
+    setScanExhausted(false);
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
     filteredGamesRef.current = [];
+    thresholdPassRef.current = "strict";
+    baselineAvailableRef.current = false;
     setRemainingGames(0);
     setPendingCount(0);
-    setScanExhausted(false);
     setScanningMore(false);
   };
 
@@ -641,10 +718,14 @@ export function OpeningPrepSection(_props: Props = {}) {
             onPress={() => void startAnalysis(opening)}
           >
             <Text style={styles.openingOptionTitle}>
-              {opening.eco !== "UNK" ? `${opening.eco} · ` : ""}
               {opening.name}
             </Text>
-            <Text style={styles.openingOptionMeta}>{opening.games} games</Text>
+            <Text style={styles.openingOptionMeta}>
+              {opening.ecoLabel && opening.ecoLabel !== "UNK"
+                ? `${opening.ecoLabel} · `
+                : ""}
+              {opening.games} games
+            </Text>
           </Pressable>
         ))}
         {!topOpenings.length ? (
@@ -675,10 +756,12 @@ export function OpeningPrepSection(_props: Props = {}) {
                 onPress={() => fillOpeningSearch(opening)}
               >
                 <Text style={styles.openingOptionTitle}>
-                  {opening.eco !== "UNK" ? `${opening.eco} · ` : ""}
                   {opening.name}
                 </Text>
                 <Text style={styles.openingOptionMeta}>
+                  {opening.ecoLabel && opening.ecoLabel !== "UNK"
+                    ? `${opening.ecoLabel} · `
+                    : ""}
                   {opening.games} games
                 </Text>
               </Pressable>
@@ -690,20 +773,34 @@ export function OpeningPrepSection(_props: Props = {}) {
         <BrutalButton
           label="Study custom opening"
           disabled={!customOpening.trim()}
-          onPress={() =>
-            void startAnalysis(
+          onPress={() => {
+            if (
               draftOpening &&
-                draftOpening.name.toLowerCase() ===
-                  customOpening.trim().toLowerCase()
-                ? draftOpening
-                : {
-                    key: customOpening.trim().toLowerCase(),
-                    eco: "UNK",
-                    name: customOpening.trim(),
+              draftOpening.name.toLowerCase() ===
+                customOpening.trim().toLowerCase()
+            ) {
+              void startAnalysis(draftOpening);
+              return;
+            }
+            const typed = customOpening.trim();
+            const family = resolveFamilyByName(typed);
+            void startAnalysis(
+              family
+                ? {
+                    key: family.key,
+                    eco: family.ecoLabel,
+                    ecoLabel: family.ecoLabel,
+                    name: family.name,
                     games: 0,
                   }
-            )
-          }
+                : {
+                    key: typed.toLowerCase(),
+                    eco: "UNK",
+                    name: typed,
+                    games: 0,
+                  }
+            );
+          }}
           style={{ marginTop: spacing.sm }}
         />
         <BrutalButton
@@ -740,10 +837,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       <View>
         <View style={styles.headerRow}>
           <Text style={styles.openingTitle}>
-            {selectedOpening?.eco && selectedOpening.eco !== "UNK"
-              ? `${selectedOpening.eco} · `
-              : ""}
-            {selectedOpening?.name || "Opening"} · {color}
+            {openingHeaderLabel(selectedOpening, color)}
           </Text>
           <BrutalButton label="Change" ghost onPress={resetFlow} />
         </View>
@@ -763,10 +857,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       <View>
         <View style={styles.headerRow}>
           <Text style={styles.openingTitle}>
-            {selectedOpening?.eco && selectedOpening.eco !== "UNK"
-              ? `${selectedOpening.eco} · `
-              : ""}
-            {selectedOpening?.name || "Opening"} · {color}
+            {openingHeaderLabel(selectedOpening, color)}
           </Text>
           <BrutalButton label="Change" ghost onPress={resetFlow} />
         </View>
@@ -793,10 +884,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     <View>
       <View style={styles.headerRow}>
         <Text style={styles.openingTitle}>
-          {selectedOpening?.eco && selectedOpening.eco !== "UNK"
-            ? `${selectedOpening.eco} · `
-            : ""}
-          {selectedOpening?.name || "Opening"} · {color}
+          {openingHeaderLabel(selectedOpening, color)}
         </Text>
         <BrutalButton label="Change" ghost onPress={resetFlow} />
       </View>
@@ -808,6 +896,11 @@ export function OpeningPrepSection(_props: Props = {}) {
           </Text>
           <Text style={styles.opponentName}>
             vs {asMistake.opponent_name || "Unknown opponent"}
+          </Text>
+          <Text style={styles.gameDetails}>
+            {asMistake.opening_name ||
+              selectedOpening?.name ||
+              "Unknown opening"}
           </Text>
           <Text style={styles.gameDetails}>
             {asMistake.speed || "Unknown format"} · Move{" "}
@@ -923,6 +1016,11 @@ export function OpeningPrepSection(_props: Props = {}) {
             GM game: {formatGmGameLabel(current.gm_game)}
           </Text>
         ) : null}
+        {revealed && current.frequency_note ? (
+          <Text style={[styles.comment, { marginTop: spacing.xs }]}>
+            {current.frequency_note}
+          </Text>
+        ) : null}
         {revealed && current.comment ? (
           <Text style={styles.comment}>{current.comment}</Text>
         ) : null}
@@ -988,7 +1086,12 @@ export function OpeningPrepSection(_props: Props = {}) {
           onPress={() => {
             if (idx >= moments.length - 1) {
               const canScanMore =
-                (remainingGames > 0 || pendingCount > 0) && !scanExhausted;
+                !scanExhausted &&
+                (remainingGames > 0 ||
+                  pendingCount > 0 ||
+                  baselineAvailableRef.current ||
+                  (thresholdPassRef.current === "strict" &&
+                    remainingGames <= 0));
               if (canScanMore) {
                 setShowScanMore(true);
                 setAllDone(false);

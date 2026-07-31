@@ -11,6 +11,10 @@ import {
 } from "./chessMoves";
 import { resolveContinuationPv } from "./resolveContinuation";
 import {
+  familyMatchesSelection,
+  resolveEcoFamily,
+} from "./ecoFamilies";
+import {
   ENGINE_LABEL,
   MAX_OPENING_GAMES,
   MIN_CONTINUATION_PLIES,
@@ -26,6 +30,17 @@ export type OpeningChoice = {
   eco: string;
   name: string;
   games: number;
+  ecoLabel?: string;
+  variationHint?: string;
+};
+
+export type CompoundMoveEntry = {
+  ply: number;
+  san: string;
+  uci: string;
+  local_pct: number;
+  compound_pct: number;
+  rank: number | null;
 };
 
 export type OpeningMoment = MistakeItem & {
@@ -36,6 +51,10 @@ export type OpeningMoment = MistakeItem & {
   games_best: number | null;
   popularity_pct: number | null;
   popularity_drop_pct: number | null;
+  path_frequency_pct: number | null;
+  path_rank: number | null;
+  frequency_note: string | null;
+  compound_table: CompoundMoveEntry[];
   source: "lichess" | "masters" | "eval";
   alt_moves: Array<{ uci: string; san: string; score: number }>;
   best_pv: string[];
@@ -84,10 +103,10 @@ type MastersPgnFn = (gameId: string) => Promise<{ pgn: string }>;
 
 const MAX_OPENING_MOVES = 10;
 const TARGET_MOMENTS = TARGET_OPENING_MOMENTS;
-const BASE_MIN_WINRATE_GAP = 0.1;
-const BASE_STRICT_WINRATE_GAP =
-  Math.round(BASE_MIN_WINRATE_GAP * 1.3 * 1000) / 1000;
-const HIGH_WINRATE_GAP = Math.round(BASE_MIN_WINRATE_GAP * 3 * 1000) / 1000;
+const MIN_THRESHOLD = 5;
+const STRICT_THRESHOLD = 10;
+const HIGH_THRESHOLD = 15;
+const MAX_MOMENTS_PER_GAME = 3;
 const LOW_WINRATE = 0.35;
 const ZERO_WINRATE = 0.05;
 const DECENT_WINRATE = 0.45;
@@ -100,7 +119,129 @@ const SCORE_TOLERANCE_FRACTION = 0.2;
 const EVAL_GAP_CP = 100;
 const MIN_GAMES_FOR_WINRATE_UI = 10;
 
-const MIN_WINRATE_GAP = BASE_MIN_WINRATE_GAP;
+export function winProbability(evalScore: number): number {
+  return 1.0 / (1.0 + 10.0 ** (-evalScore / 4.0));
+}
+
+export function winrateToEval(winrate: number): number {
+  const p = Math.min(0.99, Math.max(0.01, winrate));
+  return 4.0 * Math.log10(p / (1.0 - p));
+}
+
+export function calculateThreshold(
+  eval1: number,
+  eval2: number,
+  frequencyPct: number
+): number {
+  const p1 = winProbability(eval1);
+  const p2 = winProbability(eval2);
+  const deltaP = Math.abs(p2 - p1);
+  const mFreq =
+    1.0 + 0.25 * (Math.max(0, Math.min(100, frequencyPct)) / 100.0);
+  return deltaP * mFreq * 100.0;
+}
+
+function toOrdinal(n: number): string {
+  const abs = Math.abs(Math.round(n));
+  const mod100 = abs % 100;
+  if (mod100 >= 11 && mod100 <= 13) return `${abs}th`;
+  switch (abs % 10) {
+    case 1:
+      return `${abs}st`;
+    case 2:
+      return `${abs}nd`;
+    case 3:
+      return `${abs}rd`;
+    default:
+      return `${abs}th`;
+  }
+}
+
+const COMPOUND_START_PLY = 2;
+const RARE_COMPOUND_PCT = 1;
+
+function formatFrequencyNote(
+  table: CompoundMoveEntry[],
+  focusPly: number
+): string {
+  const focus = table.find((entry) => entry.ply === focusPly);
+  if (!focus || focus.compound_pct < RARE_COMPOUND_PCT) {
+    return "This move is rare. Probability of occurrence: < 1%";
+  }
+  const firstSide = table.find(
+    (entry) =>
+      entry.ply <= focusPly && (entry.rank === 2 || entry.rank === 3)
+  );
+  const rankLabel =
+    focus.rank == null
+      ? "common"
+      : focus.rank === 1
+        ? "most common"
+        : `${toOrdinal(focus.rank)} most common`;
+  const pct = Math.max(1, Math.round(focus.compound_pct));
+  if (firstSide) {
+    return `After ${firstSide.san} this is the ${rankLabel} move. Probability of occurrence: ${pct}%.`;
+  }
+  return `This is the ${rankLabel} move. Probability of occurrence: ${pct}%.`;
+}
+
+function moveRankAmong(
+  moves: ExplorerMove[],
+  playedUci: string
+): number | null {
+  if (!moves.length) return null;
+  const ranked = [...moves].sort(
+    (a, b) =>
+      moveTotal(b) - moveTotal(a) ||
+      String(a.san).localeCompare(String(b.san))
+  );
+  const idx = ranked.findIndex((move) => move.uci === playedUci);
+  return idx >= 0 ? idx + 1 : null;
+}
+
+function localMoveFrequency(
+  moves: ExplorerMove[],
+  total: number,
+  playedUci: string,
+  playedSan: string
+): { freq: number; rank: number | null } {
+  if (total <= 0) return { freq: 0, rank: null };
+  const played =
+    moves.find((m) => m.uci === playedUci) ||
+    moves.find((m) => m.san === playedSan);
+  if (!played) return { freq: 0, rank: moves.length + 1 };
+  return {
+    freq: moveTotal(played) / total,
+    rank: moveRankAmong(moves, String(played.uci || playedUci)),
+  };
+}
+
+function pushCompoundEntry(
+  table: CompoundMoveEntry[],
+  state: { compound: number; rare: boolean },
+  ply: number,
+  san: string,
+  uci: string,
+  localFreq: number,
+  rank: number | null
+): void {
+  if (ply < COMPOUND_START_PLY) return;
+  const localPct = Math.max(0, localFreq * 100);
+  if (!state.rare) {
+    if (localFreq > 0) state.compound *= localFreq;
+    else state.compound *= 0.005;
+  }
+  const compoundPct = state.compound * 100;
+  if (compoundPct < RARE_COMPOUND_PCT) state.rare = true;
+  table.push({
+    ply,
+    san,
+    uci,
+    local_pct: Math.round(localPct * 10) / 10,
+    compound_pct: Math.round(compoundPct * 10) / 10,
+    rank,
+  });
+}
 
 function parseMoves(game: StudyGame): string[] {
   if (game.moves_str?.trim()) {
@@ -153,20 +294,52 @@ export function topOpeningsForColor(
   color: "white" | "black",
   limit = 3
 ): OpeningChoice[] {
-  const counts = new Map<string, OpeningChoice>();
+  const counts = new Map<
+    string,
+    OpeningChoice & { variationCounts: Map<string, number> }
+  >();
   for (const game of games) {
     if (String(game.user_color || "").toLowerCase() !== color) continue;
     const eco = String(game.opening_eco || "UNK").toUpperCase();
-    const name = String(game.opening_name || "Unknown opening");
-    const key = eco !== "UNK" ? eco : name.toLowerCase();
+    const variation = String(game.opening_name || "Unknown opening");
+    const family = resolveEcoFamily(eco, variation);
+    const key = family?.key || (eco !== "UNK" ? eco : variation.toLowerCase());
+    const name = family?.name || variation;
+    const ecoLabel = family?.ecoLabel || (eco !== "UNK" ? eco : "UNK");
     const prev = counts.get(key);
     if (prev) {
       prev.games += 1;
+      prev.variationCounts.set(
+        variation,
+        (prev.variationCounts.get(variation) || 0) + 1
+      );
       continue;
     }
-    counts.set(key, { key, eco, name, games: 1 });
+    counts.set(key, {
+      key,
+      eco: ecoLabel,
+      name,
+      ecoLabel,
+      games: 1,
+      variationCounts: new Map([[variation, 1]]),
+    });
   }
-  return [...counts.values()].sort((a, b) => b.games - a.games).slice(0, limit);
+  return [...counts.values()]
+    .map((item) => {
+      const topVariation = [...item.variationCounts.entries()].sort(
+        (a, b) => b[1] - a[1]
+      )[0]?.[0];
+      return {
+        key: item.key,
+        eco: item.eco,
+        name: item.name,
+        ecoLabel: item.ecoLabel,
+        games: item.games,
+        variationHint: topVariation,
+      };
+    })
+    .sort((a, b) => b.games - a.games)
+    .slice(0, limit);
 }
 
 export function searchOpeningsForColor(
@@ -177,31 +350,48 @@ export function searchOpeningsForColor(
 ): OpeningChoice[] {
   const q = query.trim().toLowerCase();
   if (q.length < 2) return [];
-  return topOpeningsForColor(games, color, 500)
-    .filter(
-      (opening) =>
-        opening.name.toLowerCase().includes(q) ||
-        opening.eco.toLowerCase().includes(q)
-    )
-    .slice(0, limit);
+  const all = topOpeningsForColor(games, color, 500);
+  const matchedKeys = new Set<string>();
+  for (const opening of all) {
+    if (
+      opening.name.toLowerCase().includes(q) ||
+      opening.eco.toLowerCase().includes(q) ||
+      (opening.ecoLabel || "").toLowerCase().includes(q)
+    ) {
+      matchedKeys.add(opening.key);
+    }
+  }
+  for (const game of games) {
+    if (String(game.user_color || "").toLowerCase() !== color) continue;
+    const variation = String(game.opening_name || "").toLowerCase();
+    if (!variation.includes(q)) continue;
+    const family = resolveEcoFamily(game.opening_eco, game.opening_name);
+    const key =
+      family?.key ||
+      (game.opening_eco
+        ? String(game.opening_eco).toUpperCase()
+        : variation);
+    matchedKeys.add(key);
+  }
+  return all.filter((opening) => matchedKeys.has(opening.key)).slice(0, limit);
 }
 
 export function filterGamesByOpening(
   games: StudyGame[],
   color: "white" | "black",
-  opening: OpeningChoice | { eco?: string; name: string }
+  opening: OpeningChoice | { key?: string; eco?: string; name: string }
 ): StudyGame[] {
-  const eco = String(opening.eco || "").toUpperCase();
-  const name = String(opening.name || "").toLowerCase().trim();
   return games.filter((game) => {
     if (String(game.user_color || "").toLowerCase() !== color) return false;
-    const gEco = String(game.opening_eco || "").toUpperCase();
-    const gName = String(game.opening_name || "").toLowerCase();
-    if (eco && eco !== "UNK" && gEco === eco) return true;
-    if (name && (gName === name || gName.includes(name) || name.includes(gName))) {
-      return true;
-    }
-    return false;
+    return familyMatchesSelection(
+      {
+        key: "key" in opening && opening.key ? opening.key : "",
+        eco: opening.eco,
+        name: opening.name,
+      },
+      game.opening_eco,
+      game.opening_name
+    );
   });
 }
 
@@ -309,12 +499,16 @@ function isPlayableMove(row: {
   return false;
 }
 
+export type ThresholdPass = "strict" | "baseline";
+
 export type OpeningAnalyzeBatchResult = {
   moments: OpeningMoment[];
   pendingCandidates: OpeningMoment[];
   scannedGameIds: string[];
   improved: boolean;
   remaining: number;
+  thresholdPass: ThresholdPass;
+  baselineAvailable: boolean;
 };
 
 function openingMomentKey(item: { game_id: string; ply: number }): string {
@@ -325,10 +519,11 @@ function openingPositionKey(item: { fen: string }): string {
   return fenKey(item.fen);
 }
 
-function passesOpeningCriteria(item: OpeningMoment): boolean {
-  if ((item.winrate_gap || 0) >= BASE_MIN_WINRATE_GAP) return true;
-  if ((item.eval_drop_cp || 0) >= EVAL_GAP_CP) return true;
-  return false;
+function passesOpeningCriteria(
+  item: OpeningMoment,
+  floor: number = MIN_THRESHOLD
+): boolean {
+  return (item.priority_score || 0) >= floor;
 }
 
 export async function analyzeOpeningMoments(options: {
@@ -346,6 +541,7 @@ export async function analyzeOpeningMoments(options: {
   batchSize?: number;
   stopOnStrict?: boolean;
   appendCount?: number;
+  thresholdPass?: ThresholdPass;
 }): Promise<OpeningAnalyzeBatchResult> {
   const {
     games,
@@ -362,14 +558,19 @@ export async function analyzeOpeningMoments(options: {
     batchSize = MAX_OPENING_GAMES,
     stopOnStrict = true,
     appendCount,
+    thresholdPass: initialPass = "strict",
   } = options;
   const ratings = ratingsForElo(userRating);
   const candidates: OpeningMoment[] = [];
+  const deferredPool = new Map<string, OpeningMoment>();
   let gamesScanned = 0;
   let positionsChecked = 0;
+  let thresholdPass: ThresholdPass = initialPass;
+  let acceptFloor =
+    thresholdPass === "strict" ? STRICT_THRESHOLD : MIN_THRESHOLD;
 
   const excluded = new Set(excludeGameIds.map(String));
-  const latestFirst = [...games]
+  let latestFirst = [...games]
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
     .filter((game) => game.id && !excluded.has(String(game.id)));
   const scannedGameIds: string[] = [];
@@ -402,9 +603,8 @@ export async function analyzeOpeningMoments(options: {
   );
 
   const strictCount = () =>
-    candidates.filter(
-      (item) => (item.winrate_gap || 0) >= HIGH_WINRATE_GAP
-    ).length;
+    candidates.filter((item) => (item.priority_score || 0) >= HIGH_THRESHOLD)
+      .length;
 
   const wantNew =
     appendCount != null && appendCount > 0
@@ -429,13 +629,13 @@ export async function analyzeOpeningMoments(options: {
   const pickFromPool = (need: number): OpeningMoment[] => {
     if (need <= 0) return [];
     const high = [...pendingMap.values()]
-      .filter((item) => (item.winrate_gap || 0) >= HIGH_WINRATE_GAP)
+      .filter((item) => (item.priority_score || 0) >= HIGH_THRESHOLD)
       .sort(byPriority);
     const mid = [...pendingMap.values()]
-      .filter((item) => (item.winrate_gap || 0) >= BASE_STRICT_WINRATE_GAP)
+      .filter((item) => (item.priority_score || 0) >= STRICT_THRESHOLD)
       .sort(byPriority);
     const low = [...pendingMap.values()]
-      .filter((item) => passesOpeningCriteria(item))
+      .filter((item) => passesOpeningCriteria(item, acceptFloor))
       .sort(byPriority);
     const ordered: OpeningMoment[] = [];
     const seen = new Set<string>();
@@ -461,7 +661,6 @@ export async function analyzeOpeningMoments(options: {
     report(`Refining opening`, "refine", {
       selected: selectedCount,
       candidates: candidates.length,
-      log: `${ENGINE_LABEL} · refine · ${moment.played_san}`,
     });
     try {
       const fenAfterBoard = new Chess(moment.fen);
@@ -503,22 +702,37 @@ export async function analyzeOpeningMoments(options: {
         const bm = applyUci(probe, evalBestUci);
         moment.best_san = bm?.san || evalBestUci;
       }
+      const frequencyPct = moment.path_frequency_pct ?? 0;
+      const evalScore =
+        drop > 0
+          ? calculateThreshold(userBefore / 100, userAfter / 100, frequencyPct)
+          : 0;
+      const winrateScore =
+        moment.winrate_played != null && moment.winrate_best != null
+          ? calculateThreshold(
+              winrateToEval(moment.winrate_best),
+              winrateToEval(moment.winrate_played),
+              frequencyPct
+            )
+          : 0;
+      moment.priority_score =
+        Math.round(Math.max(winrateScore, evalScore, moment.priority_score || 0) * 10) /
+        10;
       if (moment.best_uci && !canonicalUci(moment.fen, moment.best_uci)) {
         return null;
       }
-      if (!passesOpeningCriteria(moment)) return null;
+      if (!passesOpeningCriteria(moment, acceptFloor)) return null;
     } catch {
       if (!moment.best_uci || !canonicalUci(moment.fen, moment.best_uci)) {
         return null;
       }
-      if (!passesOpeningCriteria(moment)) return null;
+      if (!passesOpeningCriteria(moment, acceptFloor)) return null;
     }
 
     if (!moment.best_uci) return null;
     report(`Building continuation`, "continuation", {
       selected: selectedCount,
       candidates: candidates.length,
-      log: `${ENGINE_LABEL} · continuation · ${moment.best_san || moment.best_uci}`,
     });
     try {
       const cont = await resolveContinuationPv({
@@ -545,6 +759,11 @@ export async function analyzeOpeningMoments(options: {
       ? selected.length + appendCount
       : TARGET_MOMENTS;
 
+  for (;;) {
+    report(`Threshold pass · ${thresholdPass}`, "scan", {
+      log: `--- ${thresholdPass} pass · floor ${acceptFloor} ---`,
+    });
+
   while (!signal?.cancelled && selected.length < targetSelected) {
     const slotsNeeded = targetSelected - selected.length;
     const batch = latestFirst
@@ -555,13 +774,14 @@ export async function analyzeOpeningMoments(options: {
     const chunkCandidates: OpeningMoment[] = [];
     const chunkStrictCount = () =>
       chunkCandidates.filter(
-        (item) => (item.winrate_gap || 0) >= HIGH_WINRATE_GAP
+        (item) => (item.priority_score || 0) >= HIGH_THRESHOLD
       ).length;
 
     for (const game of batch) {
     if (signal?.cancelled) break;
     if (
       stopOnStrict &&
+      thresholdPass === "strict" &&
       appendCount == null &&
       chunkStrictCount() >= slotsNeeded
     ) {
@@ -585,43 +805,33 @@ export async function analyzeOpeningMoments(options: {
     scannedGameIds.push(String(game.id));
     const gameLabel =
       game.opponent_name || game.opening_name || String(game.id).slice(0, 8);
-    report(`Opening scan · ${gameLabel}`, "scan", {
-      currentGame: gameLabel,
-      log: `${ENGINE_LABEL} · game ${gamesScanned} · batch ${batch.length} · ${gameLabel}`,
-    });
+    report(`Opening scan · ${gameLabel}`, "scan", { currentGame: gameLabel });
 
     const userIsWhite = color === "white";
     const chess = new Chess();
-    let bestForGame: OpeningMoment | null = null;
-    let bestPriority = -Infinity;
     let prevPopularity: number | null = null;
+    const gameMoments: OpeningMoment[] = [];
+    const compoundTable: CompoundMoveEntry[] = [];
+    const compoundState = { compound: 1, rare: false };
 
     const maxPly = Math.min(sans.length, MAX_OPENING_MOVES * 2);
     for (let ply = 0; ply < maxPly; ply += 1) {
       if (signal?.cancelled) break;
       const turnIsWhite = chess.turn() === "w";
       const isUserTurn = turnIsWhite === userIsWhite;
-      if (!isUserTurn) {
-        if (!applySan(chess, sans[ply])) break;
-        continue;
-      }
-
       const fenBefore = chess.fen();
-      const played = applySan(chess, sans[ply]);
-      if (!played) break;
-      const playedUci = uciFromMove(played);
-      const playedSan = played.san;
       const moveNumber = Math.floor(ply / 2) + 1;
-
-      positionsChecked += 1;
-      report(`DB lookup move ${moveNumber}`, "scan", {
-        currentGame: gameLabel,
-        log: `${ENGINE_LABEL} · explorer · move ${moveNumber}`,
-      });
 
       let lichess;
       let masters;
       try {
+        report(
+          isUserTurn
+            ? `DB lookup move ${moveNumber}`
+            : `Path freq · move ${moveNumber}`,
+          "scan",
+          { currentGame: gameLabel }
+        );
         const [lichessRaw, mastersRaw] = await Promise.all([
           fetchExplorer(fenBefore, "lichess", ratings),
           fetchExplorer(fenBefore, "masters"),
@@ -635,8 +845,47 @@ export async function analyzeOpeningMoments(options: {
           moves: normalizeExplorerMoves(fenBefore, mastersRaw.moves || []),
         };
       } catch {
+        if (!applySan(chess, sans[ply])) break;
         continue;
       }
+
+      const probe = new Chess(fenBefore);
+      const upcoming = applySan(probe, sans[ply]);
+      if (!upcoming) break;
+      const upcomingUci = uciFromMove(upcoming);
+      const lichessTotal = positionTotal(lichess);
+      const local = localMoveFrequency(
+        lichess.moves || [],
+        lichessTotal,
+        upcomingUci,
+        upcoming.san
+      );
+      pushCompoundEntry(
+        compoundTable,
+        compoundState,
+        ply,
+        upcoming.san,
+        upcomingUci,
+        local.freq,
+        local.rank
+      );
+      const compoundEntry = compoundTable.find((entry) => entry.ply === ply);
+      const frequencyPct = Math.max(
+        0,
+        Math.min(100, compoundEntry?.compound_pct ?? 100)
+      );
+
+      if (!isUserTurn) {
+        if (!applySan(chess, sans[ply])) break;
+        continue;
+      }
+
+      const played = applySan(chess, sans[ply]);
+      if (!played) break;
+      const playedUci = upcomingUci;
+      const playedSan = upcoming.san;
+
+      positionsChecked += 1;
 
       const posGames = Math.max(
         positionTotal(lichess),
@@ -667,19 +916,25 @@ export async function analyzeOpeningMoments(options: {
       const winrateBestEarly = pickedEarly.best
         ? expectedScore(pickedEarly.best, color)
         : null;
-      const winrateGapEarly =
-        winrateBestEarly != null && winratePlayedEarly != null
-          ? winrateBestEarly - winratePlayedEarly
-          : null;
+      const earlyThreshold =
+        winratePlayedEarly != null && winrateBestEarly != null
+          ? calculateThreshold(
+              winrateToEval(winrateBestEarly),
+              winrateToEval(winratePlayedEarly),
+              frequencyPct
+            )
+          : 0;
       const explorerDecisive =
         gamesPlayedEarly >= MIN_GAMES_FOR_WINRATE_UI &&
         gamesBestEarly >= MIN_GAMES_FOR_WINRATE_UI &&
-        (winrateGapEarly || 0) >= HIGH_WINRATE_GAP;
+        earlyThreshold >= HIGH_THRESHOLD;
 
       let evalBestUci: string | null = null;
       let evalBefore = 0;
       let evalAfter = 0;
       let evalDrop = 0;
+      let userBeforePawns = 0;
+      let userAfterPawns = 0;
       if (!explorerDecisive) {
         try {
           const beforeRaw = await evaluate(
@@ -701,6 +956,8 @@ export async function analyzeOpeningMoments(options: {
           evalDrop = userBefore - userAfter;
           evalBefore = beforeCp;
           evalAfter = afterCp;
+          userBeforePawns = userBefore / 100;
+          userAfterPawns = userAfter / 100;
           evalBestUci = beforeRaw.bestUci
             ? canonicalUci(fenBefore, beforeRaw.bestUci)
             : null;
@@ -727,7 +984,6 @@ export async function analyzeOpeningMoments(options: {
       let bestUci = picked.bestUci;
       let bestSan: string | null = picked.best?.san || null;
       let usedSource: "lichess" | "masters" | "eval" = picked.source;
-      let priority = 0;
 
       const playedRow =
         scored.find((row) => row.move.uci === playedUci) || null;
@@ -738,7 +994,9 @@ export async function analyzeOpeningMoments(options: {
       if (playedMove) {
         winratePlayed = expectedScore(playedMove, color);
         gamesPlayed = moveTotal(playedMove);
-        popularityPct = posGames ? moveTotal(playedMove) / posGames : playedRow?.freq ?? 0;
+        popularityPct = posGames
+          ? moveTotal(playedMove) / posGames
+          : playedRow?.freq ?? 0;
       } else if (posGames > 0) {
         winratePlayed = 0;
         gamesPlayed = 0;
@@ -763,32 +1021,52 @@ export async function analyzeOpeningMoments(options: {
       const lowOrZero =
         winratePlayed != null &&
         (winratePlayed <= ZERO_WINRATE || winratePlayed < LOW_WINRATE);
-      const bigWinGap = (winrateGap || 0) >= MIN_WINRATE_GAP;
-      const bigEvalGap = evalDrop >= EVAL_GAP_CP;
+      const winrateThreshold =
+        winratePlayed != null && winrateBest != null
+          ? calculateThreshold(
+              winrateToEval(winrateBest),
+              winrateToEval(winratePlayed),
+              frequencyPct
+            )
+          : 0;
+      const evalThreshold =
+        evalDrop > 0
+          ? calculateThreshold(
+              userBeforePawns,
+              userAfterPawns,
+              frequencyPct
+            )
+          : 0;
+      let priority = Math.max(winrateThreshold, evalThreshold);
+      report(`Threshold check`, "scan", {
+        currentGame: gameLabel,
+        log: `${playedSan} ${Math.round(priority * 10) / 10} / strict ${STRICT_THRESHOLD} / broad ${MIN_THRESHOLD}`,
+      });
 
       if (lowOrZero) {
-        if (!bigEvalGap && !bigWinGap) continue;
-        if (bigEvalGap && evalBestUci && evalBestUci !== playedUci) {
+        if (priority < MIN_THRESHOLD && evalDrop < EVAL_GAP_CP) continue;
+        if (evalDrop >= EVAL_GAP_CP && evalBestUci && evalBestUci !== playedUci) {
           if (!bestUci || usedSource === "eval" || (winrateGap || 0) < 0.05) {
             bestUci = evalBestUci;
             usedSource = picked.best ? picked.source : "eval";
-            const probe = new Chess(fenBefore);
-            const bm = applyUci(probe, evalBestUci);
+            const bestProbe = new Chess(fenBefore);
+            const bm = applyUci(bestProbe, evalBestUci);
             bestSan = bm?.san || evalBestUci;
           }
         }
-      } else if (posGames >= MIN_GAMES_AT_POS && bigWinGap) {
+      } else if (posGames >= MIN_GAMES_AT_POS && winrateThreshold >= MIN_THRESHOLD) {
         /* keep */
-      } else if (bigEvalGap && evalBestUci && evalBestUci !== playedUci) {
+      } else if (evalThreshold >= MIN_THRESHOLD && evalBestUci && evalBestUci !== playedUci) {
         bestUci = evalBestUci;
         usedSource = "eval";
-        const probe = new Chess(fenBefore);
-        const bm = applyUci(probe, evalBestUci);
+        const bestProbe = new Chess(fenBefore);
+        const bm = applyUci(bestProbe, evalBestUci);
         bestSan = bm?.san || evalBestUci;
         winrateGap = evalDrop / 1000;
         gamesBest = null;
         winrateBest = null;
-      } else {
+        priority = evalThreshold;
+      } else if (priority < MIN_THRESHOLD) {
         continue;
       }
 
@@ -797,19 +1075,19 @@ export async function analyzeOpeningMoments(options: {
         gamesBest = null;
       }
       if (!bestSan) {
-        const probe = new Chess(fenBefore);
-        const bm = applyUci(probe, bestUci);
+        const bestProbe = new Chess(fenBefore);
+        const bm = applyUci(bestProbe, bestUci);
         bestSan = bm?.san || bestUci;
       }
 
-      const lateBias = moveNumber / MAX_OPENING_MOVES;
-      priority =
-        (winrateGap || 0) * 1000 +
-        Math.max(0, popularityDrop || 0) * 400 +
-        Math.max(0, evalDrop) * 0.5 +
-        lateBias * 40;
-      if (usedSource === "masters") priority += 120;
-      if (winratePlayed != null && winratePlayed <= ZERO_WINRATE) priority += 200;
+      if (usedSource === "masters") priority *= 1.08;
+      if (winratePlayed != null && winratePlayed <= ZERO_WINRATE) {
+        priority *= 1.12;
+      }
+      priority = Math.round(priority * 10) / 10;
+
+      const pathRank = compoundEntry?.rank ?? null;
+      const frequencyNote = formatFrequencyNote(compoundTable, ply);
 
       const altMoves = scored.slice(0, 5).map((row) => ({
         uci: String(row.move.uci || ""),
@@ -849,44 +1127,45 @@ export async function analyzeOpeningMoments(options: {
         games_best: gamesBest,
         popularity_pct: popularityPct,
         popularity_drop_pct: popularityDrop,
+        path_frequency_pct: Math.round(frequencyPct * 10) / 10,
+        path_rank: pathRank,
+        frequency_note: frequencyNote,
+        compound_table: compoundTable.map((entry) => ({ ...entry })),
         source: usedSource,
         alt_moves: altMoves,
         best_pv: bestUci ? [bestUci] : [],
-        priority_score: Math.round(priority * 10) / 10,
+        priority_score: priority,
       };
 
-      if (priority > bestPriority) {
-        bestPriority = priority;
-        bestForGame = item;
-      }
+      gameMoments.push(item);
     }
 
-    if (bestForGame) {
-      const posKey = openingPositionKey(bestForGame);
-      if (chosenPositionKeys.has(posKey)) {
-        report(`Skipping duplicate position`, "scan", {
-          currentGame: gameLabel,
-          log: `skip · same board as prior chosen · ${bestForGame.played_san}`,
-        });
-      } else {
-        const priorIdx = candidates.findIndex(
-          (item) => openingPositionKey(item) === posKey
-        );
-        if (priorIdx >= 0) {
-          if (
-            bestForGame.priority_score > candidates[priorIdx].priority_score
-          ) {
-            candidates[priorIdx] = bestForGame;
-            chunkCandidates.push(bestForGame);
-          }
-        } else {
-          candidates.push(bestForGame);
-          chunkCandidates.push(bestForGame);
-          report(`Candidate ${candidates.length} found`, "scan", {
-            currentGame: gameLabel,
-            log: `candidate · ${bestForGame.played_san}`,
-          });
+    gameMoments.sort((a, b) => b.priority_score - a.priority_score);
+
+    for (const moment of gameMoments.slice(0, MAX_MOMENTS_PER_GAME)) {
+      const posKey = openingPositionKey(moment);
+      if (chosenPositionKeys.has(posKey)) continue;
+
+      if (moment.priority_score < acceptFloor) {
+        const prevDeferred = deferredPool.get(posKey);
+        if (!prevDeferred || moment.priority_score > prevDeferred.priority_score) {
+          deferredPool.set(posKey, moment);
         }
+        continue;
+      }
+
+      deferredPool.delete(posKey);
+      const priorIdx = candidates.findIndex(
+        (item) => openingPositionKey(item) === posKey
+      );
+      if (priorIdx >= 0) {
+        if (moment.priority_score > candidates[priorIdx].priority_score) {
+          candidates[priorIdx] = moment;
+          chunkCandidates.push(moment);
+        }
+      } else {
+        candidates.push(moment);
+        chunkCandidates.push(moment);
       }
     }
   }
@@ -908,11 +1187,7 @@ export async function analyzeOpeningMoments(options: {
         ? `Selecting up to ${slotsNeeded} opening moment${slotsNeeded === 1 ? "" : "s"}`
         : "Target opening moments already filled",
       "scan",
-      {
-        candidates: candidates.length,
-        selected: selectedCount,
-        log: `pool · ${pendingMap.size} pending · need ${slotsNeeded} · skip ${existingKeys.size} selected`,
-      }
+      { candidates: candidates.length, selected: selectedCount }
     );
 
     let attempts = 0;
@@ -946,6 +1221,42 @@ export async function analyzeOpeningMoments(options: {
     if (!batch.length) break;
   }
 
+    const remainingNow = Math.max(0, latestFirst.length - scannedGameIds.length);
+    if (
+      !signal?.cancelled &&
+      thresholdPass === "strict" &&
+      remainingNow <= 0 &&
+      selected.length < targetSelected
+    ) {
+      thresholdPass = "baseline";
+      acceptFloor = MIN_THRESHOLD;
+      const revived = [...deferredPool.values()].filter(
+        (item) => item.priority_score >= MIN_THRESHOLD
+      );
+      deferredPool.clear();
+      for (const item of revived) {
+        const key = openingMomentKey(item);
+        const posKey = openingPositionKey(item);
+        if (existingKeys.has(key) || chosenPositionKeys.has(posKey)) continue;
+        if (!candidates.some((c) => openingPositionKey(c) === posKey)) {
+          candidates.push(item);
+        }
+        const prev = pendingMap.get(key);
+        if (!prev || item.priority_score > prev.priority_score) {
+          pendingMap.set(key, item);
+        }
+      }
+      if (!revived.length) {
+        scannedGameIds.length = 0;
+      }
+      report(`Baseline pass · floor ${acceptFloor}`, "scan", {
+        log: `baseline floor ${acceptFloor} · revived ${revived.length}`,
+      });
+      continue;
+    }
+    break;
+  }
+
   if (appendCount == null) {
     selected = selected.slice(0, TARGET_MOMENTS);
   }
@@ -958,6 +1269,8 @@ export async function analyzeOpeningMoments(options: {
     (item) => !existingKeys.has(openingMomentKey(item))
   );
   const remaining = Math.max(0, latestFirst.length - scannedGameIds.length);
+  const baselineAvailable =
+    thresholdPass === "strict" && remaining <= 0;
 
   report(
     selectedCount || selected.length
@@ -967,7 +1280,7 @@ export async function analyzeOpeningMoments(options: {
     {
       candidates: candidates.length,
       selected: selectedCount,
-      log: `${ENGINE_LABEL} · done · ${selectedCount} new moments · ${pendingCandidates.length} pending`,
+      log: `done · ${thresholdPass} · ${selectedCount} new · deferred ${deferredPool.size}`,
     }
   );
 
@@ -977,6 +1290,8 @@ export async function analyzeOpeningMoments(options: {
     scannedGameIds,
     improved,
     remaining,
+    thresholdPass,
+    baselineAvailable,
   };
 }
 

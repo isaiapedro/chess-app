@@ -29,6 +29,7 @@ import {
   validateMoveLocal,
   type AnalyzeProgress,
   type StudyGame,
+  type ThresholdPass,
 } from "../engine/analyzeMistakes";
 import { applyUciMove } from "../engine/chessMoves";
 import { useStockfish } from "../engine/StockfishProvider";
@@ -48,6 +49,8 @@ type MistakesCachePayload = {
   pendingCandidates: MistakeItem[];
   scannedGameIds: string[];
   remaining: number;
+  thresholdPass?: ThresholdPass;
+  baselineAvailable?: boolean;
 };
 
 function parseMistakesCache(
@@ -68,6 +71,8 @@ function parseMistakesCache(
       pendingCandidates: raw.pendingCandidates || [],
       scannedGameIds: raw.scannedGameIds || [],
       remaining: raw.remaining ?? 0,
+      thresholdPass: raw.thresholdPass || "strict",
+      baselineAvailable: Boolean(raw.baselineAvailable),
     };
   }
   return null;
@@ -126,6 +131,8 @@ export function StudyScreen() {
   const lastRefreshRef = useRef(refreshToken);
   const studyGamesRef = useRef<StudyGame[]>([]);
   const scannedIdsRef = useRef<string[]>([]);
+  const thresholdPassRef = useRef<ThresholdPass>("strict");
+  const baselineAvailableRef = useRef(false);
   const pendingCandidatesRef = useRef<MistakeItem[]>([]);
 
   const current = mistakes[idx] || null;
@@ -199,7 +206,7 @@ export function StudyScreen() {
     setAnalyzeProgress(progress);
     setAnalyzeStatus(progress.status);
     if (progress.log) {
-      setAnalyzeLog((prev) => [...prev.slice(-20), progress.log!]);
+      setAnalyzeLog((prev) => [...prev.slice(-59), progress.log!]);
     }
   }, []);
 
@@ -218,8 +225,12 @@ export function StudyScreen() {
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
+        thresholdPassRef.current = cached.thresholdPass || "strict";
+        baselineAvailableRef.current = Boolean(cached.baselineAvailable);
         setScanExhausted(
-          cached.remaining <= 0 && !(cached.pendingCandidates || []).length
+          (cached.thresholdPass || "strict") === "baseline" &&
+            cached.remaining <= 0 &&
+            !(cached.pendingCandidates || []).length
         );
         setShowScanMore(false);
         setMistakesError(null);
@@ -254,8 +265,12 @@ export function StudyScreen() {
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
+        thresholdPassRef.current = cached.thresholdPass || "strict";
+        baselineAvailableRef.current = Boolean(cached.baselineAvailable);
         setScanExhausted(
-          cached.remaining <= 0 && !(cached.pendingCandidates || []).length
+          (cached.thresholdPass || "strict") === "baseline" &&
+            cached.remaining <= 0 &&
+            !(cached.pendingCandidates || []).length
         );
         setShowScanMore(false);
         setMistakesError(null);
@@ -304,6 +319,7 @@ export function StudyScreen() {
         games,
         evaluate,
         signal,
+        thresholdPass: "strict",
         fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
         fetchExplorer: async (fen, source) => {
           const res = await fetchExplorer(fen, source);
@@ -319,8 +335,12 @@ export function StudyScreen() {
       pendingCandidatesRef.current = batch.pendingCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
+      thresholdPassRef.current = batch.thresholdPass;
+      baselineAvailableRef.current = batch.baselineAvailable;
       setScanExhausted(
-        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+        batch.thresholdPass === "baseline" &&
+          batch.remaining <= 0 &&
+          batch.pendingCandidates.length === 0
       );
       setMistakes(batch.moments);
       setIdx(0);
@@ -331,11 +351,17 @@ export function StudyScreen() {
           pendingCandidates: batch.pendingCandidates,
           scannedGameIds: batch.scannedGameIds,
           remaining: batch.remaining,
+          thresholdPass: batch.thresholdPass,
+          baselineAvailable: batch.baselineAvailable,
         } satisfies MistakesCachePayload);
         setMistakesError(null);
       } else {
         setMistakesError("No critical swings found in recent games.");
-        if (batch.remaining > 0 || batch.pendingCandidates.length > 0) {
+        if (
+          batch.remaining > 0 ||
+          batch.pendingCandidates.length > 0 ||
+          batch.baselineAvailable
+        ) {
           setShowScanMore(true);
         }
       }
@@ -358,10 +384,18 @@ export function StudyScreen() {
   ]);
 
   const continueScanMistakes = useCallback(async () => {
+    if (!engineReady || scanningMore || scanExhausted) {
+      return;
+    }
+    const canBaseline =
+      baselineAvailableRef.current ||
+      (thresholdPassRef.current === "strict" &&
+        remainingGames <= 0 &&
+        pendingCandidatesRef.current.length === 0);
     if (
-      !engineReady ||
-      scanningMore ||
-      (remainingGames <= 0 && pendingCandidatesRef.current.length === 0)
+      remainingGames <= 0 &&
+      pendingCandidatesRef.current.length === 0 &&
+      !canBaseline
     ) {
       return;
     }
@@ -369,6 +403,7 @@ export function StudyScreen() {
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
     const keptMoments = mistakesRef.current;
+    const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
     setShowScanMore(false);
     setAllDone(false);
     resetQuizChrome();
@@ -381,11 +416,18 @@ export function StudyScreen() {
       found: 0,
       candidates: 0,
       selected: 0,
-      status: "Scanning next batch…",
+      status:
+        nextPass === "baseline"
+          ? "Baseline pass · broader threshold…"
+          : "Scanning next batch…",
       phase: "scan",
       engine: "Stockfish",
     });
-    setAnalyzeStatus("Scanning next batch…");
+    setAnalyzeStatus(
+      nextPass === "baseline"
+        ? "Baseline pass · broader threshold…"
+        : "Scanning next batch…"
+    );
     setScanningMore(true);
     try {
       let games = studyGamesRef.current;
@@ -416,11 +458,12 @@ export function StudyScreen() {
         games,
         evaluate,
         signal,
-        excludeGameIds: scannedIdsRef.current,
+        excludeGameIds: nextPass === "baseline" ? [] : scannedIdsRef.current,
         existingMoments: keptMoments,
         existingCandidates: [],
         appendCount: TARGET_MISTAKE_MOMENTS,
-        stopOnStrict: true,
+        stopOnStrict: nextPass === "strict",
+        thresholdPass: nextPass,
         fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
         fetchExplorer: async (fen, source) => {
           const res = await fetchExplorer(fen, source);
@@ -432,13 +475,15 @@ export function StudyScreen() {
         onProgress: pushProgress,
       });
       if (signal.cancelled) return;
-      scannedIdsRef.current = [
-        ...scannedIdsRef.current,
-        ...batch.scannedGameIds,
-      ];
+      scannedIdsRef.current =
+        nextPass === "baseline"
+          ? batch.scannedGameIds
+          : [...scannedIdsRef.current, ...batch.scannedGameIds];
       pendingCandidatesRef.current = batch.pendingCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
+      thresholdPassRef.current = batch.thresholdPass;
+      baselineAvailableRef.current = batch.baselineAvailable;
       setMistakes(batch.moments);
       setIdx(
         batch.moments.length > keptMoments.length
@@ -446,17 +491,25 @@ export function StudyScreen() {
           : Math.max(0, batch.moments.length - 1)
       );
       setScanExhausted(
-        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+        batch.thresholdPass === "baseline" &&
+          batch.remaining <= 0 &&
+          batch.pendingCandidates.length === 0
       );
       await writeCache(mistakesCacheKey, {
         moments: batch.moments,
         pendingCandidates: batch.pendingCandidates,
         scannedGameIds: scannedIdsRef.current,
         remaining: batch.remaining,
+        thresholdPass: batch.thresholdPass,
+        baselineAvailable: batch.baselineAvailable,
       } satisfies MistakesCachePayload);
       if (batch.moments.length <= keptMoments.length) {
         setMistakesError("No further critical swings found.");
-        if (batch.remaining > 0 || batch.pendingCandidates.length > 0) {
+        if (
+          batch.remaining > 0 ||
+          batch.pendingCandidates.length > 0 ||
+          batch.baselineAvailable
+        ) {
           setShowScanMore(true);
         } else {
           setAllDone(true);
@@ -498,6 +551,8 @@ export function StudyScreen() {
       setIdx(0);
       scannedIdsRef.current = [];
       pendingCandidatesRef.current = [];
+      thresholdPassRef.current = "strict";
+      baselineAvailableRef.current = false;
       setPendingCount(0);
       setRemainingGames(0);
       setScanExhausted(false);

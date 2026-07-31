@@ -11,6 +11,7 @@ import { resolveContinuationPv } from "./resolveContinuation";
 import {
   BATCH_GAMES,
   ENGINE_LABEL,
+  MAX_MISTAKE_SCAN_GAMES,
   MIN_CONTINUATION_PLIES,
   REFINE_DEPTH,
   REFINE_MOVETIME,
@@ -81,6 +82,7 @@ const HIGH_STRICT_DROP_CP = Math.round(HIGH_MIN_DROP_CP * 1.3);
 const HIGH_STRICT_PRIORITY = Math.round(HIGH_MIN_PRIORITY * 1.3);
 const MIN_DROP_CP = BASE_MIN_DROP_CP;
 const MIN_PRIORITY = BASE_MIN_PRIORITY;
+const MAX_MOMENTS_PER_GAME = 3;
 const STRICT_DROP_CP = HIGH_STRICT_DROP_CP;
 const STRICT_PRIORITY = HIGH_STRICT_PRIORITY;
 const TARGET_MOMENTS = TARGET_MISTAKE_MOMENTS;
@@ -182,12 +184,16 @@ export function pvToSanLine(
   return pvLineFromMoves(fen, pv, maxPlies);
 }
 
+export type ThresholdPass = "strict" | "baseline";
+
 export type AnalyzeBatchResult = {
   moments: MistakeItem[];
   pendingCandidates: MistakeItem[];
   scannedGameIds: string[];
   improved: boolean;
   remaining: number;
+  thresholdPass: ThresholdPass;
+  baselineAvailable: boolean;
 };
 
 function momentKey(item: { game_id: string; ply: number }): string {
@@ -198,13 +204,15 @@ function positionKey(item: { fen: string }): string {
   return fenKey(item.fen);
 }
 
-function passesMistakeCriteria(item: {
-  eval_drop_cp: number;
-  priority_score: number;
-}): boolean {
+function passesMistakeCriteria(
+  item: {
+    eval_drop_cp: number;
+    priority_score: number;
+  },
+  floor: number = BASE_MIN_PRIORITY
+): boolean {
   return (
-    item.eval_drop_cp >= BASE_MIN_DROP_CP &&
-    item.priority_score >= BASE_MIN_PRIORITY
+    item.eval_drop_cp >= BASE_MIN_DROP_CP && item.priority_score >= floor
   );
 }
 
@@ -221,6 +229,7 @@ export async function analyzeCriticalMistakes(options: {
   batchSize?: number;
   stopOnStrict?: boolean;
   appendCount?: number;
+  thresholdPass?: ThresholdPass;
 }): Promise<AnalyzeBatchResult> {
   const {
     games,
@@ -235,12 +244,17 @@ export async function analyzeCriticalMistakes(options: {
     batchSize = BATCH_GAMES,
     stopOnStrict = true,
     appendCount,
+    thresholdPass: initialPass = "strict",
   } = options;
   type Ranked = MistakeItem & { priority_score: number };
   const candidates: Ranked[] = [];
+  const deferredPool = new Map<string, Ranked>();
   let positionsChecked = 0;
   let gamesScanned = 0;
   let selectedCount = 0;
+  let thresholdPass: ThresholdPass = initialPass;
+  let acceptFloor =
+    thresholdPass === "strict" ? STRICT_PRIORITY : MIN_PRIORITY;
 
   const report = (
     status: string,
@@ -271,8 +285,8 @@ export async function analyzeCriticalMistakes(options: {
   const latestFirst = [...games]
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
     .filter((game) => game.id && !excluded.has(String(game.id)));
-  const batch = latestFirst.slice(0, batchSize);
   const scannedGameIds: string[] = [];
+  const scannedIdSet = new Set<string>();
 
   const existingKeys = new Set(existingMoments.map(momentKey));
   const existingByKey = new Map(
@@ -297,178 +311,184 @@ export async function analyzeCriticalMistakes(options: {
       Math.round(item.eval_drop_cp * 10) / 10,
   });
 
-  const strictCount = () =>
-    candidates.filter(
-      (item) =>
-        item.eval_drop_cp >= STRICT_DROP_CP &&
-        item.priority_score >= STRICT_PRIORITY
-    ).length;
+  const scanChunk = async (
+    chunk: StudyGame[],
+    slotsNeeded: number
+  ): Promise<Ranked[]> => {
+    const chunkCandidates: Ranked[] = [];
+    const chunkStrictCount = () =>
+      chunkCandidates.filter(
+        (item) =>
+          item.eval_drop_cp >= STRICT_DROP_CP &&
+          item.priority_score >= STRICT_PRIORITY
+      ).length;
 
-  const wantNew =
-    appendCount != null && appendCount > 0
-      ? appendCount
-      : Math.max(0, TARGET_MOMENTS - existingMoments.length);
-
-  for (const game of batch) {
-    if (signal?.cancelled) break;
-    if (
-      stopOnStrict &&
-      appendCount == null &&
-      strictCount() >= TARGET_MOMENTS
-    ) {
-      break;
-    }
-    if (
-      appendCount != null &&
-      candidates.filter((item) => !existingKeys.has(momentKey(item))).length >=
-        Math.max(wantNew * 2, wantNew + 2)
-    ) {
-      break;
-    }
-
-    const sans = parseMoves(game);
-    if (sans.length < 6) {
-      scannedGameIds.push(String(game.id));
-      continue;
-    }
-
-    gamesScanned += 1;
-    scannedGameIds.push(String(game.id));
-    const gameLabel =
-      opponentName(game) || game.opening_name || String(game.id).slice(0, 8);
-    report(`Scanning ${gameLabel}`, "scan", {
-      currentGame: gameLabel,
-      log: `${ENGINE_LABEL} · game ${gamesScanned}/${batch.length} · ${gameLabel}`,
-    });
-
-    const userIsWhite = String(game.user_color || "white").toLowerCase() === "white";
-    const chess = new Chess();
-    let bestForGame: Ranked | null = null;
-    let bestPriority = -Infinity;
-    let userMoveIndex = -1;
-
-    for (let ply = 0; ply < sans.length; ply += 1) {
+    for (const game of chunk) {
       if (signal?.cancelled) break;
+      if (stopOnStrict && chunkStrictCount() >= slotsNeeded) {
+        break;
+      }
+      if (
+        appendCount != null &&
+        chunkCandidates.length >= Math.max(slotsNeeded * 2, slotsNeeded + 2)
+      ) {
+        break;
+      }
 
-      const turnIsWhite = chess.turn() === "w";
-      const isUserTurn = turnIsWhite === userIsWhite;
-      if (!isUserTurn) {
-        if (!applySan(chess, sans[ply])) break;
+      const sans = parseMoves(game);
+      if (sans.length < 6) {
+        scannedGameIds.push(String(game.id));
+        scannedIdSet.add(String(game.id));
         continue;
       }
 
-      userMoveIndex += 1;
-      if (ply < OPENING_PLY_SKIP) {
-        if (!applySan(chess, sans[ply])) break;
-        continue;
-      }
-      if (userMoveIndex % SAMPLE_EVERY !== 0 && ply < sans.length - 1) {
-        if (!applySan(chess, sans[ply])) break;
-        continue;
-      }
+      gamesScanned += 1;
+      scannedGameIds.push(String(game.id));
+      scannedIdSet.add(String(game.id));
+      const gameLabel =
+        opponentName(game) || game.opening_name || String(game.id).slice(0, 8);
+      report(`Scanning ${gameLabel}`, "scan", { currentGame: gameLabel });
 
-      const fenBefore = chess.fen();
-      const played = applySan(chess, sans[ply]);
-      if (!played) break;
-      const fenAfter = chess.fen();
-      const playedUci = uciFromMove(played);
-      const playedSan = played.san;
+      const userIsWhite = String(game.user_color || "white").toLowerCase() === "white";
+      const chess = new Chess();
+      const gameMoments: Ranked[] = [];
+      let userMoveIndex = -1;
 
-      positionsChecked += 1;
-      report(`Checking position ${positionsChecked}`, "scan", {
-        currentGame: gameLabel,
-        log: `${ENGINE_LABEL} · eval · ply ${ply + 1}`,
-      });
+      for (let ply = 0; ply < sans.length; ply += 1) {
+        if (signal?.cancelled) break;
 
-      let beforeRaw;
-      let afterRaw;
-      try {
-        beforeRaw = await evaluate(fenBefore, SCAN_DEPTH, 1, SCAN_MOVETIME);
-        afterRaw = await evaluate(fenAfter, SCAN_DEPTH, 1, SCAN_MOVETIME);
-      } catch {
-        continue;
-      }
+        const turnIsWhite = chess.turn() === "w";
+        const isUserTurn = turnIsWhite === userIsWhite;
+        if (!isUserTurn) {
+          if (!applySan(chess, sans[ply])) break;
+          continue;
+        }
 
-      const beforeCp = clampCp(toWhiteCp(fenBefore, beforeRaw.cpWhite));
-      const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
-      const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
-      const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
-      const drop = userBefore - userAfter;
-      if (drop < MIN_DROP_CP) continue;
+        userMoveIndex += 1;
+        if (ply < OPENING_PLY_SKIP) {
+          if (!applySan(chess, sans[ply])) break;
+          continue;
+        }
+        if (userMoveIndex % SAMPLE_EVERY !== 0 && ply < sans.length - 1) {
+          if (!applySan(chess, sans[ply])) break;
+          continue;
+        }
 
-      const bestUci = beforeRaw.bestUci
-        ? canonicalUci(fenBefore, beforeRaw.bestUci)
-        : "";
-      if (!bestUci || bestUci === playedUci) continue;
-      const probeLegal = new Chess(fenBefore);
-      if (!applyUciMove(probeLegal, bestUci)) continue;
+        const fenBefore = chess.fen();
+        const played = applySan(chess, sans[ply]);
+        if (!played) break;
+        const fenAfter = chess.fen();
+        const playedUci = uciFromMove(played);
+        const playedSan = played.san;
 
-      let bestSan: string | null = null;
-      if (bestUci && bestUci.length >= 4) {
-        const probe = new Chess(fenBefore);
-        const bestMove = applyUciMove(probe, bestUci);
-        bestSan = bestMove?.san || null;
-      }
-
-      const priority = mistakePriority(userBefore, userAfter, drop);
-      const item: Ranked = {
-        game_id: String(game.id),
-        created_at: String(game.created_at),
-        opening_name: game.opening_name,
-        opening_eco: game.opening_eco,
-        opponent_name: opponentName(game),
-        speed: game.speed,
-        user_color: String(game.user_color || "white"),
-        result: String(game.result || ""),
-        ply,
-        move_number: Math.floor(ply / 2) + 1,
-        fen: fenBefore,
-        played_uci: playedUci,
-        played_san: playedSan,
-        best_uci: bestUci,
-        best_san: bestSan,
-        best_pv: bestUci ? [bestUci] : [],
-        eval_before_cp: Math.round(beforeCp * 10) / 10,
-        eval_after_cp: Math.round(afterCp * 10) / 10,
-        eval_delta_cp: Math.round((afterCp - beforeCp) * 10) / 10,
-        eval_drop_cp: Math.round(drop * 10) / 10,
-        comment: `Your position worsened by ~${Math.round(drop)} cp after ${playedSan}.`,
-        priority_score: Math.round(priority * 10) / 10,
-      };
-
-      if (priority > bestPriority) {
-        bestPriority = priority;
-        bestForGame = item;
-      }
-    }
-
-    if (bestForGame && bestPriority >= MIN_PRIORITY) {
-      const posKey = positionKey(bestForGame);
-      if (chosenPositionKeys.has(posKey)) {
-        report(`Skipping duplicate position`, "scan", {
+        positionsChecked += 1;
+        report(`Checking position ${positionsChecked}`, "scan", {
           currentGame: gameLabel,
-          log: `skip · same board as prior chosen · ${bestForGame.played_san}`,
         });
-      } else {
+
+        let beforeRaw;
+        let afterRaw;
+        try {
+          beforeRaw = await evaluate(fenBefore, SCAN_DEPTH, 1, SCAN_MOVETIME);
+          afterRaw = await evaluate(fenAfter, SCAN_DEPTH, 1, SCAN_MOVETIME);
+        } catch {
+          continue;
+        }
+
+        const beforeCp = clampCp(toWhiteCp(fenBefore, beforeRaw.cpWhite));
+        const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
+        const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
+        const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
+        const drop = userBefore - userAfter;
+        if (drop < MIN_DROP_CP) continue;
+
+        const bestUci = beforeRaw.bestUci
+          ? canonicalUci(fenBefore, beforeRaw.bestUci)
+          : "";
+        if (!bestUci || bestUci === playedUci) continue;
+        const probeLegal = new Chess(fenBefore);
+        if (!applyUciMove(probeLegal, bestUci)) continue;
+
+        let bestSan: string | null = null;
+        if (bestUci && bestUci.length >= 4) {
+          const probe = new Chess(fenBefore);
+          const bestMove = applyUciMove(probe, bestUci);
+          bestSan = bestMove?.san || null;
+        }
+
+        const priority = mistakePriority(userBefore, userAfter, drop);
+        report(`Threshold check`, "scan", {
+          currentGame: gameLabel,
+          log: `${playedSan} ${Math.round(priority * 10) / 10} / strict ${STRICT_PRIORITY} / broad ${MIN_PRIORITY}`,
+        });
+        if (priority < MIN_PRIORITY) continue;
+
+        const item: Ranked = {
+          game_id: String(game.id),
+          created_at: String(game.created_at),
+          opening_name: game.opening_name,
+          opening_eco: game.opening_eco,
+          opponent_name: opponentName(game),
+          speed: game.speed,
+          user_color: String(game.user_color || "white"),
+          result: String(game.result || ""),
+          ply,
+          move_number: Math.floor(ply / 2) + 1,
+          fen: fenBefore,
+          played_uci: playedUci,
+          played_san: playedSan,
+          best_uci: bestUci,
+          best_san: bestSan,
+          best_pv: bestUci ? [bestUci] : [],
+          eval_before_cp: Math.round(beforeCp * 10) / 10,
+          eval_after_cp: Math.round(afterCp * 10) / 10,
+          eval_delta_cp: Math.round((afterCp - beforeCp) * 10) / 10,
+          eval_drop_cp: Math.round(drop * 10) / 10,
+          comment: `Your position worsened by ~${Math.round(drop)} cp after ${playedSan}.`,
+          priority_score: Math.round(priority * 10) / 10,
+        };
+
+        gameMoments.push(item);
+      }
+
+      gameMoments.sort(
+        (a, b) =>
+          b.priority_score - a.priority_score || b.eval_drop_cp - a.eval_drop_cp
+      );
+
+      for (const moment of gameMoments.slice(0, MAX_MOMENTS_PER_GAME)) {
+        const posKey = positionKey(moment);
+        if (chosenPositionKeys.has(posKey)) continue;
+
+        if (moment.priority_score < acceptFloor) {
+          const prevDeferred = deferredPool.get(posKey);
+          if (
+            !prevDeferred ||
+            moment.priority_score > prevDeferred.priority_score
+          ) {
+            deferredPool.set(posKey, moment);
+          }
+          continue;
+        }
+
+        deferredPool.delete(posKey);
         const priorIdx = candidates.findIndex(
           (item) => positionKey(item) === posKey
         );
         if (priorIdx >= 0) {
-          if (
-            bestForGame.priority_score > candidates[priorIdx].priority_score
-          ) {
-            candidates[priorIdx] = bestForGame;
+          if (moment.priority_score > candidates[priorIdx].priority_score) {
+            candidates[priorIdx] = moment;
+            chunkCandidates.push(moment);
           }
         } else {
-          candidates.push(bestForGame);
-          report(`Candidate ${candidates.length} found`, "scan", {
-            currentGame: gameLabel,
-            log: `candidate · ${bestForGame.played_san} · drop ${bestForGame.eval_drop_cp}cp`,
-          });
+          candidates.push(moment);
+          chunkCandidates.push(moment);
         }
       }
     }
-  }
+
+    return chunkCandidates;
+  };
 
   const byPriority = (a: Ranked, b: Ranked) =>
     b.priority_score - a.priority_score || b.eval_drop_cp - a.eval_drop_cp;
@@ -481,15 +501,17 @@ export async function analyzeCriticalMistakes(options: {
     if (existingKeys.has(key) || chosenPositionKeys.has(posKey)) continue;
     pendingMap.set(key, ranked);
   }
-  for (const item of candidates) {
-    const key = momentKey(item);
-    const posKey = positionKey(item);
-    if (existingKeys.has(key) || chosenPositionKeys.has(posKey)) continue;
-    const prev = pendingMap.get(key);
-    if (!prev || item.priority_score > prev.priority_score) {
-      pendingMap.set(key, item);
+  const addToPool = (items: Ranked[]) => {
+    for (const item of items) {
+      const key = momentKey(item);
+      const posKey = positionKey(item);
+      if (existingKeys.has(key) || chosenPositionKeys.has(posKey)) continue;
+      const prev = pendingMap.get(key);
+      if (!prev || item.priority_score > prev.priority_score) {
+        pendingMap.set(key, item);
+      }
     }
-  }
+  };
 
   let selected: Ranked[] = existingMoments.map(
     (item) => existingByKey.get(momentKey(item)) || toRanked(item)
@@ -522,7 +544,7 @@ export async function analyzeCriticalMistakes(options: {
       .filter(
         (item) =>
           item.eval_drop_cp >= BASE_MIN_DROP_CP &&
-          item.priority_score >= BASE_MIN_PRIORITY
+          item.priority_score >= acceptFloor
       )
       .sort(byPriority);
     const ordered: Ranked[] = [];
@@ -547,7 +569,6 @@ export async function analyzeCriticalMistakes(options: {
     report(`Refining moment`, "refine", {
       selected: selectedCount,
       candidates: candidates.length,
-      log: `${ENGINE_LABEL} · refine · ${moment.played_san} · depth ${REFINE_DEPTH}`,
     });
     try {
       const fenAfterBoard = new Chess(moment.fen);
@@ -590,19 +611,18 @@ export async function analyzeCriticalMistakes(options: {
       moment.comment = `Your position worsened by ~${Math.round(drop)} cp after ${moment.played_san}.`;
       moment.priority_score =
         Math.round(mistakePriority(userBefore, userAfter, drop) * 10) / 10;
-      if (!passesMistakeCriteria(moment)) return null;
+      if (!passesMistakeCriteria(moment, acceptFloor)) return null;
     } catch {
       if (!moment.best_uci || !canonicalUci(moment.fen, moment.best_uci)) {
         return null;
       }
-      if (!passesMistakeCriteria(moment)) return null;
+      if (!passesMistakeCriteria(moment, acceptFloor)) return null;
     }
 
     if (!moment.best_uci) return null;
     report(`Building continuation`, "continuation", {
       selected: selectedCount,
       candidates: candidates.length,
-      log: `${ENGINE_LABEL} · continuation · ${moment.best_san || moment.best_uci}`,
     });
     try {
       const cont = await resolveContinuationPv({
@@ -630,43 +650,98 @@ export async function analyzeCriticalMistakes(options: {
     appendCount != null && appendCount > 0
       ? selected.length + appendCount
       : TARGET_MOMENTS;
-  const slotsNeeded = Math.max(0, targetSelected - selected.length);
-  report(
-    slotsNeeded
-      ? `Selecting up to ${slotsNeeded} moment${slotsNeeded === 1 ? "" : "s"}`
-      : "Target moments already filled",
-    "scan",
-    {
-      candidates: candidates.length,
-      selected: selectedCount,
-      log: `pool · ${pendingMap.size} pending · need ${slotsNeeded} · skip ${existingKeys.size} selected`,
-    }
-  );
 
-  let attempts = 0;
-  const maxAttempts = pendingMap.size + slotsNeeded + 2;
-  while (selected.length < targetSelected && pendingMap.size > 0) {
-    if (signal?.cancelled) break;
-    if (attempts >= maxAttempts) break;
-    attempts += 1;
-    const need = targetSelected - selected.length;
-    const nextBatch = pickFromPool(need);
-    if (!nextBatch.length) break;
-    for (const candidate of nextBatch) {
-      const key = momentKey(candidate);
-      const posKey = positionKey(candidate);
-      pendingMap.delete(key);
-      if (selected.some((item) => momentKey(item) === key)) continue;
-      if (existingKeys.has(key) && appendCount != null) continue;
-      if (chosenPositionKeys.has(posKey)) continue;
-      const refined = await refineOne(candidate);
-      if (refined) {
-        selected.push(refined);
-        chosenPositionKeys.add(positionKey(refined));
-        selectedCount = selected.length - existingMoments.length;
-        if (selected.length >= targetSelected) break;
+  for (;;) {
+    report(`Threshold pass · ${thresholdPass}`, "scan", {
+      log: `--- ${thresholdPass} pass · floor ${acceptFloor} ---`,
+    });
+    let rounds = 0;
+    const maxRounds = latestFirst.length + targetSelected + 4;
+    while (selected.length < targetSelected) {
+      if (signal?.cancelled) break;
+      rounds += 1;
+      if (rounds > maxRounds) break;
+      const slotsNeeded = targetSelected - selected.length;
+
+      let nextBatch = pickFromPool(slotsNeeded);
+      if (!nextBatch.length) {
+        if (gamesScanned >= MAX_MISTAKE_SCAN_GAMES) break;
+        const chunk = latestFirst
+          .filter((game) => !scannedIdSet.has(String(game.id)))
+          .slice(0, Math.min(batchSize, MAX_MISTAKE_SCAN_GAMES - gamesScanned));
+        if (!chunk.length) break;
+        report(`Scanning ${chunk.length} more games`, "scan", {
+          candidates: candidates.length,
+          selected: selectedCount,
+        });
+        addToPool(await scanChunk(chunk, slotsNeeded));
+        nextBatch = pickFromPool(slotsNeeded);
+        if (!nextBatch.length) continue;
+      }
+
+      report(
+        `Selecting up to ${slotsNeeded} moment${slotsNeeded === 1 ? "" : "s"}`,
+        "scan",
+        {
+          candidates: candidates.length,
+          selected: selectedCount,
+        }
+      );
+
+      for (const candidate of nextBatch) {
+        if (signal?.cancelled) break;
+        const key = momentKey(candidate);
+        const posKey = positionKey(candidate);
+        pendingMap.delete(key);
+        if (selected.some((item) => momentKey(item) === key)) continue;
+        if (existingKeys.has(key) && appendCount != null) continue;
+        if (chosenPositionKeys.has(posKey)) continue;
+        const refined = await refineOne(candidate);
+        if (refined) {
+          selected.push(refined);
+          chosenPositionKeys.add(positionKey(refined));
+          selectedCount = selected.length - existingMoments.length;
+          if (selected.length >= targetSelected) break;
+        }
       }
     }
+
+    const remainingNow = Math.max(0, latestFirst.length - scannedGameIds.length);
+    if (
+      !signal?.cancelled &&
+      thresholdPass === "strict" &&
+      remainingNow <= 0 &&
+      selected.length < targetSelected
+    ) {
+      thresholdPass = "baseline";
+      acceptFloor = MIN_PRIORITY;
+      const revived = [...deferredPool.values()].filter(
+        (item) => item.priority_score >= MIN_PRIORITY
+      );
+      deferredPool.clear();
+      for (const item of revived) {
+        const key = momentKey(item);
+        const posKey = positionKey(item);
+        if (existingKeys.has(key) || chosenPositionKeys.has(posKey)) continue;
+        if (!candidates.some((c) => positionKey(c) === posKey)) {
+          candidates.push(item);
+        }
+        const prev = pendingMap.get(key);
+        if (!prev || item.priority_score > prev.priority_score) {
+          pendingMap.set(key, item);
+        }
+      }
+      if (!revived.length) {
+        scannedGameIds.length = 0;
+        scannedIdSet.clear();
+        gamesScanned = 0;
+      }
+      report(`Baseline pass · floor ${acceptFloor}`, "scan", {
+        log: `baseline floor ${acceptFloor} · revived ${revived.length}`,
+      });
+      continue;
+    }
+    break;
   }
 
   if (appendCount == null) {
@@ -679,6 +754,8 @@ export async function analyzeCriticalMistakes(options: {
     .sort(byPriority);
   const improved = selected.some((item) => !existingKeys.has(momentKey(item)));
   const remaining = Math.max(0, latestFirst.length - scannedGameIds.length);
+  const baselineAvailable =
+    thresholdPass === "strict" && remaining <= 0;
 
   report(
     selectedCount || selected.length
@@ -688,7 +765,7 @@ export async function analyzeCriticalMistakes(options: {
     {
       candidates: candidates.length,
       selected: selectedCount,
-      log: `${ENGINE_LABEL} · done · ${selectedCount} new moments · ${pendingCandidates.length} pending`,
+      log: `done · ${thresholdPass} · ${selectedCount} new · deferred ${deferredPool.size}`,
     }
   );
 
@@ -698,6 +775,8 @@ export async function analyzeCriticalMistakes(options: {
     scannedGameIds,
     improved,
     remaining,
+    thresholdPass,
+    baselineAvailable,
   };
 }
 

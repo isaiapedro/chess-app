@@ -1,7 +1,7 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import type { AnalyzeProgress } from "../engine/analyzeMistakes";
-import { colors, font } from "../theme";
+import { colors, font, spacing } from "../theme";
 
 const WAITING_LINES = [
   "Buying the chess board…",
@@ -42,6 +42,9 @@ function pickRandomLine(exclude?: string): string {
   return next;
 }
 
+const LOG_WINDOW = 12;
+const LOG_REFRESH_MS = 700;
+
 type Props = {
   progress: AnalyzeProgress | null;
   logLines?: string[];
@@ -50,9 +53,13 @@ type Props = {
 
 export function StudyAnalyzeStatus({
   progress,
+  logLines = [],
   fallback = "Setting up the pieces…",
 }: Props) {
   const [phrase, setPhrase] = useState(() => pickRandomLine());
+  const [visibleLogs, setVisibleLogs] = useState<string[]>([]);
+  const latestLogs = useRef(logLines);
+  latestLogs.current = logLines;
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -61,8 +68,18 @@ export function StudyAnalyzeStatus({
     return () => clearInterval(timer);
   }, []);
 
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setVisibleLogs(latestLogs.current.slice(-LOG_WINDOW));
+    }, LOG_REFRESH_MS);
+    return () => clearInterval(timer);
+  }, []);
+
   const candidates = progress?.candidates ?? 0;
   const selected = progress?.selected ?? 0;
+  const recentLogs = visibleLogs.length
+    ? visibleLogs
+    : logLines.slice(-LOG_WINDOW);
 
   return (
     <View style={styles.wrap}>
@@ -70,6 +87,15 @@ export function StudyAnalyzeStatus({
       <Text style={styles.counts}>
         Moments found: {candidates} · Ready to study: {selected}
       </Text>
+      {recentLogs.length ? (
+        <View style={styles.logBox}>
+          {recentLogs.map((line, index) => (
+            <Text key={`${index}-${line.slice(0, 24)}`} style={styles.logLine}>
+              {line}
+            </Text>
+          ))}
+        </View>
+      ) : null}
     </View>
   );
 }
@@ -87,5 +113,17 @@ const styles = StyleSheet.create({
     fontFamily: font.mono,
     fontSize: 12,
     textAlign: "center",
+  },
+  logBox: {
+    marginTop: spacing.xs,
+    width: "100%",
+    gap: 2,
+    paddingHorizontal: spacing.sm,
+  },
+  logLine: {
+    color: colors.textDim,
+    fontFamily: font.mono,
+    fontSize: 11,
+    textAlign: "left",
   },
 });

@@ -134,6 +134,15 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
         else:
             curr_unbeaten_streak = 0
 
+    current_win_streak = 0
+    for res in reversed(list(df_sorted["result"])):
+        if res == "Win":
+            current_win_streak += 1
+        elif res == "Draw":
+            continue
+        else:
+            break
+
     day_counts = df["created_at"].dt.day_name().value_counts()
     peak_day = day_counts.index[0] if not day_counts.empty else "N/A"
 
@@ -147,6 +156,7 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
         "total_hours": round(total_hours, 1),
         "max_win_streak": max_win_streak,
         "max_unbeaten_streak": max_unbeaten_streak,
+        "current_win_streak": current_win_streak,
         "peak_day": peak_day,
         "peak_hour": peak_hour_str,
     }

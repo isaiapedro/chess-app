@@ -321,6 +321,7 @@ export function selectRecapView(
     peakRating: rating.peak,
     currentRating: rating.current,
     ratingChange: rating.change,
+    currentWinStreak: Number(headline.current_win_streak || 0),
     results,
     stats: [
       {
