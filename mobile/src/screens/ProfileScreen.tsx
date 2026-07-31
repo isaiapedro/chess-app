@@ -1,21 +1,31 @@
 import React, { useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { BrutalButton, DisplayTitle } from "../components/ui";
+import { useFilters } from "../context/FilterContext";
 import { clearAppCache } from "../storage/cache";
 import { colors, font, result, spacing } from "../theme";
 
 export function ProfileScreen() {
+  const { refresh } = useFilters();
   const [clearing, setClearing] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [failed, setFailed] = useState(false);
 
   const onClearCache = async () => {
     if (clearing) return;
     setClearing(true);
     setStatus(null);
+    setFailed(false);
     try {
-      await clearAppCache();
-      setStatus("Cache cleared.");
+      const removed = await clearAppCache();
+      refresh();
+      setStatus(
+        removed
+          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"}.`
+          : "Nothing cached."
+      );
     } catch (e) {
+      setFailed(true);
       setStatus(e instanceof Error ? e.message : "Failed to clear cache");
     } finally {
       setClearing(false);
@@ -34,10 +44,7 @@ export function ProfileScreen() {
       />
       {status ? (
         <Text
-          style={[
-            styles.status,
-            status === "Cache cleared." ? styles.statusOk : styles.statusErr,
-          ]}
+          style={[styles.status, failed ? styles.statusErr : styles.statusOk]}
         >
           {status}
         </Text>

@@ -92,10 +92,11 @@ export async function getCacheAge(key: string): Promise<number | null> {
   }
 }
 
-export async function clearAppCache(): Promise<void> {
+export async function clearAppCache(): Promise<number> {
   const keys = await AsyncStorage.getAllKeys();
   const appKeys = keys.filter((key) => key.startsWith(PREFIX));
   if (appKeys.length) {
     await AsyncStorage.multiRemove(appKeys);
   }
+  return appKeys.length;
 }

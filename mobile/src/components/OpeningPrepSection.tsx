@@ -51,6 +51,7 @@ type Phase = "color" | "opening" | "analyze" | "quiz";
 type OpeningCachePayload = {
   moments: OpeningMoment[];
   pendingCandidates: OpeningMoment[];
+  deferredCandidates?: OpeningMoment[];
   scannedGameIds: string[];
   remaining: number;
   thresholdPass?: ThresholdPass;
@@ -82,6 +83,7 @@ function parseOpeningCache(
     return {
       moments: raw.moments,
       pendingCandidates: raw.pendingCandidates || [],
+      deferredCandidates: raw.deferredCandidates || [],
       scannedGameIds: raw.scannedGameIds || [],
       remaining: raw.remaining ?? 0,
       thresholdPass: raw.thresholdPass || "strict",
@@ -160,6 +162,7 @@ export function OpeningPrepSection(_props: Props = {}) {
   const [analyzeLog, setAnalyzeLog] = useState<string[]>([]);
   const scannedIdsRef = useRef<string[]>([]);
   const pendingCandidatesRef = useRef<OpeningMoment[]>([]);
+  const deferredCandidatesRef = useRef<OpeningMoment[]>([]);
   const filteredGamesRef = useRef<StudyGame[]>([]);
   const momentsRef = useRef<OpeningMoment[]>([]);
   const thresholdPassRef = useRef<ThresholdPass>("strict");
@@ -290,6 +293,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setIdx(0);
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
+    deferredCandidatesRef.current = [];
     filteredGamesRef.current = [];
     thresholdPassRef.current = "strict";
     baselineAvailableRef.current = false;
@@ -317,6 +321,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setScanExhausted(false);
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
+    deferredCandidatesRef.current = [];
     thresholdPassRef.current = "strict";
     baselineAvailableRef.current = false;
     setPendingCount(0);
@@ -337,6 +342,7 @@ export function OpeningPrepSection(_props: Props = {}) {
         setIdx(0);
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
+        deferredCandidatesRef.current = cached.deferredCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
         thresholdPassRef.current = cached.thresholdPass || "strict";
@@ -408,6 +414,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       if (signal.cancelled) return;
       scannedIdsRef.current = batch.scannedGameIds;
       pendingCandidatesRef.current = batch.pendingCandidates;
+      deferredCandidatesRef.current = batch.deferredCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
@@ -427,6 +434,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       await writeCache(cacheKey, {
         moments: batch.moments,
         pendingCandidates: batch.pendingCandidates,
+        deferredCandidates: batch.deferredCandidates,
         scannedGameIds: batch.scannedGameIds,
         remaining: batch.remaining,
         thresholdPass: batch.thresholdPass,
@@ -465,6 +473,8 @@ export function OpeningPrepSection(_props: Props = {}) {
     const signal = cancelRef.current;
     const keptMoments = momentsRef.current;
     const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
+    const carriedCandidates = pendingCandidatesRef.current;
+    const carriedDeferred = deferredCandidatesRef.current;
     setShowScanMore(false);
     setAllDone(false);
     pendingCandidatesRef.current = [];
@@ -510,7 +520,8 @@ export function OpeningPrepSection(_props: Props = {}) {
         signal,
         excludeGameIds: nextPass === "baseline" ? [] : scannedIdsRef.current,
         existingMoments: keptMoments,
-        existingCandidates: [],
+        existingCandidates: carriedCandidates,
+        existingDeferred: carriedDeferred,
         appendCount: APPEND_MOMENTS,
         stopOnStrict: nextPass === "strict",
         thresholdPass: nextPass,
@@ -544,6 +555,7 @@ export function OpeningPrepSection(_props: Props = {}) {
           ? batch.scannedGameIds
           : [...scannedIdsRef.current, ...batch.scannedGameIds];
       pendingCandidatesRef.current = batch.pendingCandidates;
+      deferredCandidatesRef.current = batch.deferredCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
@@ -562,6 +574,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       await writeCache(cacheKey, {
         moments: batch.moments,
         pendingCandidates: batch.pendingCandidates,
+        deferredCandidates: batch.deferredCandidates,
         scannedGameIds: scannedIdsRef.current,
         remaining: batch.remaining,
         thresholdPass: batch.thresholdPass,
@@ -662,6 +675,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setScanExhausted(false);
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
+    deferredCandidatesRef.current = [];
     filteredGamesRef.current = [];
     thresholdPassRef.current = "strict";
     baselineAvailableRef.current = false;

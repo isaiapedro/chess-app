@@ -10,6 +10,7 @@ import React, {
 import { StyleSheet, View } from "react-native";
 import Constants from "expo-constants";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
+import { Chess } from "chess.js";
 
 type EvalResult = {
   cpWhite: number;
@@ -30,6 +31,24 @@ type StockfishContextValue = {
 };
 
 const StockfishContext = createContext<StockfishContextValue | null>(null);
+
+const MATED_SCORE = -100000;
+
+function terminalEval(fen: string): EvalResult | null {
+  let board: Chess;
+  try {
+    board = new Chess(fen);
+  } catch {
+    return null;
+  }
+  if (!board.isGameOver()) return null;
+  return {
+    cpWhite: board.isCheckmate() ? MATED_SCORE : 0,
+    bestUci: null,
+    bestPv: [],
+    multipv: [],
+  };
+}
 
 type Pending = {
   id: string;
@@ -559,6 +578,11 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
   const evaluate = useCallback(
     (fen: string, depth = 15, multiPv = 1, movetimeMs = 1200) => {
       return new Promise<EvalResult>((resolve, reject) => {
+        const terminal = terminalEval(fen);
+        if (terminal) {
+          resolve(terminal);
+          return;
+        }
         if (!ready) {
           reject(new Error("Stockfish not ready"));
           return;

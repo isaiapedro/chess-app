@@ -47,6 +47,7 @@ type Mode = "mistakes" | "repertoire";
 type MistakesCachePayload = {
   moments: MistakeItem[];
   pendingCandidates: MistakeItem[];
+  deferredCandidates?: MistakeItem[];
   scannedGameIds: string[];
   remaining: number;
   thresholdPass?: ThresholdPass;
@@ -69,6 +70,7 @@ function parseMistakesCache(
     return {
       moments: raw.moments,
       pendingCandidates: raw.pendingCandidates || [],
+      deferredCandidates: raw.deferredCandidates || [],
       scannedGameIds: raw.scannedGameIds || [],
       remaining: raw.remaining ?? 0,
       thresholdPass: raw.thresholdPass || "strict",
@@ -134,6 +136,7 @@ export function StudyScreen() {
   const thresholdPassRef = useRef<ThresholdPass>("strict");
   const baselineAvailableRef = useRef(false);
   const pendingCandidatesRef = useRef<MistakeItem[]>([]);
+  const deferredCandidatesRef = useRef<MistakeItem[]>([]);
 
   const current = mistakes[idx] || null;
   const mistakesCacheKey = studyMistakesCacheKey(queryFilters);
@@ -223,6 +226,7 @@ export function StudyScreen() {
         setIdx(0);
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
+        deferredCandidatesRef.current = cached.deferredCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
         thresholdPassRef.current = cached.thresholdPass || "strict";
@@ -263,6 +267,7 @@ export function StudyScreen() {
         setIdx(0);
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
+        deferredCandidatesRef.current = cached.deferredCandidates || [];
         setPendingCount((cached.pendingCandidates || []).length);
         setRemainingGames(cached.remaining);
         thresholdPassRef.current = cached.thresholdPass || "strict";
@@ -333,6 +338,7 @@ export function StudyScreen() {
       if (signal.cancelled) return;
       scannedIdsRef.current = batch.scannedGameIds;
       pendingCandidatesRef.current = batch.pendingCandidates;
+      deferredCandidatesRef.current = batch.deferredCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
@@ -349,6 +355,7 @@ export function StudyScreen() {
         await writeCache(mistakesCacheKey, {
           moments: batch.moments,
           pendingCandidates: batch.pendingCandidates,
+          deferredCandidates: batch.deferredCandidates,
           scannedGameIds: batch.scannedGameIds,
           remaining: batch.remaining,
           thresholdPass: batch.thresholdPass,
@@ -404,6 +411,8 @@ export function StudyScreen() {
     const signal = cancelRef.current;
     const keptMoments = mistakesRef.current;
     const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
+    const carriedCandidates = pendingCandidatesRef.current;
+    const carriedDeferred = deferredCandidatesRef.current;
     setShowScanMore(false);
     setAllDone(false);
     resetQuizChrome();
@@ -460,7 +469,8 @@ export function StudyScreen() {
         signal,
         excludeGameIds: nextPass === "baseline" ? [] : scannedIdsRef.current,
         existingMoments: keptMoments,
-        existingCandidates: [],
+        existingCandidates: carriedCandidates,
+        existingDeferred: carriedDeferred,
         appendCount: TARGET_MISTAKE_MOMENTS,
         stopOnStrict: nextPass === "strict",
         thresholdPass: nextPass,
@@ -480,6 +490,7 @@ export function StudyScreen() {
           ? batch.scannedGameIds
           : [...scannedIdsRef.current, ...batch.scannedGameIds];
       pendingCandidatesRef.current = batch.pendingCandidates;
+      deferredCandidatesRef.current = batch.deferredCandidates;
       setPendingCount(batch.pendingCandidates.length);
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
@@ -498,6 +509,7 @@ export function StudyScreen() {
       await writeCache(mistakesCacheKey, {
         moments: batch.moments,
         pendingCandidates: batch.pendingCandidates,
+        deferredCandidates: batch.deferredCandidates,
         scannedGameIds: scannedIdsRef.current,
         remaining: batch.remaining,
         thresholdPass: batch.thresholdPass,
@@ -551,6 +563,7 @@ export function StudyScreen() {
       setIdx(0);
       scannedIdsRef.current = [];
       pendingCandidatesRef.current = [];
+      deferredCandidatesRef.current = [];
       thresholdPassRef.current = "strict";
       baselineAvailableRef.current = false;
       setPendingCount(0);

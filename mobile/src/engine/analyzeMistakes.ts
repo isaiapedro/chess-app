@@ -88,6 +88,7 @@ const STRICT_PRIORITY = HIGH_STRICT_PRIORITY;
 const TARGET_MOMENTS = TARGET_MISTAKE_MOMENTS;
 const EVAL_CLAMP = 2000;
 const MATE_CP_THRESHOLD = 50000;
+const MATE_MOVE_SPAN = 100;
 const GOOD_MOVE_MAX_LOSS_CP = 50;
 const GAP_TOLERANCE_FRACTION = 0.2;
 const GAP_TOLERANCE_MIN_CP = 20;
@@ -97,8 +98,8 @@ const CONTINUATION_PLIES = MIN_CONTINUATION_PLIES;
 export function clampCp(value: number): number {
   const abs = Math.abs(value);
   if (abs >= MATE_CP_THRESHOLD) {
-    const moves = Math.max(1, Math.min(99, Math.round((100000 - abs) / 1000)));
-    const encoded = EVAL_CLAMP + moves;
+    const moves = Math.max(0, Math.min(99, Math.round((100000 - abs) / 1000)));
+    const encoded = EVAL_CLAMP + (MATE_MOVE_SPAN - moves);
     return value > 0 ? encoded : -encoded;
   }
   return Math.max(-EVAL_CLAMP, Math.min(EVAL_CLAMP, value));
@@ -113,11 +114,11 @@ export function displayCp(value: number): number {
 export function formatEval(value: number): string {
   const abs = Math.abs(value);
   if (abs > EVAL_CLAMP) {
-    const moves = Math.max(1, Math.round(abs - EVAL_CLAMP));
-    return `Mate in ${moves}`;
-  }
-  if (abs >= EVAL_CLAMP) {
-    return "Mate";
+    const moves = Math.max(0, Math.round(MATE_MOVE_SPAN - (abs - EVAL_CLAMP)));
+    const side = value > 0 ? "w" : "b";
+    return moves === 0
+      ? `Checkmate for ${side}`
+      : `Mate in ${moves} for ${side}`;
   }
   const pawns = value / 100;
   return `${pawns > 0 ? "+" : ""}${pawns.toFixed(2)}`;
@@ -189,6 +190,7 @@ export type ThresholdPass = "strict" | "baseline";
 export type AnalyzeBatchResult = {
   moments: MistakeItem[];
   pendingCandidates: MistakeItem[];
+  deferredCandidates: MistakeItem[];
   scannedGameIds: string[];
   improved: boolean;
   remaining: number;
@@ -226,6 +228,7 @@ export async function analyzeCriticalMistakes(options: {
   excludeGameIds?: string[];
   existingMoments?: MistakeItem[];
   existingCandidates?: MistakeItem[];
+  existingDeferred?: MistakeItem[];
   batchSize?: number;
   stopOnStrict?: boolean;
   appendCount?: number;
@@ -241,6 +244,7 @@ export async function analyzeCriticalMistakes(options: {
     excludeGameIds = [],
     existingMoments = [],
     existingCandidates = [],
+    existingDeferred = [],
     batchSize = BATCH_GAMES,
     stopOnStrict = true,
     appendCount,
@@ -377,6 +381,7 @@ export async function analyzeCriticalMistakes(options: {
         const fenBefore = chess.fen();
         const played = applySan(chess, sans[ply]);
         if (!played) break;
+        if (chess.isCheckmate()) break;
         const fenAfter = chess.fen();
         const playedUci = uciFromMove(played);
         const playedSan = played.san;
@@ -397,8 +402,8 @@ export async function analyzeCriticalMistakes(options: {
 
         const beforeCp = clampCp(toWhiteCp(fenBefore, beforeRaw.cpWhite));
         const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
-        const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
-        const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
+        const userBefore = userIsWhite ? beforeCp : -beforeCp;
+        const userAfter = userIsWhite ? afterCp : -afterCp;
         const drop = userBefore - userAfter;
         if (drop < MIN_DROP_CP) continue;
 
@@ -492,6 +497,18 @@ export async function analyzeCriticalMistakes(options: {
 
   const byPriority = (a: Ranked, b: Ranked) =>
     b.priority_score - a.priority_score || b.eval_drop_cp - a.eval_drop_cp;
+
+  for (const item of existingDeferred) {
+    const ranked = toRanked(item);
+    const posKey = positionKey(ranked);
+    if (existingKeys.has(momentKey(ranked)) || chosenPositionKeys.has(posKey)) {
+      continue;
+    }
+    const prev = deferredPool.get(posKey);
+    if (!prev || ranked.priority_score > prev.priority_score) {
+      deferredPool.set(posKey, ranked);
+    }
+  }
 
   const pendingMap = new Map<string, Ranked>();
   for (const item of existingCandidates) {
@@ -592,8 +609,8 @@ export async function analyzeCriticalMistakes(options: {
       );
       const beforeCp = clampCp(toWhiteCp(moment.fen, beforeRaw.cpWhite));
       const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
-      const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
-      const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
+      const userBefore = userIsWhite ? beforeCp : -beforeCp;
+      const userAfter = userIsWhite ? afterCp : -afterCp;
       const drop = userBefore - userAfter;
       const bestUci = beforeRaw.bestUci
         ? canonicalUci(moment.fen, beforeRaw.bestUci)
@@ -745,12 +762,30 @@ export async function analyzeCriticalMistakes(options: {
   }
 
   if (appendCount == null) {
-    selected = selected.slice(0, TARGET_MOMENTS);
+    selected = [...selected].sort(byPriority).slice(0, TARGET_MOMENTS);
+  } else {
+    const neu = selected
+      .filter((item) => !existingKeys.has(momentKey(item)))
+      .sort(byPriority);
+    const kept = existingMoments
+      .map((item) =>
+        selected.find((row) => momentKey(row) === momentKey(item))
+      )
+      .filter((item): item is Ranked => Boolean(item));
+    selected = [...kept, ...neu];
   }
   selectedCount = Math.max(0, selected.length - existingMoments.length);
   const selectedKeySet = new Set(selected.map(momentKey));
   const pendingCandidates = [...pendingMap.values()]
     .filter((item) => !selectedKeySet.has(momentKey(item)))
+    .sort(byPriority);
+  const pendingKeySet = new Set(pendingCandidates.map(momentKey));
+  const deferredCandidates = [...deferredPool.values()]
+    .filter(
+      (item) =>
+        !selectedKeySet.has(momentKey(item)) &&
+        !pendingKeySet.has(momentKey(item))
+    )
     .sort(byPriority);
   const improved = selected.some((item) => !existingKeys.has(momentKey(item)));
   const remaining = Math.max(0, latestFirst.length - scannedGameIds.length);
@@ -772,6 +807,7 @@ export async function analyzeCriticalMistakes(options: {
   return {
     moments: selected,
     pendingCandidates,
+    deferredCandidates,
     scannedGameIds,
     improved,
     remaining,
@@ -893,8 +929,12 @@ export async function validateMoveLocal(
         bestWhite = toWhiteCp(fen, multi.cpWhite);
       }
       const turn = fen.split(" ")[1];
+      const userWhiteCapped = clampCp(userWhite);
+      const bestWhiteCapped = clampCp(bestWhite);
       const loss =
-        turn === "b" ? userWhite - bestWhite : bestWhite - userWhite;
+        turn === "b"
+          ? userWhiteCapped - bestWhiteCapped
+          : bestWhiteCapped - userWhiteCapped;
       const centipawnLoss = Math.round(Math.max(0, loss) * 10) / 10;
       const isBest = canonUserUci === resolvedBestUci;
       const isPlayed = playedCanon != null && canonUserUci === playedCanon;
@@ -908,8 +948,8 @@ export async function validateMoveLocal(
         verdict,
         user_san: userSan,
         centipawn_loss: centipawnLoss,
-        user_eval_cp: Math.round(userWhite * 10) / 10,
-        best_eval_cp: Math.round(bestWhite * 10) / 10,
+        user_eval_cp: Math.round(userWhiteCapped * 10) / 10,
+        best_eval_cp: Math.round(bestWhiteCapped * 10) / 10,
         best_continuation_san: bestContinuation || null,
         best_pv: bestPv,
         best_uci: resolvedBestUci,
@@ -918,7 +958,7 @@ export async function validateMoveLocal(
       };
     }
 
-    const loss = bestStm - userStm;
+    const loss = clampCp(bestStm) - clampCp(userStm);
     const centipawnLoss = Math.round(Math.max(0, loss) * 10) / 10;
     const isBest = canonUserUci === resolvedBestUci;
     const isPlayed = playedCanon != null && canonUserUci === playedCanon;
@@ -933,8 +973,8 @@ export async function validateMoveLocal(
       verdict,
       user_san: userSan,
       centipawn_loss: centipawnLoss,
-      user_eval_cp: Math.round(toWhiteCp(fen, userStm) * 10) / 10,
-      best_eval_cp: Math.round(toWhiteCp(fen, bestStm) * 10) / 10,
+      user_eval_cp: Math.round(clampCp(toWhiteCp(fen, userStm)) * 10) / 10,
+      best_eval_cp: Math.round(clampCp(toWhiteCp(fen, bestStm)) * 10) / 10,
       best_continuation_san: bestContinuation || null,
       best_pv: bestPv,
       best_uci: resolvedBestUci,

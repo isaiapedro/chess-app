@@ -504,6 +504,7 @@ export type ThresholdPass = "strict" | "baseline";
 export type OpeningAnalyzeBatchResult = {
   moments: OpeningMoment[];
   pendingCandidates: OpeningMoment[];
+  deferredCandidates: OpeningMoment[];
   scannedGameIds: string[];
   improved: boolean;
   remaining: number;
@@ -538,6 +539,7 @@ export async function analyzeOpeningMoments(options: {
   excludeGameIds?: string[];
   existingMoments?: OpeningMoment[];
   existingCandidates?: OpeningMoment[];
+  existingDeferred?: OpeningMoment[];
   batchSize?: number;
   stopOnStrict?: boolean;
   appendCount?: number;
@@ -555,6 +557,7 @@ export async function analyzeOpeningMoments(options: {
     excludeGameIds = [],
     existingMoments = [],
     existingCandidates = [],
+    existingDeferred = [],
     batchSize = MAX_OPENING_GAMES,
     stopOnStrict = true,
     appendCount,
@@ -613,6 +616,20 @@ export async function analyzeOpeningMoments(options: {
 
   const byPriority = (a: OpeningMoment, b: OpeningMoment) =>
     b.priority_score - a.priority_score;
+
+  for (const item of existingDeferred) {
+    const posKey = openingPositionKey(item);
+    if (
+      existingKeys.has(openingMomentKey(item)) ||
+      chosenPositionKeys.has(posKey)
+    ) {
+      continue;
+    }
+    const prev = deferredPool.get(posKey);
+    if (!prev || item.priority_score > prev.priority_score) {
+      deferredPool.set(posKey, item);
+    }
+  }
 
   const pendingMap = new Map<string, OpeningMoment>();
   for (const item of existingCandidates) {
@@ -683,8 +700,8 @@ export async function analyzeOpeningMoments(options: {
       );
       const beforeCp = clampCp(toWhiteCp(moment.fen, beforeRaw.cpWhite));
       const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
-      const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
-      const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
+      const userBefore = userIsWhite ? beforeCp : -beforeCp;
+      const userAfter = userIsWhite ? afterCp : -afterCp;
       const drop = userBefore - userAfter;
       const evalBestUci = beforeRaw.bestUci
         ? canonicalUci(moment.fen, beforeRaw.bestUci)
@@ -951,8 +968,8 @@ export async function analyzeOpeningMoments(options: {
           );
           const beforeCp = clampCp(toWhiteCp(fenBefore, beforeRaw.cpWhite));
           const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
-          const userBefore = clampCp(userIsWhite ? beforeCp : -beforeCp);
-          const userAfter = clampCp(userIsWhite ? afterCp : -afterCp);
+          const userBefore = userIsWhite ? beforeCp : -beforeCp;
+          const userAfter = userIsWhite ? afterCp : -afterCp;
           evalDrop = userBefore - userAfter;
           evalBefore = beforeCp;
           evalAfter = afterCp;
@@ -1258,12 +1275,32 @@ export async function analyzeOpeningMoments(options: {
   }
 
   if (appendCount == null) {
-    selected = selected.slice(0, TARGET_MOMENTS);
+    selected = [...selected].sort(byPriority).slice(0, TARGET_MOMENTS);
+  } else {
+    const neu = selected
+      .filter((item) => !existingKeys.has(openingMomentKey(item)))
+      .sort(byPriority);
+    const kept = existingMoments
+      .map((item) =>
+        selected.find(
+          (row) => openingMomentKey(row) === openingMomentKey(item)
+        )
+      )
+      .filter((item): item is OpeningMoment => Boolean(item));
+    selected = [...kept, ...neu];
   }
   selectedCount = Math.max(0, selected.length - existingMoments.length);
   const selectedKeySet = new Set(selected.map(openingMomentKey));
   const pendingCandidates = [...pendingMap.values()]
     .filter((item) => !selectedKeySet.has(openingMomentKey(item)))
+    .sort(byPriority);
+  const pendingKeySet = new Set(pendingCandidates.map(openingMomentKey));
+  const deferredCandidates = [...deferredPool.values()]
+    .filter(
+      (item) =>
+        !selectedKeySet.has(openingMomentKey(item)) &&
+        !pendingKeySet.has(openingMomentKey(item))
+    )
     .sort(byPriority);
   const improved = selected.some(
     (item) => !existingKeys.has(openingMomentKey(item))
@@ -1287,6 +1324,7 @@ export async function analyzeOpeningMoments(options: {
   return {
     moments: selected,
     pendingCandidates,
+    deferredCandidates,
     scannedGameIds,
     improved,
     remaining,
