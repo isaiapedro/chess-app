@@ -105,7 +105,7 @@ const styles = StyleSheet.create({
     lineHeight: 18,
   },
   comparison: {
-    backgroundColor: colors.surfaceAlt,
+    backgroundColor: colors.muted,
     borderRadius: 12,
     padding: spacing.md,
     alignItems: "center",

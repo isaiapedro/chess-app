@@ -5,52 +5,82 @@ import React, {
   useMemo,
   useState,
 } from "react";
-import type { DatePreset, Platform, Timeframe } from "../api/types";
+import type { Period, Platform, Timeframe } from "../api/types";
 import type { QueryFilters } from "../api/client";
 
 function isoDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
+
+const PERIOD_TIMEFRAME: Record<Period, Timeframe> = {
+  all: "1 year",
+  year: "1 year",
+  month: "1 month",
+  week: "1 month",
+  day: "1 month",
+};
 
 function startOfWeek(d: Date): Date {
   const copy = new Date(d);
-  const day = copy.getDay();
-  const diff = day === 0 ? -6 : 1 - day;
-  copy.setDate(copy.getDate() + diff);
+  const weekday = copy.getDay();
+  copy.setDate(copy.getDate() + (weekday === 0 ? -6 : 1 - weekday));
   copy.setHours(0, 0, 0, 0);
   return copy;
 }
 
 function resolveDateRange(
-  preset: DatePreset,
-  customFrom: Date | null,
-  customTo: Date | null
+  period: Period,
+  selectedDay: Date
 ): { dateFrom: string | null; dateTo: string | null } {
   const now = new Date();
-  if (preset === "all") return { dateFrom: null, dateTo: null };
-  if (preset === "custom") {
-    return {
-      dateFrom: customFrom ? isoDate(customFrom) : null,
-      dateTo: customTo ? isoDate(customTo) : null,
-    };
-  }
-  if (preset === "day") {
-    const day = isoDate(now);
+  if (period === "day") {
+    const day = isoDate(selectedDay);
     return { dateFrom: day, dateTo: day };
   }
-  if (preset === "week") {
-    const start = startOfWeek(now);
-    return { dateFrom: isoDate(start), dateTo: isoDate(now) };
+  if (period === "week") {
+    return { dateFrom: isoDate(startOfWeek(now)), dateTo: isoDate(now) };
   }
-  if (preset === "month") {
+  if (period === "month") {
     const start = new Date(now.getFullYear(), now.getMonth(), 1);
     return { dateFrom: isoDate(start), dateTo: isoDate(now) };
   }
-  if (preset === "year") {
-    const start = new Date(now.getFullYear(), 0, 1);
+  if (period === "year") {
+    const start = new Date(now);
+    start.setFullYear(start.getFullYear() - 1);
+    start.setHours(0, 0, 0, 0);
     return { dateFrom: isoDate(start), dateTo: isoDate(now) };
   }
   return { dateFrom: null, dateTo: null };
+}
+
+function shortDate(d: Date): string {
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" });
+}
+
+function buildPeriodLabel(period: Period, selectedDay: Date): string {
+  const now = new Date();
+  if (period === "year") {
+    const start = new Date(now);
+    start.setFullYear(start.getFullYear() - 1);
+    return `${shortDate(start)} – ${shortDate(now)}`;
+  }
+  if (period === "month") {
+    return now.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+  }
+  if (period === "week") {
+    return `${shortDate(startOfWeek(now))} – ${shortDate(now)}`;
+  }
+  if (period === "day") {
+    return selectedDay.toLocaleDateString(undefined, {
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    });
+  }
+  return "All Time";
 }
 
 type FilterContextValue = {
@@ -58,18 +88,13 @@ type FilterContextValue = {
   setUsername: (v: string) => void;
   platform: Platform;
   setPlatform: (v: Platform) => void;
-  timeframe: Timeframe;
-  setTimeframe: (v: Timeframe) => void;
-  datePreset: DatePreset;
-  setDatePreset: (v: DatePreset) => void;
-  customFrom: Date | null;
-  setCustomFrom: (v: Date | null) => void;
-  customTo: Date | null;
-  setCustomTo: (v: Date | null) => void;
+  period: Period;
+  setPeriod: (v: Period) => void;
+  selectedDay: Date;
+  setSelectedDay: (v: Date) => void;
+  periodLabel: string;
   speed: string | null;
   setSpeed: (v: string | null) => void;
-  color: "white" | "black" | null;
-  setColor: (v: "white" | "black" | null) => void;
   queryFilters: QueryFilters;
   refreshToken: number;
   refresh: () => void;
@@ -80,12 +105,9 @@ const FilterContext = createContext<FilterContextValue | null>(null);
 export function FilterProvider({ children }: { children: React.ReactNode }) {
   const [username, setUsername] = useState("pedroisaia");
   const [platform, setPlatform] = useState<Platform>("chesscom");
-  const [timeframe, setTimeframe] = useState<Timeframe>("1 month");
-  const [datePreset, setDatePreset] = useState<DatePreset>("all");
-  const [customFrom, setCustomFrom] = useState<Date | null>(null);
-  const [customTo, setCustomTo] = useState<Date | null>(null);
+  const [period, setPeriod] = useState<Period>("month");
+  const [selectedDay, setSelectedDay] = useState<Date>(new Date());
   const [speed, setSpeed] = useState<string | null>(null);
-  const [color, setColor] = useState<"white" | "black" | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);
 
   const refresh = useCallback(() => {
@@ -93,26 +115,21 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const queryFilters = useMemo<QueryFilters>(() => {
-    const range = resolveDateRange(datePreset, customFrom, customTo);
+    const range = resolveDateRange(period, selectedDay);
     return {
       username: username.trim() || "pedroisaia",
       platform,
-      timeframe,
+      timeframe: PERIOD_TIMEFRAME[period],
       speed,
-      color,
       dateFrom: range.dateFrom,
       dateTo: range.dateTo,
     };
-  }, [
-    username,
-    platform,
-    timeframe,
-    datePreset,
-    customFrom,
-    customTo,
-    speed,
-    color,
-  ]);
+  }, [username, platform, period, selectedDay, speed]);
+
+  const periodLabel = useMemo(
+    () => buildPeriodLabel(period, selectedDay),
+    [period, selectedDay]
+  );
 
   const value = useMemo(
     () => ({
@@ -120,18 +137,13 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
       setUsername,
       platform,
       setPlatform,
-      timeframe,
-      setTimeframe,
-      datePreset,
-      setDatePreset,
-      customFrom,
-      setCustomFrom,
-      customTo,
-      setCustomTo,
+      period,
+      setPeriod,
+      selectedDay,
+      setSelectedDay,
+      periodLabel,
       speed,
       setSpeed,
-      color,
-      setColor,
       queryFilters,
       refreshToken,
       refresh,
@@ -139,12 +151,10 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
     [
       username,
       platform,
-      timeframe,
-      datePreset,
-      customFrom,
-      customTo,
+      period,
+      selectedDay,
+      periodLabel,
       speed,
-      color,
       queryFilters,
       refreshToken,
       refresh,

@@ -1,8 +1,13 @@
+from pathlib import Path
+
+from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from api.routers import games, stats, study
 from api.schemas import HealthResponse
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 app = FastAPI(
     title="Chess Wrapped Analytics API",

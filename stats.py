@@ -152,6 +152,66 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def calculate_activity_stats(df: pd.DataFrame) -> dict:
+    if df.empty:
+        return {
+            "hourly_activity": [],
+            "monthly_activity": [],
+            "results_breakdown": {
+                "wins": 0,
+                "draws": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+            },
+        }
+
+    work = df.copy()
+    wins = int((work["result"] == "Win").sum())
+    draws = int((work["result"] == "Draw").sum())
+    losses = int((work["result"] == "Loss").sum())
+    total = len(work)
+    win_rate = round((wins / total) * 100, 1) if total else 0.0
+
+    hourly_activity = []
+    hours = work["created_at"].dt.hour
+    for hour in range(24):
+        mask = hours == hour
+        bucket = work[mask]
+        hourly_activity.append(
+            {
+                "hour": hour,
+                "label": str(hour),
+                "games": int(len(bucket)),
+                "wins": int((bucket["result"] == "Win").sum()),
+            }
+        )
+
+    monthly_activity = []
+    work["month_key"] = work["created_at"].dt.to_period("M")
+    for period, group in work.groupby("month_key", sort=True):
+        ratings = group["user_rating"].dropna()
+        monthly_activity.append(
+            {
+                "month": period.strftime("%b"),
+                "month_key": str(period),
+                "games": int(len(group)),
+                "wins": int((group["result"] == "Win").sum()),
+                "rating": int(ratings.iloc[-1]) if not ratings.empty else None,
+            }
+        )
+
+    return {
+        "hourly_activity": hourly_activity,
+        "monthly_activity": monthly_activity,
+        "results_breakdown": {
+            "wins": wins,
+            "draws": draws,
+            "losses": losses,
+            "win_rate": win_rate,
+        },
+    }
+
+
 # --- BULLET 2: OPENING REPERTOIRE ---
 def calculate_opening_stats(df: pd.DataFrame, min_games: int = 3) -> dict:
     if df.empty:
@@ -386,6 +446,14 @@ def parse_game_interactions(row: pd.Series) -> dict:
     castling_choice = "Uncastled"
     promotions = {"Q": 0, "N": 0, "R": 0, "B": 0}
     checkmate_piece = None
+    captured_piece_weight_g = 0.0
+    piece_weight_g = {
+        chess.PAWN: 4.0,
+        chess.KNIGHT: 8.0,
+        chess.BISHOP: 8.0,
+        chess.ROOK: 12.0,
+        chess.QUEEN: 16.0,
+    }
 
     for ply, move in enumerate(moves):
         is_user_turn = (
@@ -394,15 +462,20 @@ def parse_game_interactions(row: pd.Series) -> dict:
             else (board.turn == chess.BLACK)
         )
 
-        if first_blood is None and board.is_capture(move):
+        is_capture = board.is_capture(move)
+
+        if first_blood is None and is_capture:
             first_blood = "user" if is_user_turn else "opponent"
 
-        if is_user_turn and board.is_capture(move):
+        if is_user_turn and is_capture:
             captured_piece = board.piece_at(move.to_square)
             if not captured_piece and board.is_en_passant(move):
                 captured_piece = chess.Piece(chess.PAWN, not board.turn)
 
             if captured_piece:
+                captured_piece_weight_g += piece_weight_g.get(
+                    captured_piece.piece_type, 0.0
+                )
                 if captured_piece.piece_type == chess.KNIGHT:
                     knights_captured_by_user += 1
                 elif captured_piece.piece_type == chess.BISHOP:
@@ -471,6 +544,7 @@ def parse_game_interactions(row: pd.Series) -> dict:
         "promotions": promotions,
         "checkmate_piece": checkmate_piece,
         "endgame_type": endgame_type,
+        "captured_piece_weight_g": captured_piece_weight_g,
     }
 
 
@@ -489,6 +563,7 @@ def calculate_notation_stats(df: pd.DataFrame) -> dict:
     checkmate_finishers = {}
     endgame_types = {}
     parsed_count = 0
+    captured_piece_weight_g = 0.0
 
     for idx, row in df.iterrows():
         res = parse_game_interactions(row)
@@ -498,6 +573,7 @@ def calculate_notation_stats(df: pd.DataFrame) -> dict:
         parsed_count += 1
         total_knights += res["knights_captured"]
         total_bishops += res["bishops_captured"]
+        captured_piece_weight_g += res["captured_piece_weight_g"]
 
         df.at[idx, "first_blood"] = res["first_blood"]
 
@@ -548,6 +624,7 @@ def calculate_notation_stats(df: pd.DataFrame) -> dict:
         "underpromotions": underpromotions,
         "checkmate_finishers": checkmate_finishers,
         "endgame_types": endgame_types,
+        "captured_piece_weight_g": round(captured_piece_weight_g, 1),
     }
 
 

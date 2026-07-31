@@ -7,67 +7,58 @@ import {
   Text,
   View,
 } from "react-native";
-import { fetchInsights } from "../api/client";
-import type { InsightsResponse } from "../api/types";
-import { AnimatedPanel, DonutChart } from "../components/AnalyticsCharts";
+import Svg, { Circle } from "react-native-svg";
+import { LineChart } from "react-native-chart-kit";
+import { fetchInsights, fetchRecap } from "../api/client";
+import { selectFactors } from "../api/selectors";
+import type { FactorItem, InsightsResponse, RecapResponse } from "../api/types";
+import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
-import { colors, spacing } from "../theme";
-
-type NumericMap = Record<string, number>;
-type OpeningRow = {
-  opening_eco?: string;
-  eco_label?: string;
-  total?: number;
-  wins?: number;
-  losses?: number;
-  draws?: number;
-  win_rate?: number;
-};
-
-function asNumber(value: unknown): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : 0;
-}
-
-function asMap(value: unknown): NumericMap {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return {};
-  return Object.fromEntries(
-    Object.entries(value as Record<string, unknown>).map(([key, item]) => [
-      key,
-      asNumber(item),
-    ])
-  );
-}
+import { colors, font, result, spacing, withAlpha } from "../theme";
+import { CatalogScreen } from "./CatalogScreen";
 
 export function InsightsScreen() {
   const { queryFilters, refreshToken } = useFilters();
   const [data, setData] = useState<InsightsResponse | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [recap, setRecap] = useState<RecapResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [showCatalog, setShowCatalog] = useState(false);
 
   const load = useCallback(
     async (forceNetwork = false) => {
-      setLoading(true);
-      setError(null);
       try {
-        setData(await fetchInsights(queryFilters, forceNetwork));
+        setError(null);
+        const [insights, recapData] = await Promise.all([
+          fetchInsights(queryFilters, forceNetwork),
+          fetchRecap(queryFilters, forceNetwork),
+        ]);
+        setData(insights);
+        setRecap(recapData);
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load insights");
       } finally {
         setLoading(false);
+        setRefreshing(false);
       }
     },
     [queryFilters]
   );
 
   useEffect(() => {
-    load();
+    setLoading(true);
+    void load(false);
   }, [load, refreshToken]);
+
+  if (showCatalog && data) {
+    return <CatalogScreen data={data} onBack={() => setShowCatalog(false)} />;
+  }
 
   if (loading && !data) {
     return (
       <View style={styles.center}>
-        <ActivityIndicator color={colors.accent} size="large" />
-        <Text style={styles.muted}>Loading insights…</Text>
+        <ActivityIndicator color={colors.red} />
       </View>
     );
   }
@@ -76,276 +67,317 @@ export function InsightsScreen() {
     return (
       <View style={styles.center}>
         <Text style={styles.error}>{error}</Text>
-        <Text style={styles.muted}>Cached analytics load automatically offline.</Text>
       </View>
     );
   }
 
-  const style = data?.style || {};
-  const conditional =
-    (style.conditional as Record<string, unknown> | undefined) || {};
-  const clock = (style.clock as Record<string, unknown> | undefined) || {};
-  const openings = data?.openings || {};
-  const middlegames = data?.middlegames || {};
-  const endgames = data?.endgames || {};
-  const castling = asMap(style.castling_counts);
-  const endgameTypes = asMap(endgames.endgame_types);
-  const openingRows = Array.isArray(openings.op_group)
-    ? (openings.op_group as OpeningRow[])
-        .slice()
-        .sort((a, b) => asNumber(b.total) - asNumber(a.total))
-        .slice(0, 5)
-    : [];
+  if (!data) return null;
+
+  const factors = selectFactors(data);
+  const results = recap?.results || {
+    wins: 0,
+    draws: 0,
+    losses: 0,
+    win_rate: factors.baseline_win_rate || 0,
+  };
+  const ratingSeries = (recap?.rating_series || []).slice(-12);
+  const winRate = results.win_rate || factors.baseline_win_rate || 0;
 
   return (
     <ScrollView
-      style={styles.wrap}
+      style={styles.scroll}
       contentContainerStyle={styles.content}
       refreshControl={
         <RefreshControl
-          refreshing={loading}
-          onRefresh={() => load(true)}
-          tintColor={colors.accent}
+          refreshing={refreshing}
+          tintColor={colors.red}
+          onRefresh={() => {
+            setRefreshing(true);
+            void load(true);
+          }}
         />
       }
     >
-      <Text style={styles.title}>Insights</Text>
-      <Text style={styles.subtitle}>
-        {data?.meta.username} · {data?.meta.games_count ?? 0} games
-      </Text>
+      <View style={styles.hero}>
+        <Eyebrow>Performance Analysis</Eyebrow>
+        <DisplayTitle size={34}>
+          What Moves{"\n"}the Needle
+        </DisplayTitle>
+      </View>
 
-      <Text style={styles.section}>Playing style</Text>
-      <AnimatedPanel>
-        <View style={styles.metricGrid}>
-          <Metric
-            label="Baseline win rate"
-            value={`${asNumber(conditional.baseline_win_rate).toFixed(1)}%`}
-          />
-          <Metric
-            label="First blood"
-            value={`${asNumber(style.first_blood_pct).toFixed(1)}%`}
-          />
-          <Metric
-            label="Vs higher rated"
-            value={`${asNumber(conditional.underdog_win_rate).toFixed(1)}%`}
-          />
-          <Metric
-            label="Avg move time"
-            value={`${asNumber(clock.avg_time_per_move_user).toFixed(1)}s`}
-          />
-        </View>
-      </AnimatedPanel>
-
-      <DonutChart
-        title="Castling choices"
-        data={[
-          { name: "Kingside", value: castling.Kingside || 0, color: colors.accent },
-          { name: "Queenside", value: castling.Queenside || 0, color: colors.info },
-          { name: "Uncastled", value: castling.Uncastled || 0, color: colors.warning },
-        ]}
-      />
-
-      <Text style={styles.section}>Openings</Text>
-      <AnimatedPanel>
-        <Text style={styles.panelTitle}>Most played ECOs</Text>
-        {openingRows.map((row) => (
-          <View key={row.opening_eco || row.eco_label} style={styles.listRow}>
-            <View style={styles.listCopy}>
-              <Text style={styles.listTitle} numberOfLines={1}>
-                {row.eco_label || row.opening_eco || "Unknown"}
-              </Text>
-              <View style={styles.track}>
-                <View
-                  style={[
-                    styles.trackFill,
-                    {
-                      width: `${Math.min(100, Math.max(2, asNumber(row.win_rate)))}%`,
-                    },
-                  ]}
-                />
-              </View>
+      <EdgeCard lifted style={styles.summaryCard}>
+        <View style={styles.summaryRow}>
+          <WinRateDial value={winRate} />
+          <View style={{ flex: 1 }}>
+            <View style={styles.wdlRow}>
+              {[
+                { label: "Wins", value: results.wins, color: result.win },
+                { label: "Draws", value: results.draws, color: result.draw },
+                { label: "Losses", value: results.losses, color: result.loss },
+              ].map((item) => (
+                <View key={item.label}>
+                  <Text style={[styles.wdlValue, { color: item.color }]}>{item.value}</Text>
+                  <Text style={styles.wdlLabel}>{item.label}</Text>
+                </View>
+              ))}
             </View>
-            <Text style={styles.listMeta}>
-              {row.total ?? 0}g · {asNumber(row.win_rate).toFixed(0)}%
-            </Text>
+            {ratingSeries.length > 1 ? (
+              <LineChart
+                data={{
+                  labels: ratingSeries.map(() => ""),
+                  datasets: [{ data: ratingSeries.map((p) => p.user_rating) }],
+                }}
+                width={220}
+                height={40}
+                withDots={false}
+                withInnerLines={false}
+                withOuterLines={false}
+                withVerticalLabels={false}
+                withHorizontalLabels={false}
+                chartConfig={{
+                  backgroundGradientFrom: colors.surface,
+                  backgroundGradientTo: colors.surface,
+                  color: () => colors.blue,
+                  labelColor: () => colors.textDim,
+                  propsForBackgroundLines: { stroke: "transparent" },
+                }}
+                style={{ paddingRight: 0, marginLeft: -16 }}
+              />
+            ) : null}
           </View>
-        ))}
-      </AnimatedPanel>
-
-      <Text style={styles.section}>Middlegame</Text>
-      <AnimatedPanel>
-        <View style={styles.metricGrid}>
-          <Metric
-            label="Knights captured"
-            value={`${asNumber(middlegames.knights_captured)}`}
-          />
-          <Metric
-            label="Bishops captured"
-            value={`${asNumber(middlegames.bishops_captured)}`}
-          />
-          <Metric
-            label="Early queen trades"
-            value={`${asNumber(middlegames.queenless_pct).toFixed(1)}%`}
-          />
-          <Metric
-            label="Underpromotions"
-            value={`${asNumber(middlegames.underpromotions)}`}
-          />
         </View>
-      </AnimatedPanel>
+      </EdgeCard>
 
-      <Text style={styles.section}>Endgame</Text>
-      <DonutChart
-        title="Endgame types reached"
-        data={Object.entries(endgameTypes).map(([name, value], index) => ({
-          name,
-          value,
-          color: [colors.accent, colors.info, colors.warning, "#a78bfa", "#f87171"][
-            index % 5
-          ],
-        }))}
-      />
-      <AnimatedPanel>
-        <View style={styles.metricGrid}>
-          <Metric
-            label="Sprints (≤30)"
-            value={`${asNumber(endgames.short_games_count)}`}
-            detail={`${asNumber(endgames.short_win_rate).toFixed(1)}% wins`}
-          />
-          <Metric
-            label="Marathons (>50)"
-            value={`${asNumber(endgames.marathon_games_count)}`}
-            detail={`${asNumber(endgames.marathon_win_rate).toFixed(1)}% wins`}
-          />
-        </View>
-      </AnimatedPanel>
+      <View style={styles.pad}>
+        <GroupHeading label="Driving Your Wins" accent={result.win} />
+        {factors.driving.length ? (
+          factors.driving.map((item) => (
+            <FactorCard
+              key={item.condition}
+              item={item}
+              baseline={factors.baseline_win_rate}
+              positive
+            />
+          ))
+        ) : (
+          <Text style={styles.empty}>No positive drivers in this sample.</Text>
+        )}
+      </View>
+
+      <View style={styles.pad}>
+        <GroupHeading label="Costing You Points" accent={result.loss} />
+        {factors.costing.length ? (
+          factors.costing.map((item) => (
+            <FactorCard
+              key={item.condition}
+              item={item}
+              baseline={factors.baseline_win_rate}
+              positive={false}
+            />
+          ))
+        ) : (
+          <Text style={styles.empty}>No negative drivers in this sample.</Text>
+        )}
+      </View>
+
+      <View style={[styles.pad, { marginTop: spacing.md }]}>
+        <BrutalButton
+          label="Explore All Metrics →"
+          onPress={() => setShowCatalog(true)}
+        />
+      </View>
     </ScrollView>
   );
 }
 
-function Metric({
-  label,
-  value,
-  detail,
-}: {
-  label: string;
-  value: string;
-  detail?: string;
-}) {
+function WinRateDial({ value }: { value: number }) {
+  const size = 72;
+  const stroke = 8;
+  const radius = (size - stroke) / 2;
+  const circumference = 2 * Math.PI * radius;
+  const clamped = Math.max(0, Math.min(100, value));
+  const offset = circumference - (clamped / 100) * circumference;
+
   return (
-    <View style={styles.metric}>
-      <Text style={styles.metricLabel}>{label}</Text>
-      <Text style={styles.metricValue}>{value}</Text>
-      {detail ? <Text style={styles.metricDetail}>{detail}</Text> : null}
+    <View style={{ width: size, height: size, marginRight: spacing.md }}>
+      <Svg width={size} height={size}>
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke={withAlpha("#ffffff", 0.1)}
+          strokeWidth={stroke}
+          fill="none"
+        />
+        <Circle
+          cx={size / 2}
+          cy={size / 2}
+          r={radius}
+          stroke={colors.blue}
+          strokeWidth={stroke}
+          fill="none"
+          strokeDasharray={`${circumference} ${circumference}`}
+          strokeDashoffset={offset}
+          strokeLinecap="round"
+          rotation="-90"
+          origin={`${size / 2}, ${size / 2}`}
+        />
+      </Svg>
+      <View style={styles.dialCenter}>
+        <Text style={styles.dialValue}>{Math.round(clamped)}%</Text>
+      </View>
     </View>
   );
 }
 
+function GroupHeading({ label, accent }: { label: string; accent: string }) {
+  return (
+    <View style={styles.groupHead}>
+      <View style={[styles.dot, { backgroundColor: accent }]} />
+      <Text style={[styles.groupLabel, { color: accent }]}>{label}</Text>
+      <View style={styles.rule} />
+    </View>
+  );
+}
+
+function FactorCard({
+  item,
+  baseline,
+  positive,
+}: {
+  item: FactorItem;
+  baseline: number;
+  positive: boolean;
+}) {
+  const accent = positive ? result.win : result.loss;
+  const widthPct = Math.max(8, Math.min(100, item.win_rate));
+  const baselinePct = Math.max(0, Math.min(100, baseline));
+
+  return (
+    <EdgeCard style={{ ...styles.factorCard, borderLeftColor: accent, borderLeftWidth: 3 }}>
+      <Text style={styles.factorName}>{item.condition}</Text>
+      <View style={styles.factorRow}>
+        <Text style={styles.factorValue}>{item.win_rate}%</Text>
+        <Text style={[styles.factorDelta, { color: accent }]}>
+          {item.diff > 0 ? "+" : ""}
+          {item.diff}%
+        </Text>
+      </View>
+      <Text style={styles.factorMeta}>baseline {baseline}%</Text>
+      <View style={styles.barTrack}>
+        <View style={[styles.barFill, { width: `${widthPct}%`, backgroundColor: accent }]} />
+        <View style={[styles.baselineMark, { left: `${baselinePct}%` }]} />
+      </View>
+      <View style={styles.barLabels}>
+        <Text style={styles.barLabel}>You</Text>
+        <Text style={styles.barLabel}>Your baseline</Text>
+      </View>
+    </EdgeCard>
+  );
+}
+
 const styles = StyleSheet.create({
-  wrap: {
-    flex: 1,
-    backgroundColor: colors.bg,
-  },
-  content: {
-    padding: spacing.md,
-    paddingBottom: spacing.xl,
-  },
+  scroll: { flex: 1, backgroundColor: colors.bg },
+  content: { paddingBottom: 100 },
   center: {
-    alignItems: "center",
-    backgroundColor: colors.bg,
     flex: 1,
-    gap: spacing.sm,
+    alignItems: "center",
     justifyContent: "center",
+    backgroundColor: colors.bg,
     padding: spacing.lg,
   },
-  title: {
-    color: colors.text,
-    fontSize: 28,
-    fontWeight: "800",
-  },
-  subtitle: {
-    color: colors.textMuted,
-    marginBottom: spacing.md,
-    marginTop: 4,
-  },
-  section: {
-    color: colors.text,
-    fontSize: 18,
-    fontWeight: "700",
-    marginBottom: spacing.sm,
-    marginTop: spacing.md,
-  },
-  panelTitle: {
-    color: colors.text,
-    fontSize: 17,
-    fontWeight: "700",
-    marginBottom: spacing.sm,
-  },
-  metricGrid: {
-    flexDirection: "row",
-    flexWrap: "wrap",
-    gap: spacing.sm,
-  },
-  metric: {
-    backgroundColor: colors.surfaceAlt,
-    borderRadius: 10,
-    flexGrow: 1,
-    minWidth: "46%",
-    padding: spacing.md,
-  },
-  metricLabel: {
-    color: colors.textMuted,
+  error: { color: colors.red, fontFamily: font.monoBold, textAlign: "center" },
+  hero: { padding: spacing.md, paddingTop: spacing.lg },
+  summaryCard: { marginHorizontal: spacing.md, marginBottom: spacing.md },
+  summaryRow: { flexDirection: "row", alignItems: "center" },
+  wdlRow: { flexDirection: "row", gap: 14, marginBottom: 6 },
+  wdlValue: { fontFamily: font.display, fontSize: 20 },
+  wdlLabel: {
+    color: colors.textDim,
+    fontFamily: font.mono,
     fontSize: 11,
+    letterSpacing: 1,
+    textTransform: "uppercase",
   },
-  metricValue: {
-    color: colors.text,
-    fontSize: 21,
-    fontWeight: "700",
-    marginTop: 3,
-  },
-  metricDetail: {
-    color: colors.accent,
-    fontSize: 11,
-    marginTop: 2,
-  },
-  listRow: {
+  dialCenter: {
+    ...StyleSheet.absoluteFillObject,
     alignItems: "center",
-    borderBottomColor: colors.border,
-    borderBottomWidth: 1,
-    flexDirection: "row",
-    gap: spacing.sm,
-    paddingVertical: 10,
+    justifyContent: "center",
   },
-  listCopy: {
-    flex: 1,
-  },
-  listTitle: {
+  dialValue: {
     color: colors.text,
-    fontSize: 13,
-    marginBottom: 5,
+    fontFamily: font.display,
+    fontSize: 15,
   },
-  listMeta: {
-    color: colors.textMuted,
+  pad: { paddingHorizontal: spacing.md, marginTop: spacing.sm },
+  groupHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.sm,
+  },
+  dot: { width: 8, height: 8 },
+  groupLabel: {
+    fontFamily: font.monoBold,
+    fontSize: 11,
+    letterSpacing: 2,
+    textTransform: "uppercase",
+  },
+  rule: { flex: 1, height: 1, backgroundColor: colors.border },
+  empty: {
+    color: colors.textDim,
+    fontFamily: font.sans,
+    fontSize: 12,
+    marginBottom: spacing.md,
+  },
+  factorCard: { marginBottom: spacing.sm },
+  factorName: {
+    color: colors.textDim,
+    fontFamily: font.mono,
+    fontSize: 11,
+    letterSpacing: 1.4,
+    textTransform: "uppercase",
+    marginBottom: 6,
+  },
+  factorRow: { flexDirection: "row", alignItems: "baseline", gap: 8 },
+  factorValue: {
+    color: colors.text,
+    fontFamily: font.display,
+    fontSize: 28,
+  },
+  factorDelta: {
+    fontFamily: font.monoBold,
     fontSize: 12,
   },
-  track: {
-    backgroundColor: colors.bg,
-    borderRadius: 3,
-    height: 5,
-    overflow: "hidden",
+  factorMeta: {
+    color: colors.textDim,
+    fontFamily: font.mono,
+    fontSize: 12,
+    marginTop: 2,
+    marginBottom: 10,
   },
-  trackFill: {
-    backgroundColor: colors.accent,
-    borderRadius: 3,
-    height: "100%",
+  barTrack: {
+    height: 4,
+    backgroundColor: withAlpha("#ffffff", 0.08),
+    position: "relative",
   },
-  muted: {
-    color: colors.textMuted,
-    textAlign: "center",
+  barFill: { height: 4 },
+  baselineMark: {
+    position: "absolute",
+    top: -1,
+    width: 2,
+    height: 6,
+    backgroundColor: colors.rim,
+    marginLeft: -1,
   },
-  error: {
-    color: colors.danger,
-    fontWeight: "600",
-    textAlign: "center",
+  barLabels: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    marginTop: 5,
+  },
+  barLabel: {
+    color: colors.textDim,
+    fontFamily: font.mono,
+    fontSize: 11,
   },
 });

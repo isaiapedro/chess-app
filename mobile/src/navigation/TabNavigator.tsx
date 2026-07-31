@@ -4,10 +4,10 @@ import { Ionicons } from "@expo/vector-icons";
 import { RecapScreen } from "../screens/RecapScreen";
 import { InsightsScreen } from "../screens/InsightsScreen";
 import { StudyScreen } from "../screens/StudyScreen";
-import { colors } from "../theme";
+import { colors, font } from "../theme";
 
 export type RootTabParamList = {
-  Recap: undefined;
+  Wrapped: undefined;
   Insights: undefined;
   Study: undefined;
 };
@@ -20,24 +20,31 @@ export function TabNavigator() {
       screenOptions={({ route }) => ({
         headerShown: false,
         tabBarStyle: {
-          backgroundColor: colors.surface,
-          borderTopColor: colors.border,
+          backgroundColor: colors.bg,
+          borderTopColor: colors.text,
+          borderTopWidth: 2,
+          height: 64,
+          paddingTop: 6,
         },
-        tabBarActiveTintColor: colors.accent,
-        tabBarInactiveTintColor: colors.textMuted,
+        tabBarActiveTintColor: colors.red,
+        tabBarInactiveTintColor: colors.textDim,
+        tabBarLabelStyle: {
+          fontFamily: font.monoBold,
+          fontSize: 11,
+          letterSpacing: 1,
+          textTransform: "uppercase",
+        },
         tabBarIcon: ({ color, size }) => {
           const map: Record<keyof RootTabParamList, keyof typeof Ionicons.glyphMap> = {
-            Recap: "trophy-outline",
-            Insights: "analytics-outline",
+            Wrapped: "star-outline",
+            Insights: "bar-chart-outline",
             Study: "school-outline",
           };
-          return (
-            <Ionicons name={map[route.name]} size={size} color={color} />
-          );
+          return <Ionicons name={map[route.name]} size={size} color={color} />;
         },
       })}
     >
-      <Tab.Screen name="Recap" component={RecapScreen} />
+      <Tab.Screen name="Wrapped" component={RecapScreen} />
       <Tab.Screen name="Insights" component={InsightsScreen} />
       <Tab.Screen name="Study" component={StudyScreen} />
     </Tab.Navigator>

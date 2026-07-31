@@ -5,8 +5,10 @@ import os
 import pathlib
 import time
 import requests
+from dotenv import load_dotenv
 
 PROJECT_ROOT = pathlib.Path(__file__).resolve().parent
+load_dotenv(PROJECT_ROOT / ".env")
 CACHE_BASE = PROJECT_ROOT / ".cache"
 CACHE_BASE.mkdir(exist_ok=True)
 
@@ -50,8 +52,17 @@ def _lichess_headers() -> dict:
     return headers
 
 
+RATE_LIMIT_COOLDOWN = 120.0
+_rate_limited_until = 0.0
+
+
 def lichess_get(url: str, params: dict, label: str):
     """GET JSON from Lichess, returning None on any transport or HTTP error."""
+    global _rate_limited_until
+
+    if time.monotonic() < _rate_limited_until:
+        return None
+
     started = time.monotonic()
     try:
         res = requests.get(
@@ -92,6 +103,14 @@ def lichess_get(url: str, params: dict, label: str):
         }
     )
     # endregion
+
+    if res.status_code == 429:
+        try:
+            retry_after = float(res.headers.get("Retry-After") or RATE_LIMIT_COOLDOWN)
+        except ValueError:
+            retry_after = RATE_LIMIT_COOLDOWN
+        _rate_limited_until = time.monotonic() + min(retry_after, RATE_LIMIT_COOLDOWN)
+        return None
 
     if res.status_code != 200:
         return None
@@ -149,6 +168,16 @@ def get_player_prep(username: str, color: str, fen: str):
     url = f"{EXPLORER_BASE}/player"
     params = {"player": username.lower(), "color": color, "fen": fen}
     return lichess_get(url, params, "explorer_player")
+
+
+def rating_buckets_for_elo(elo: int, spread: int = 300) -> str:
+    buckets = [1000, 1200, 1400, 1600, 1800, 2000, 2200, 2500]
+    lo = elo - spread
+    hi = elo + spread
+    selected = [b for b in buckets if b >= lo - 100 and b <= hi + 100]
+    if not selected:
+        selected = [1600, 1800, 2000]
+    return ",".join(str(b) for b in selected)
 
 
 @disk_cache("cloud_eval")

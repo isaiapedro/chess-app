@@ -159,6 +159,10 @@ def _parse_lichess_games(raw_games: list, username: str) -> pd.DataFrame:
                 "opp_rating": g.get("players", {})
                 .get(opp_color, {})
                 .get("rating"),
+                "opponent_name": g.get("players", {})
+                .get(opp_color, {})
+                .get("user", {})
+                .get("name", "Unknown"),
                 "result": result,
                 "opening_name": opening_info.get("name", "Unknown"),
                 "opening_eco": opening_info.get("eco", "UNK"),
@@ -227,6 +231,7 @@ def _parse_chesscom_games(raw_games: list, username: str) -> pd.DataFrame:
                 "user_color": user_color,
                 "user_rating": user_data.get("rating"),
                 "opp_rating": opp_data.get("rating"),
+                "opponent_name": opp_data.get("username", "Unknown"),
                 "result": result,
                 "opening_name": opening_name,
                 "opening_eco": opening_eco,

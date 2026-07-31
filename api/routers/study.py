@@ -36,8 +36,11 @@ def study_explorer(
     source: Literal["lichess", "masters", "player"] = Query("lichess"),
     username: Optional[str] = Query(None),
     color: Optional[Literal["white", "black"]] = Query(None),
+    ratings: Optional[str] = Query(None),
 ):
-    return explorer_position(fen, source=source, username=username, color=color)
+    return explorer_position(
+        fen, source=source, username=username, color=color, ratings=ratings
+    )
 
 
 @router.get("/mistakes")

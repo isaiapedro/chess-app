@@ -1,50 +1,45 @@
 import React, { useState } from "react";
 import {
+  Platform as RNPlatform,
   Pressable,
-  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
 import DateTimePicker from "@react-native-community/datetimepicker";
+import type { Period, Platform } from "../api/types";
 import { useFilters } from "../context/FilterContext";
-import type { DatePreset, Platform, Timeframe } from "../api/types";
-import { colors, spacing } from "../theme";
+import { MetaTag, SelectField } from "./ui";
+import { colors, font, spacing } from "../theme";
 
-const DATE_PRESETS: { key: DatePreset; label: string }[] = [
-  { key: "all", label: "All" },
-  { key: "year", label: "Year" },
-  { key: "month", label: "Month" },
-  { key: "week", label: "Week" },
-  { key: "day", label: "Day" },
-  { key: "custom", label: "Custom" },
+const PERIODS: { value: Period; label: string }[] = [
+  { value: "all", label: "All Time" },
+  { value: "year", label: "Year" },
+  { value: "month", label: "Month" },
+  { value: "week", label: "Week" },
+  { value: "day", label: "Day" },
 ];
 
-const PLATFORMS: Platform[] = ["chesscom", "lichess"];
-const TIMEFRAMES: Timeframe[] = ["1 month", "6 months", "1 year"];
-const SPEEDS = [null, "bullet", "blitz", "rapid", "classical"] as const;
-const COLORS = [null, "white", "black"] as const;
+const SPEEDS = [
+  { value: "", label: "All Formats" },
+  { value: "bullet", label: "♟ Bullet" },
+  { value: "blitz", label: "♝ Blitz" },
+  { value: "rapid", label: "♞ Rapid" },
+  { value: "classical", label: "♔ Classical" },
+];
 
-function Chip({
-  label,
-  active,
-  onPress,
-}: {
-  label: string;
-  active: boolean;
-  onPress: () => void;
-}) {
-  return (
-    <Pressable
-      onPress={onPress}
-      style={[styles.chip, active && styles.chipActive]}
-    >
-      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-        {label}
-      </Text>
-    </Pressable>
-  );
+const PLATFORMS: { value: Platform; label: string }[] = [
+  { value: "chesscom", label: "Chess.com" },
+  { value: "lichess", label: "Lichess" },
+];
+
+function formatDay(date: Date): string {
+  return date.toLocaleDateString(undefined, {
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  });
 }
 
 export function FilterHeader() {
@@ -53,234 +48,162 @@ export function FilterHeader() {
     setUsername,
     platform,
     setPlatform,
-    timeframe,
-    setTimeframe,
-    datePreset,
-    setDatePreset,
-    customFrom,
-    setCustomFrom,
-    customTo,
-    setCustomTo,
+    period,
+    setPeriod,
+    selectedDay,
+    setSelectedDay,
     speed,
     setSpeed,
-    color,
-    setColor,
     refresh,
   } = useFilters();
 
-  const [showFrom, setShowFrom] = useState(false);
-  const [showTo, setShowTo] = useState(false);
+  const [draftUser, setDraftUser] = useState(username);
+  const [picking, setPicking] = useState(false);
 
   return (
     <View style={styles.wrap}>
-      <Text style={styles.title}>Chess Wrapped</Text>
-      <View style={styles.row}>
+      <View style={styles.userRow}>
         <TextInput
-          style={styles.input}
-          value={username}
-          onChangeText={setUsername}
-          placeholder="Username"
-          placeholderTextColor={colors.textMuted}
+          value={draftUser}
+          onChangeText={setDraftUser}
+          placeholder="username"
+          placeholderTextColor={colors.textDim}
           autoCapitalize="none"
           autoCorrect={false}
+          style={styles.input}
         />
-        <Pressable style={styles.refreshBtn} onPress={refresh}>
-          <Text style={styles.refreshText}>Load</Text>
+        <Pressable
+          style={styles.loadBtn}
+          onPress={() => {
+            setUsername(draftUser.trim() || username);
+            refresh();
+          }}
+        >
+          <Text style={styles.loadText}>Load</Text>
         </Pressable>
       </View>
 
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipRow}
-      >
-        {PLATFORMS.map((p) => (
-          <Chip
-            key={p}
-            label={p}
-            active={platform === p}
-            onPress={() => setPlatform(p)}
+      <View style={styles.selectRow}>
+        <SelectField
+          label="Period"
+          value={period}
+          options={PERIODS}
+          onChange={(v) => setPeriod(v as Period)}
+        />
+        <SelectField
+          label="Time Format"
+          value={speed || ""}
+          options={SPEEDS}
+          onChange={(v) => setSpeed(v || null)}
+        />
+      </View>
+
+      <View style={styles.chipRow}>
+        {PLATFORMS.map((item) => (
+          <MetaTag
+            key={item.value}
+            label={item.label}
+            active={platform === item.value}
+            onPress={() => setPlatform(item.value)}
           />
         ))}
-        {TIMEFRAMES.map((t) => (
-          <Chip
-            key={t}
-            label={t}
-            active={timeframe === t}
-            onPress={() => setTimeframe(t)}
-          />
-        ))}
-      </ScrollView>
+      </View>
 
-      <Text style={styles.sectionLabel}>Date filter</Text>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipRow}
-      >
-        {DATE_PRESETS.map((p) => (
-          <Chip
-            key={p.key}
-            label={p.label}
-            active={datePreset === p.key}
-            onPress={() => setDatePreset(p.key)}
-          />
-        ))}
-      </ScrollView>
+      {period === "day" ? (
+        <Pressable style={styles.dateBtn} onPress={() => setPicking(true)}>
+          <Text style={styles.dateText}>{formatDay(selectedDay)}</Text>
+        </Pressable>
+      ) : null}
 
-      {datePreset === "custom" && (
-        <View style={styles.customRow}>
-          <Pressable
-            style={styles.dateBtn}
-            onPress={() => setShowFrom(true)}
-          >
-            <Text style={styles.dateBtnText}>
-              From: {customFrom ? customFrom.toISOString().slice(0, 10) : "pick"}
-            </Text>
-          </Pressable>
-          <Pressable style={styles.dateBtn} onPress={() => setShowTo(true)}>
-            <Text style={styles.dateBtnText}>
-              To: {customTo ? customTo.toISOString().slice(0, 10) : "pick"}
-            </Text>
-          </Pressable>
-        </View>
-      )}
-
-      {showFrom && (
+      {picking ? (
         <DateTimePicker
-          value={customFrom || new Date()}
+          value={selectedDay}
           mode="date"
-          onChange={(_, date) => {
-            setShowFrom(false);
-            if (date) setCustomFrom(date);
+          maximumDate={new Date()}
+          display={RNPlatform.OS === "ios" ? "inline" : "calendar"}
+          onChange={(event, date) => {
+            if (RNPlatform.OS !== "ios") setPicking(false);
+            if (event.type === "dismissed") return;
+            if (date) setSelectedDay(date);
           }}
         />
-      )}
-      {showTo && (
-        <DateTimePicker
-          value={customTo || new Date()}
-          mode="date"
-          onChange={(_, date) => {
-            setShowTo(false);
-            if (date) setCustomTo(date);
-          }}
-        />
-      )}
+      ) : null}
 
-      <Text style={styles.sectionLabel}>Extras</Text>
-      <ScrollView
-        horizontal
-        showsHorizontalScrollIndicator={false}
-        contentContainerStyle={styles.chipRow}
-      >
-        {SPEEDS.map((s) => (
-          <Chip
-            key={s ?? "all-speed"}
-            label={s ?? "All speeds"}
-            active={speed === s}
-            onPress={() => setSpeed(s)}
-          />
-        ))}
-        {COLORS.map((c) => (
-          <Chip
-            key={c ?? "all-color"}
-            label={c ?? "All colors"}
-            active={color === c}
-            onPress={() => setColor(c)}
-          />
-        ))}
-      </ScrollView>
+      {picking && RNPlatform.OS === "ios" ? (
+        <Pressable style={styles.doneBtn} onPress={() => setPicking(false)}>
+          <Text style={styles.loadText}>Done</Text>
+        </Pressable>
+      ) : null}
     </View>
   );
 }
 
 const styles = StyleSheet.create({
   wrap: {
-    backgroundColor: colors.surface,
+    backgroundColor: "rgba(0,0,0,0.96)",
     borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+    borderBottomColor: colors.rim,
     paddingHorizontal: spacing.md,
-    paddingTop: spacing.md,
-    paddingBottom: spacing.sm,
+    paddingTop: spacing.sm,
+    paddingBottom: spacing.md,
+    gap: spacing.sm,
   },
-  title: {
-    color: colors.accent,
-    fontSize: 20,
-    fontWeight: "700",
-    marginBottom: spacing.sm,
-  },
-  row: {
+  userRow: {
     flexDirection: "row",
     gap: spacing.sm,
-    marginBottom: spacing.sm,
   },
   input: {
     flex: 1,
-    backgroundColor: colors.bg,
+    minHeight: 42,
     borderWidth: 1,
     borderColor: colors.border,
-    borderRadius: 8,
+    backgroundColor: colors.charcoal,
     color: colors.text,
-    paddingHorizontal: spacing.md,
-    paddingVertical: spacing.sm,
-  },
-  refreshBtn: {
-    backgroundColor: colors.accentDim,
-    borderRadius: 8,
-    justifyContent: "center",
-    paddingHorizontal: spacing.md,
-  },
-  refreshText: {
-    color: colors.accent,
-    fontWeight: "700",
-  },
-  sectionLabel: {
-    color: colors.textMuted,
+    paddingHorizontal: 12,
+    fontFamily: font.mono,
     fontSize: 12,
-    marginTop: spacing.xs,
-    marginBottom: spacing.xs,
+  },
+  loadBtn: {
+    backgroundColor: colors.red,
+    borderWidth: 2,
+    borderColor: colors.text,
+    paddingHorizontal: 16,
+    justifyContent: "center",
+  },
+  loadText: {
+    color: colors.text,
+    fontFamily: font.monoBold,
+    fontSize: 11,
+    letterSpacing: 1,
     textTransform: "uppercase",
-    letterSpacing: 0.6,
+    textAlign: "center",
+  },
+  selectRow: {
+    flexDirection: "row",
+    gap: 10,
   },
   chipRow: {
-    gap: spacing.sm,
-    paddingBottom: spacing.sm,
-  },
-  chip: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 16,
-    paddingHorizontal: 12,
-    paddingVertical: 6,
-    backgroundColor: colors.bg,
-  },
-  chipActive: {
-    borderColor: colors.accent,
-    backgroundColor: colors.accentDim,
-  },
-  chipText: {
-    color: colors.textMuted,
-    fontSize: 13,
-  },
-  chipTextActive: {
-    color: colors.accent,
-    fontWeight: "600",
-  },
-  customRow: {
     flexDirection: "row",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
+    gap: 6,
   },
   dateBtn: {
-    flex: 1,
-    backgroundColor: colors.bg,
-    borderRadius: 8,
     borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.sm,
+    borderColor: "#000000",
+    backgroundColor: colors.cream,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
   },
-  dateBtnText: {
-    color: colors.text,
-    fontSize: 13,
+  dateText: {
+    color: "#111111",
+    fontFamily: font.monoBold,
+    fontSize: 11,
+    letterSpacing: 1,
+    textTransform: "uppercase",
+  },
+  doneBtn: {
+    backgroundColor: colors.red,
+    borderWidth: 2,
+    borderColor: colors.text,
+    paddingVertical: 10,
   },
 });

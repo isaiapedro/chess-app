@@ -38,9 +38,12 @@ export type MistakeItem = {
   created_at: string;
   opening_name?: string;
   opening_eco?: string;
+  opponent_name?: string;
+  speed?: string;
   user_color: string;
   result: string;
   ply: number;
+  move_number?: number;
   fen: string;
   played_uci: string;
   played_san: string;
@@ -48,6 +51,7 @@ export type MistakeItem = {
   best_san: string | null;
   eval_before_cp: number;
   eval_after_cp: number;
+  eval_delta_cp?: number;
   eval_drop_cp: number;
   comment: string;
 };
@@ -152,10 +156,12 @@ export async function fetchInsights(
 
 export async function fetchGames(
   filters: QueryFilters,
-  forceNetwork = false
+  forceNetwork = false,
+  includePgn = false
 ): Promise<{ count: number; games: Array<Record<string, unknown>> }> {
   const params = buildParams(filters);
   params.delete("username");
+  if (includePgn) params.set("include_pgn", "true");
   return getJson(
     `/api/v1/games/${encodeURIComponent(filters.username)}`,
     params,
@@ -163,14 +169,14 @@ export async function fetchGames(
   );
 }
 
-export async function fetchMistakes(
+export async function fetchStudyGames(
   filters: QueryFilters,
-  limit = 5
-): Promise<{ meta: Record<string, unknown>; mistakes: MistakeItem[] }> {
-  const params = buildParams(filters);
-  params.set("limit", String(limit));
-  params.set("max_games", "3");
-  return getJson("/api/v1/study/mistakes", params);
+  forceNetwork = false
+): Promise<Array<Record<string, unknown>>> {
+  const payload = await fetchGames(filters, forceNetwork, true);
+  return (payload.games || []).sort((a, b) =>
+    String(b.created_at || "").localeCompare(String(a.created_at || ""))
+  );
 }
 
 export async function fetchEval(fen: string, multiPv = 3) {
@@ -191,11 +197,13 @@ export async function fetchExplorer(
   fen: string,
   source: "lichess" | "masters" | "player" = "lichess",
   username?: string,
-  color?: "white" | "black"
+  color?: "white" | "black",
+  ratings?: string
 ) {
   const params = new URLSearchParams({ fen, source });
   if (username) params.set("username", username);
   if (color) params.set("color", color);
+  if (ratings) params.set("ratings", ratings);
   return getJson<{
     fen: string;
     source: string;
@@ -204,6 +212,8 @@ export async function fetchExplorer(
     white: number;
     draws: number;
     black: number;
+    fallback?: boolean;
+    note?: string;
   }>("/api/v1/study/explorer", params);
 }
 
@@ -217,6 +227,7 @@ export async function validateQuizMove(
     legal: boolean;
     user_san: string | null;
     accepted_as_top_line: boolean;
+    centipawn_loss: number | null;
   }>("/api/v1/study/quiz/validate", {
     fen,
     user_uci: userUci,

@@ -6,27 +6,18 @@ import {
   Text,
   View,
 } from "react-native";
+import Svg, { Path } from "react-native-svg";
 import { Chess, Square } from "chess.js";
-import { colors } from "../theme";
+import { colors, withAlpha } from "../theme";
+import {
+  ALPHA_PIECES,
+  ALPHA_VIEWBOX,
+  type AlphaPieceKey,
+} from "./pieces/alphaPieces";
 
 const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
 const RANKS_WHITE = [8, 7, 6, 5, 4, 3, 2, 1] as const;
 const RANKS_BLACK = [1, 2, 3, 4, 5, 6, 7, 8] as const;
-
-const PIECE_GLYPH: Record<string, string> = {
-  wK: "♔",
-  wQ: "♕",
-  wR: "♖",
-  wB: "♗",
-  wN: "♘",
-  wP: "♙",
-  bK: "♚",
-  bQ: "♛",
-  bR: "♜",
-  bB: "♝",
-  bN: "♞",
-  bP: "♟",
-};
 
 type Props = {
   fen: string;
@@ -37,7 +28,25 @@ type Props = {
 };
 
 function squareColor(fileIdx: number, rankIdx: number): string {
-  return (fileIdx + rankIdx) % 2 === 0 ? "#b58863" : "#f0d9b5";
+  return (fileIdx + rankIdx) % 2 === 0 ? colors.boardLight : colors.boardDark;
+}
+
+function PieceSvg({
+  pieceKey,
+  size,
+}: {
+  pieceKey: AlphaPieceKey;
+  size: number;
+}) {
+  const paths = ALPHA_PIECES[pieceKey];
+  if (!paths?.length) return null;
+  return (
+    <Svg width={size} height={size} viewBox={ALPHA_VIEWBOX}>
+      {paths.map((path, index) => (
+        <Path key={`${pieceKey}-${index}`} d={path.d} fill={path.fill} />
+      ))}
+    </Svg>
+  );
 }
 
 export function ChessBoard({
@@ -59,8 +68,7 @@ export function ChessBoard({
   }, [fen]);
 
   const ranks = orientation === "white" ? [...RANKS_WHITE] : [...RANKS_BLACK];
-  const files =
-    orientation === "white" ? [...FILES] : [...FILES].reverse();
+  const files = orientation === "white" ? [...FILES] : [...FILES].reverse();
 
   const fromHi = highlightUci?.slice(0, 2) as Square | undefined;
   const toHi = highlightUci?.slice(2, 4) as Square | undefined;
@@ -71,6 +79,7 @@ export function ChessBoard({
   };
 
   const sqSize = size / 8;
+  const pieceSize = sqSize * 0.78;
 
   const legalTargets = useMemo(() => {
     if (!selected) return new Set<string>();
@@ -102,14 +111,14 @@ export function ChessBoard({
 
     const trial = new Chess(fen);
     try {
-      const result = trial.move({
+      const moveResult = trial.move({
         from: selected,
         to: sq,
         promotion: "q",
       });
-      if (result) {
-        const uci = `${result.from}${result.to}${result.promotion || ""}`;
-        onMove?.(uci, result.san, trial.fen());
+      if (moveResult) {
+        const uci = `${moveResult.from}${moveResult.to}${moveResult.promotion || ""}`;
+        onMove?.(uci, moveResult.san, trial.fen());
       }
     } catch {
       /* illegal */
@@ -119,51 +128,66 @@ export function ChessBoard({
 
   return (
     <View style={styles.wrap} onLayout={onLayout}>
-      <View style={[styles.board, { width: size, height: size }]}>
-        {ranks.map((rank, rankIdx) => (
-          <View key={`r${rank}`} style={styles.row}>
-            {files.map((file, fileIdx) => {
-              const sq = `${file}${rank}` as Square;
-              const piece = chess.get(sq);
-              const glyph = piece
-                ? PIECE_GLYPH[`${piece.color}${piece.type.toUpperCase()}`]
-                : "";
-              const isSel = selected === sq;
-              const isTarget = legalTargets.has(sq);
-              const isHi = sq === fromHi || sq === toHi;
-              return (
-                <Pressable
-                  key={sq}
-                  onPress={() => handlePress(sq)}
-                  style={[
-                    styles.square,
-                    {
-                      width: sqSize,
-                      height: sqSize,
-                      backgroundColor: squareColor(fileIdx, rankIdx),
-                    },
-                    isSel && styles.selected,
-                    isHi && styles.highlight,
-                  ]}
-                >
-                  {isTarget && !piece ? <View style={styles.dot} /> : null}
-                  {isTarget && piece ? (
-                    <View style={styles.captureRing} />
-                  ) : null}
-                  <Text
+      <View style={[styles.boardShadow]}>
+        <View style={[styles.board, { width: size, height: size }]}>
+          {ranks.map((rank, rankIdx) => (
+            <View key={`r${rank}`} style={styles.row}>
+              {files.map((file, fileIdx) => {
+                const sq = `${file}${rank}` as Square;
+                const piece = chess.get(sq);
+                const pieceKey = piece
+                  ? (`${piece.color}${piece.type.toUpperCase()}` as AlphaPieceKey)
+                  : null;
+                const isSel = selected === sq;
+                const isTarget = legalTargets.has(sq);
+                const isHi = sq === fromHi || sq === toHi;
+                const isLight = (fileIdx + rankIdx) % 2 === 0;
+                return (
+                  <Pressable
+                    key={sq}
+                    onPress={() => handlePress(sq)}
                     style={[
-                      styles.piece,
-                      { fontSize: sqSize * 0.62 },
-                      piece?.color === "w" ? styles.whitePiece : styles.blackPiece,
+                      styles.square,
+                      {
+                        width: sqSize,
+                        height: sqSize,
+                        backgroundColor: squareColor(fileIdx, rankIdx),
+                      },
+                      isSel && styles.selected,
+                      isHi && styles.highlight,
                     ]}
                   >
-                    {glyph}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-        ))}
+                    {isTarget && !piece ? <View style={styles.dot} /> : null}
+                    {isTarget && piece ? <View style={styles.captureRing} /> : null}
+                    {pieceKey ? <PieceSvg pieceKey={pieceKey} size={pieceSize} /> : null}
+                    {fileIdx === 0 ? (
+                      <Text
+                        style={[
+                          styles.coord,
+                          styles.rankCoord,
+                          { color: isLight ? colors.boardDark : colors.boardLight },
+                        ]}
+                      >
+                        {rank}
+                      </Text>
+                    ) : null}
+                    {rankIdx === ranks.length - 1 ? (
+                      <Text
+                        style={[
+                          styles.coord,
+                          styles.fileCoord,
+                          { color: isLight ? colors.boardDark : colors.boardLight },
+                        ]}
+                      >
+                        {file}
+                      </Text>
+                    ) : null}
+                  </Pressable>
+                );
+              })}
+            </View>
+          ))}
+        </View>
       </View>
     </View>
   );
@@ -174,10 +198,16 @@ const styles = StyleSheet.create({
     width: "100%",
     alignItems: "center",
   },
+  boardShadow: {
+    backgroundColor: colors.shadowGray,
+    paddingBottom: 4,
+    paddingRight: 0,
+  },
   board: {
     borderWidth: 2,
-    borderColor: colors.border,
+    borderColor: colors.text,
     overflow: "hidden",
+    backgroundColor: colors.boardDark,
   },
   row: {
     flexDirection: "row",
@@ -188,34 +218,37 @@ const styles = StyleSheet.create({
   },
   selected: {
     borderWidth: 2,
-    borderColor: colors.accent,
+    borderColor: colors.sage,
   },
   highlight: {
-    backgroundColor: "#81b64c88",
+    backgroundColor: withAlpha(colors.sage, 0.55),
   },
-  piece: {
-    fontWeight: "600",
+  coord: {
+    position: "absolute",
+    zIndex: 2,
+    fontSize: 11,
+    lineHeight: 12,
+    fontWeight: "700",
+    includeFontPadding: false,
   },
-  whitePiece: {
-    color: "#fff",
-    textShadowColor: "#000",
-    textShadowOffset: { width: 0, height: 1 },
-    textShadowRadius: 2,
+  rankCoord: {
+    top: 3,
+    left: 3,
   },
-  blackPiece: {
-    color: "#111",
+  fileCoord: {
+    bottom: 3,
+    right: 3,
   },
   dot: {
     position: "absolute",
     width: 12,
     height: 12,
     borderRadius: 6,
-    backgroundColor: "rgba(0,0,0,0.25)",
+    backgroundColor: withAlpha(colors.red, 0.45),
   },
   captureRing: {
     ...StyleSheet.absoluteFillObject,
     borderWidth: 3,
-    borderColor: "rgba(0,0,0,0.3)",
-    borderRadius: 4,
+    borderColor: withAlpha(colors.red, 0.55),
   },
 });
