@@ -75,6 +75,8 @@ export function StudyScreen() {
   const [puzzleFen, setPuzzleFen] = useState<string | null>(null);
   const [puzzleMoveSan, setPuzzleMoveSan] = useState<string | null>(null);
   const [highlightUci, setHighlightUci] = useState<string | null>(null);
+  const [sequencePv, setSequencePv] = useState<string[]>([]);
+  const [sequencePlaying, setSequencePlaying] = useState(false);
   const cancelRef = useRef({ cancelled: false });
   const playTokenRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -95,12 +97,15 @@ export function StudyScreen() {
     setContinuation(null);
     setUserMoveEval(null);
     setHighlightUci(null);
+    setSequencePv([]);
+    setSequencePlaying(false);
   }, [current?.game_id, current?.ply, current?.fen]);
 
   const playContinuation = useCallback((startFen: string, pv: string[]) => {
     const token = ++playTokenRef.current;
     const moves = pv.filter(Boolean);
     if (!moves.length) return;
+    setSequencePlaying(true);
     setPuzzleFen(startFen);
     setHighlightUci(null);
     let i = 0;
@@ -114,10 +119,12 @@ export function StudyScreen() {
       setHighlightUci(moves[i] || null);
       i += 1;
       if (i < moves.length) {
-        setTimeout(step, 650);
+        setTimeout(step, 1200);
+      } else {
+        setSequencePlaying(false);
       }
     };
-    setTimeout(step, 350);
+    setTimeout(step, 500);
   }, []);
 
   const resetQuizChrome = useCallback(() => {
@@ -133,6 +140,8 @@ export function StudyScreen() {
     setUserMoveEval(null);
     setHighlightUci(null);
     setPuzzleMoveSan(null);
+    setSequencePv([]);
+    setSequencePlaying(false);
   }, []);
 
   const loadMistakes = useCallback(async () => {
@@ -262,7 +271,10 @@ export function StudyScreen() {
       setQuizCorrect(true);
       setQuizFeedback(null);
       setPuzzleMoveSan(res.user_san);
-      playContinuation(current.fen, res.best_pv);
+      setPuzzleFen(current.fen);
+      setHighlightUci(current.best_uci);
+      setSequencePv(res.best_pv.length ? res.best_pv : current.best_uci ? [current.best_uci] : []);
+      setSequencePlaying(false);
     } catch (e) {
       setQuizFeedback(e instanceof Error ? e.message : "Validate failed");
       setPuzzleFen(current.fen);
@@ -375,6 +387,15 @@ export function StudyScreen() {
                 highlightUci={highlightUci || (revealed ? current.best_uci : null)}
               />
 
+              {revealed && sequencePv.length > 0 ? (
+                <BrutalButton
+                  label={sequencePlaying ? "Playing sequence…" : "Show sequence"}
+                  disabled={sequencePlaying}
+                  onPress={() => playContinuation(current.fen, sequencePv)}
+                  style={{ marginTop: spacing.md }}
+                />
+              ) : null}
+
               <EdgeCard style={{ marginTop: spacing.md }}>
                 <View style={styles.moveCompare}>
                   {puzzleMoveSan ? (
@@ -454,8 +475,11 @@ export function StudyScreen() {
                       setRevealed(true);
                       setQuizCorrect(null);
                       setQuizFeedback(null);
+                      setPuzzleFen(current.fen);
                       setPuzzleMoveSan(current.best_san || current.best_uci);
                       setUserMoveEval(null);
+                      setHighlightUci(current.best_uci);
+                      setSequencePlaying(false);
                       try {
                         const res = await validateMoveLocal(
                           evaluate,
@@ -464,11 +488,14 @@ export function StudyScreen() {
                           current.best_uci
                         );
                         setContinuation(res.best_continuation_san);
-                        playContinuation(current.fen, res.best_pv);
+                        setSequencePv(
+                          res.best_pv.length
+                            ? res.best_pv
+                            : [current.best_uci]
+                        );
                       } catch {
                         setContinuation(null);
-                        setPuzzleFen(applyUci(current.fen, current.best_uci));
-                        setHighlightUci(current.best_uci);
+                        setSequencePv([current.best_uci]);
                       }
                     }}
                     style={{ marginTop: spacing.sm }}

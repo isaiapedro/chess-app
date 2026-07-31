@@ -4,13 +4,12 @@ import {
   Pressable,
   StyleSheet,
   Text,
-  TextInput,
   View,
 } from "react-native";
 import DateTimePicker from "@react-native-community/datetimepicker";
-import type { Period, Platform } from "../api/types";
+import type { Period } from "../api/types";
 import { useFilters } from "../context/FilterContext";
-import { MetaTag, SelectField } from "./ui";
+import { SelectField } from "./ui";
 import { colors, font, spacing } from "../theme";
 
 const PERIODS: { value: Period; label: string }[] = [
@@ -29,11 +28,6 @@ const SPEEDS = [
   { value: "classical", label: "♔ Classical" },
 ];
 
-const PLATFORMS: { value: Platform; label: string }[] = [
-  { value: "chesscom", label: "Chess.com" },
-  { value: "lichess", label: "Lichess" },
-];
-
 function formatDay(date: Date): string {
   return date.toLocaleDateString(undefined, {
     day: "2-digit",
@@ -44,45 +38,18 @@ function formatDay(date: Date): string {
 
 export function FilterHeader() {
   const {
-    username,
-    setUsername,
-    platform,
-    setPlatform,
     period,
     setPeriod,
     selectedDay,
     setSelectedDay,
     speed,
     setSpeed,
-    refresh,
   } = useFilters();
 
-  const [draftUser, setDraftUser] = useState(username);
   const [picking, setPicking] = useState(false);
 
   return (
     <View style={styles.wrap}>
-      <View style={styles.userRow}>
-        <TextInput
-          value={draftUser}
-          onChangeText={setDraftUser}
-          placeholder="username"
-          placeholderTextColor={colors.textDim}
-          autoCapitalize="none"
-          autoCorrect={false}
-          style={styles.input}
-        />
-        <Pressable
-          style={styles.loadBtn}
-          onPress={() => {
-            setUsername(draftUser.trim() || username);
-            refresh();
-          }}
-        >
-          <Text style={styles.loadText}>Load</Text>
-        </Pressable>
-      </View>
-
       <View style={styles.selectRow}>
         <SelectField
           label="Period"
@@ -96,17 +63,6 @@ export function FilterHeader() {
           options={SPEEDS}
           onChange={(v) => setSpeed(v || null)}
         />
-      </View>
-
-      <View style={styles.chipRow}>
-        {PLATFORMS.map((item) => (
-          <MetaTag
-            key={item.value}
-            label={item.label}
-            active={platform === item.value}
-            onPress={() => setPlatform(item.value)}
-          />
-        ))}
       </View>
 
       {period === "day" ? (
@@ -131,7 +87,7 @@ export function FilterHeader() {
 
       {picking && RNPlatform.OS === "ios" ? (
         <Pressable style={styles.doneBtn} onPress={() => setPicking(false)}>
-          <Text style={styles.loadText}>Done</Text>
+          <Text style={styles.doneText}>Done</Text>
         </Pressable>
       ) : null}
     </View>
@@ -148,43 +104,9 @@ const styles = StyleSheet.create({
     paddingBottom: spacing.md,
     gap: spacing.sm,
   },
-  userRow: {
-    flexDirection: "row",
-    gap: spacing.sm,
-  },
-  input: {
-    flex: 1,
-    minHeight: 42,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.charcoal,
-    color: colors.text,
-    paddingHorizontal: 12,
-    fontFamily: font.mono,
-    fontSize: 12,
-  },
-  loadBtn: {
-    backgroundColor: colors.red,
-    borderWidth: 2,
-    borderColor: colors.text,
-    paddingHorizontal: 16,
-    justifyContent: "center",
-  },
-  loadText: {
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    textAlign: "center",
-  },
   selectRow: {
     flexDirection: "row",
     gap: 10,
-  },
-  chipRow: {
-    flexDirection: "row",
-    gap: 6,
   },
   dateBtn: {
     borderWidth: 1,
@@ -197,13 +119,19 @@ const styles = StyleSheet.create({
     color: "#111111",
     fontFamily: font.monoBold,
     fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
   },
   doneBtn: {
     backgroundColor: colors.red,
     borderWidth: 2,
     borderColor: colors.text,
     paddingVertical: 10,
+  },
+  doneText: {
+    color: colors.text,
+    fontFamily: font.monoBold,
+    fontSize: 11,
+    letterSpacing: 1,
+    textTransform: "uppercase",
+    textAlign: "center",
   },
 });

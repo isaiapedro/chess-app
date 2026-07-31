@@ -54,11 +54,17 @@ type EvalFn = (
 
 const MAX_OPENING_MOVES = 10;
 const TARGET_MOMENTS = 3;
-const MIN_WINRATE_GAP = 0.08;
+const MIN_WINRATE_GAP = 0.1;
 const STRICT_WINRATE_GAP = Math.round(MIN_WINRATE_GAP * 1.3 * 1000) / 1000;
+const LOW_WINRATE = 0.35;
+const ZERO_WINRATE = 0.05;
+const DECENT_WINRATE = 0.45;
+const DECENT_FREQ = 0.08;
 const MIN_GAMES_AT_POS = 8;
 const MIN_MOVE_GAMES = 3;
+const MIN_MASTERS_GAMES = 3;
 const GOOD_SCORE_GAP = 0.05;
+const EVAL_GAP_CP = 100;
 const ANALYSIS_DEPTH = 12;
 
 function parseMoves(game: StudyGame): string[] {
@@ -178,46 +184,76 @@ function positionTotal(payload: {
   return payload.moves.reduce((sum, m) => sum + moveTotal(m), 0);
 }
 
-function pickDbBest(
-  lichessMoves: ExplorerMove[],
-  mastersMoves: ExplorerMove[],
-  side: "white" | "black"
-): {
-  best: ExplorerMove | null;
-  source: "lichess" | "masters";
-  scored: Array<{ move: ExplorerMove; score: number; games: number }>;
-} {
-  const mastersScored = mastersMoves
+function scoreRows(
+  moves: ExplorerMove[],
+  side: "white" | "black",
+  minGames: number
+): Array<{ move: ExplorerMove; score: number; games: number; freq: number }> {
+  const total = moves.reduce((sum, m) => sum + moveTotal(m), 0) || 1;
+  return moves
     .map((move) => ({
       move,
       score: expectedScore(move, side),
       games: moveTotal(move),
+      freq: moveTotal(move) / total,
     }))
-    .filter((row) => row.games >= Math.max(2, Math.min(MIN_MOVE_GAMES, 2)))
-    .sort((a, b) => b.score - a.score || b.games - a.games);
+    .filter((row) => row.games >= minGames)
+    .sort((a, b) => b.games - a.games || b.score - a.score);
+}
 
-  if (mastersScored.length && mastersScored[0].games >= 5) {
+function pickBestMove(
+  lichessMoves: ExplorerMove[],
+  mastersMoves: ExplorerMove[],
+  side: "white" | "black",
+  evalBestUci: string | null
+): {
+  best: ExplorerMove | null;
+  source: "lichess" | "masters" | "eval";
+  scored: Array<{ move: ExplorerMove; score: number; games: number; freq: number }>;
+  bestUci: string | null;
+} {
+  const mastersScored = scoreRows(mastersMoves, side, MIN_MASTERS_GAMES);
+  if (mastersScored.length) {
+    const top = [...mastersScored]
+      .slice(0, 3)
+      .sort((a, b) => b.score - a.score || b.games - a.games)[0];
     return {
-      best: mastersScored[0].move,
+      best: top.move,
       source: "masters",
       scored: mastersScored,
+      bestUci: top.move.uci || null,
     };
   }
 
-  const lichessScored = lichessMoves
-    .map((move) => ({
-      move,
-      score: expectedScore(move, side),
-      games: moveTotal(move),
-    }))
-    .filter((row) => row.games >= MIN_MOVE_GAMES)
-    .sort((a, b) => b.score - a.score || b.games - a.games);
+  const lichessScored = scoreRows(lichessMoves, side, MIN_MOVE_GAMES);
+  if (lichessScored.length) {
+    const top3 = lichessScored.slice(0, 3);
+    const byWin = [...top3].sort((a, b) => b.score - a.score || b.games - a.games)[0];
+    return {
+      best: byWin.move,
+      source: "lichess",
+      scored: lichessScored,
+      bestUci: byWin.move.uci || null,
+    };
+  }
 
   return {
-    best: lichessScored[0]?.move || null,
-    source: "lichess",
-    scored: lichessScored.length ? lichessScored : mastersScored,
+    best: null,
+    source: "eval",
+    scored: [],
+    bestUci: evalBestUci,
   };
+}
+
+function isPlayableMove(row: {
+  score: number;
+  freq: number;
+  games: number;
+} | null): boolean {
+  if (!row) return false;
+  if (row.score >= DECENT_WINRATE && row.freq >= DECENT_FREQ) return true;
+  if (row.score >= DECENT_WINRATE && row.games >= 10) return true;
+  return false;
 }
 
 async function buildContinuationPv(
@@ -228,26 +264,26 @@ async function buildContinuationPv(
   plies = 5
 ): Promise<string[]> {
   const pv = [firstUci];
-  let fen = startFen;
   const board = new Chess(startFen);
   if (!applyUci(board, firstUci)) return pv;
-  fen = board.fen();
+  let fen = board.fen();
 
   for (let i = 1; i < plies; i += 1) {
     const side = board.turn() === "w" ? "white" : "black";
-    let payload;
+    let mastersMoves: ExplorerMove[] = [];
+    let lichessMoves: ExplorerMove[] = [];
     try {
-      payload = await fetchExplorer(fen, "masters");
-      if (!payload.moves?.length || payload.fallback) {
-        payload = await fetchExplorer(fen, "lichess", ratings);
-      }
+      const masters = await fetchExplorer(fen, "masters");
+      mastersMoves = masters.moves || [];
+      const lichess = await fetchExplorer(fen, "lichess", ratings);
+      lichessMoves = lichess.moves || [];
     } catch {
       break;
     }
-    const { best } = pickDbBest(payload.moves || [], [], side);
-    if (!best?.uci) break;
-    if (!applyUci(board, best.uci)) break;
-    pv.push(best.uci);
+    const picked = pickBestMove(lichessMoves, mastersMoves, side, null);
+    if (!picked.bestUci) break;
+    if (!applyUci(board, picked.bestUci)) break;
+    pv.push(picked.bestUci);
     fen = board.fen();
   }
   return pv;
@@ -332,76 +368,118 @@ export async function analyzeOpeningMoments(options: {
         positionTotal(lichess),
         positionTotal(masters)
       );
-      const { best, source, scored } = pickDbBest(
+
+      let evalBestUci: string | null = null;
+      let evalBefore = 0;
+      let evalAfter = 0;
+      let evalDrop = 0;
+      try {
+        const beforeRaw = await evaluate(fenBefore, ANALYSIS_DEPTH, 1);
+        const afterRaw = await evaluate(chess.fen(), ANALYSIS_DEPTH, 1);
+        const turn = fenBefore.split(" ")[1];
+        const beforeCp = turn === "b" ? -beforeRaw.cpWhite : beforeRaw.cpWhite;
+        const afterCp = turn === "b" ? -afterRaw.cpWhite : afterRaw.cpWhite;
+        const userBefore = userIsWhite ? beforeCp : -beforeCp;
+        const userAfter = userIsWhite ? afterCp : -afterCp;
+        evalDrop = userBefore - userAfter;
+        evalBefore = beforeCp;
+        evalAfter = afterCp;
+        evalBestUci = beforeRaw.bestUci;
+      } catch {
+        /* keep zeros */
+      }
+
+      const picked = pickBestMove(
         lichess.moves || [],
         masters.moves || [],
-        color
+        color,
+        evalBestUci
       );
+      const scored = picked.scored;
 
       let winratePlayed: number | null = null;
       let winrateBest: number | null = null;
       let winrateGap: number | null = null;
       let popularityPct: number | null = null;
       let popularityDrop: number | null = null;
-      let bestUci = best?.uci || null;
-      let bestSan = best?.san || null;
-      let usedSource: "lichess" | "masters" | "eval" = source;
-      let evalBefore = 0;
-      let evalAfter = 0;
+      let bestUci = picked.bestUci;
+      let bestSan: string | null = picked.best?.san || null;
+      let usedSource: "lichess" | "masters" | "eval" = picked.source;
       let priority = 0;
 
-      const playedRow = scored.find((row) => row.move.uci === playedUci);
+      const playedRow =
+        scored.find((row) => row.move.uci === playedUci) || null;
       const playedMove =
-        (lichess.moves || []).find((m) => m.uci === playedUci) ||
-        (masters.moves || []).find((m) => m.uci === playedUci);
+        (masters.moves || []).find((m) => m.uci === playedUci) ||
+        (lichess.moves || []).find((m) => m.uci === playedUci);
 
-      if (best && posGames >= MIN_GAMES_AT_POS) {
-        winrateBest = expectedScore(best, color);
-        winratePlayed = playedMove
-          ? expectedScore(playedMove, color)
-          : playedRow?.score ?? 0;
-        winrateGap = winrateBest - winratePlayed;
-        const playedGames = playedMove ? moveTotal(playedMove) : 0;
-        popularityPct = posGames ? playedGames / posGames : 0;
-        if (prevPopularity != null) {
-          popularityDrop = prevPopularity - popularityPct;
-        }
-        prevPopularity = popularityPct;
-
-        const lateBias = moveNumber / MAX_OPENING_MOVES;
-        priority =
-          (winrateGap || 0) * 1000 +
-          Math.max(0, popularityDrop || 0) * 400 +
-          lateBias * 40;
-        if (source === "masters") priority += 80;
-        if (bestUci === playedUci) continue;
-        if ((winrateGap || 0) < MIN_WINRATE_GAP) continue;
-      } else {
-        try {
-          const beforeRaw = await evaluate(fenBefore, ANALYSIS_DEPTH, 1);
-          const afterRaw = await evaluate(chess.fen(), ANALYSIS_DEPTH, 1);
-          const turn = fenBefore.split(" ")[1];
-          const beforeCp =
-            turn === "b" ? -beforeRaw.cpWhite : beforeRaw.cpWhite;
-          const afterCp = turn === "b" ? -afterRaw.cpWhite : afterRaw.cpWhite;
-          const userBefore = userIsWhite ? beforeCp : -beforeCp;
-          const userAfter = userIsWhite ? afterCp : -afterCp;
-          const drop = userBefore - userAfter;
-          if (drop < 80) continue;
-          evalBefore = beforeCp;
-          evalAfter = afterCp;
-          bestUci = beforeRaw.bestUci;
-          if (!bestUci || bestUci === playedUci) continue;
-          const probe = new Chess(fenBefore);
-          const bm = applyUci(probe, bestUci);
-          bestSan = bm?.san || bestUci;
-          usedSource = "eval";
-          priority = drop;
-          winrateGap = drop / 1000;
-        } catch {
-          continue;
-        }
+      if (playedMove) {
+        winratePlayed = expectedScore(playedMove, color);
+        popularityPct = posGames ? moveTotal(playedMove) / posGames : playedRow?.freq ?? 0;
+      } else if (posGames > 0) {
+        winratePlayed = 0;
+        popularityPct = 0;
       }
+
+      if (picked.best) {
+        winrateBest = expectedScore(picked.best, color);
+      }
+      if (winrateBest != null && winratePlayed != null) {
+        winrateGap = winrateBest - winratePlayed;
+      }
+      if (prevPopularity != null && popularityPct != null) {
+        popularityDrop = prevPopularity - popularityPct;
+      }
+      if (popularityPct != null) prevPopularity = popularityPct;
+
+      if (isPlayableMove(playedRow)) continue;
+      if (bestUci && bestUci === playedUci) continue;
+
+      const lowOrZero =
+        winratePlayed != null &&
+        (winratePlayed <= ZERO_WINRATE || winratePlayed < LOW_WINRATE);
+      const bigWinGap = (winrateGap || 0) >= MIN_WINRATE_GAP;
+      const bigEvalGap = evalDrop >= EVAL_GAP_CP;
+
+      if (lowOrZero) {
+        if (!bigEvalGap && !bigWinGap) continue;
+        if (bigEvalGap && evalBestUci && evalBestUci !== playedUci) {
+          if (!bestUci || usedSource === "eval" || (winrateGap || 0) < 0.05) {
+            bestUci = evalBestUci;
+            usedSource = picked.best ? picked.source : "eval";
+            const probe = new Chess(fenBefore);
+            const bm = applyUci(probe, evalBestUci);
+            bestSan = bm?.san || evalBestUci;
+          }
+        }
+      } else if (posGames >= MIN_GAMES_AT_POS && bigWinGap) {
+        /* keep */
+      } else if (bigEvalGap && evalBestUci && evalBestUci !== playedUci) {
+        bestUci = evalBestUci;
+        usedSource = "eval";
+        const probe = new Chess(fenBefore);
+        const bm = applyUci(probe, evalBestUci);
+        bestSan = bm?.san || evalBestUci;
+        winrateGap = evalDrop / 1000;
+      } else {
+        continue;
+      }
+
+      if (!bestUci || bestUci === playedUci) continue;
+      if (!bestSan) {
+        const probe = new Chess(fenBefore);
+        const bm = applyUci(probe, bestUci);
+        bestSan = bm?.san || bestUci;
+      }
+
+      const lateBias = moveNumber / MAX_OPENING_MOVES;
+      priority =
+        (winrateGap || 0) * 1000 +
+        Math.max(0, popularityDrop || 0) * 400 +
+        Math.max(0, evalDrop) * 0.5 +
+        lateBias * 40;
+      if (usedSource === "masters") priority += 120;
+      if (winratePlayed != null && winratePlayed <= ZERO_WINRATE) priority += 200;
 
       const altMoves = scored.slice(0, 5).map((row) => ({
         uci: String(row.move.uci || ""),
@@ -427,17 +505,13 @@ export async function analyzeOpeningMoments(options: {
         best_san: bestSan,
         eval_before_cp: Math.round(evalBefore * 10) / 10,
         eval_after_cp: Math.round(evalAfter * 10) / 10,
-        eval_drop_cp: Math.round((winrateGap || 0) * 1000) / 10,
+        eval_drop_cp: Math.round(evalDrop * 10) / 10,
         comment:
-          winrateGap != null && usedSource !== "eval"
+          usedSource !== "eval" && winratePlayed != null && winrateBest != null
             ? `Your position worsened in the opening — ${playedSan} scores ${(
-                (winratePlayed || 0) * 100
-              ).toFixed(0)}% vs ${(
-                (winrateBest || 0) * 100
-              ).toFixed(0)}% for ${bestSan}.`
-            : `Your position worsened by ~${Math.round(
-                (winrateGap || 0) * 1000
-              )} cp after ${playedSan}.`,
+                winratePlayed * 100
+              ).toFixed(0)}% vs ${(winrateBest * 100).toFixed(0)}% for ${bestSan}.`
+            : `Your position worsened by ~${Math.round(evalDrop)} cp after ${playedSan}.`,
         winrate_played: winratePlayed,
         winrate_best: winrateBest,
         winrate_gap: winrateGap,
@@ -575,10 +649,16 @@ export function validateOpeningMove(
     moment.alt_moves.find((m) => m.uci === bestUci)?.score ??
     null;
   const userScore = userAlt?.score ?? null;
+  const ranked = [...moment.alt_moves].sort((a, b) => b.score - a.score);
+  const inTop3 = ranked.slice(0, 3).some((m) => m.uci === userUci);
 
   if (bestScore != null && userScore != null) {
     const gap = bestScore - userScore;
-    if (gap <= GOOD_SCORE_GAP) {
+    const playable =
+      gap <= GOOD_SCORE_GAP ||
+      (inTop3 && userScore >= DECENT_WINRATE) ||
+      (userScore >= DECENT_WINRATE && gap <= 0.08);
+    if (playable) {
       return {
         verdict: "good",
         user_san: userSan,
