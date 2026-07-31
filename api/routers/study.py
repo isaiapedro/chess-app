@@ -10,6 +10,7 @@ from api.services.study import (
     eval_position,
     explorer_position,
     find_critical_mistakes,
+    masters_game_pgn,
     validate_quiz_move,
 )
 
@@ -41,6 +42,11 @@ def study_explorer(
     return explorer_position(
         fen, source=source, username=username, color=color, ratings=ratings
     )
+
+
+@router.get("/masters-pgn/{game_id}")
+def study_masters_pgn(game_id: str):
+    return masters_game_pgn(game_id)
 
 
 @router.get("/mistakes")

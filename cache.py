@@ -160,7 +160,11 @@ def get_lichess_stats(
 @disk_cache("explorer_masters")
 def get_gm_games(fen: str):
     url = f"{EXPLORER_BASE}/masters"
-    return lichess_get(url, {"fen": fen}, "explorer_masters")
+    return lichess_get(
+        url,
+        {"fen": fen, "topGames": 15, "moves": 12},
+        "explorer_masters",
+    )
 
 
 @disk_cache("explorer_player")
@@ -168,6 +172,35 @@ def get_player_prep(username: str, color: str, fen: str):
     url = f"{EXPLORER_BASE}/player"
     params = {"player": username.lower(), "color": color, "fen": fen}
     return lichess_get(url, params, "explorer_player")
+
+
+@disk_cache("masters_pgn")
+def get_masters_pgn(game_id: str):
+    url = f"{EXPLORER_BASE}/masters/pgn/{game_id}"
+    global _rate_limited_until
+    if time.monotonic() < _rate_limited_until:
+        return None
+    try:
+        res = requests.get(
+            url,
+            headers=_lichess_headers(),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except requests.RequestException:
+        return None
+    if res.status_code == 429:
+        try:
+            retry_after = float(res.headers.get("Retry-After") or RATE_LIMIT_COOLDOWN)
+        except ValueError:
+            retry_after = RATE_LIMIT_COOLDOWN
+        _rate_limited_until = time.monotonic() + min(retry_after, RATE_LIMIT_COOLDOWN)
+        return None
+    if res.status_code != 200:
+        return None
+    text = (res.text or "").strip()
+    if not text:
+        return None
+    return {"id": game_id, "pgn": text}
 
 
 def rating_buckets_for_elo(elo: int, spread: int = 300) -> str:

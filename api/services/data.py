@@ -125,6 +125,22 @@ def build_rating_series(df: pd.DataFrame) -> list[dict]:
     return dataframe_to_records(series)
 
 
+def build_rating_series_by_speed(df: pd.DataFrame) -> dict[str, list[dict]]:
+    if df.empty or "user_rating" not in df.columns or "speed" not in df.columns:
+        return {}
+    out: dict[str, list[dict]] = {}
+    work = df.copy()
+    work["speed_key"] = work["speed"].astype(str).str.lower().str.strip()
+    for speed, group in work.groupby("speed_key"):
+        key = str(speed).strip()
+        if not key or key in {"nan", "none", ""}:
+            continue
+        series = build_rating_series(group)
+        if series:
+            out[key] = series
+    return out
+
+
 def build_rating_summary(df: pd.DataFrame) -> dict:
     series = build_rating_series(df)
     if not series:
@@ -236,6 +252,9 @@ def recap_payload(loaded: LoadedGames) -> dict:
             headline, to_json_safe(stats["notation"]) or {}
         ),
         "rating_series": build_rating_series(loaded.filtered_df),
+        "rating_series_by_speed": build_rating_series_by_speed(
+            loaded.filtered_df
+        ),
         "rating_summary": build_rating_summary(loaded.filtered_df),
         "activity": {
             "hourly_activity": activity.get("hourly_activity") or [],

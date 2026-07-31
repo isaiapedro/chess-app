@@ -3,6 +3,10 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 const PREFIX = "@chess-wrapped:v1:";
 const DEFAULT_TTL_MS = 15 * 60 * 1000;
 
+export const STUDY_ANALYSIS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const STUDY_API_TTL_MS = 6 * 60 * 60 * 1000;
+export const GAMES_TTL_MS = 60 * 60 * 1000;
+
 type CacheEntry<T> = {
   savedAt: number;
   data: T;
@@ -13,17 +17,44 @@ type CacheOptions = {
   ttlMs?: number;
 };
 
+function storageKeyFor(key: string): string {
+  return `${PREFIX}${key}`;
+}
+
+export async function readCache<T>(
+  key: string,
+  ttlMs: number = DEFAULT_TTL_MS
+): Promise<T | null> {
+  try {
+    const raw = await AsyncStorage.getItem(storageKeyFor(key));
+    if (!raw) return null;
+    const entry = JSON.parse(raw) as CacheEntry<T>;
+    if (Date.now() - entry.savedAt >= ttlMs) return null;
+    return entry.data;
+  } catch {
+    return null;
+  }
+}
+
+export async function writeCache<T>(key: string, data: T): Promise<void> {
+  const entry: CacheEntry<T> = { savedAt: Date.now(), data };
+  try {
+    await AsyncStorage.setItem(storageKeyFor(key), JSON.stringify(entry));
+  } catch {
+    /* storage full / unavailable */
+  }
+}
+
 export async function readThroughCache<T>(
   key: string,
   fetcher: () => Promise<T>,
   options: CacheOptions = {}
 ): Promise<T> {
-  const storageKey = `${PREFIX}${key}`;
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
   let cached: CacheEntry<T> | null = null;
 
   try {
-    const raw = await AsyncStorage.getItem(storageKey);
+    const raw = await AsyncStorage.getItem(storageKeyFor(key));
     cached = raw ? (JSON.parse(raw) as CacheEntry<T>) : null;
   } catch {
     cached = null;
@@ -40,7 +71,7 @@ export async function readThroughCache<T>(
   try {
     const data = await fetcher();
     const entry: CacheEntry<T> = { savedAt: Date.now(), data };
-    await AsyncStorage.setItem(storageKey, JSON.stringify(entry));
+    await AsyncStorage.setItem(storageKeyFor(key), JSON.stringify(entry));
     return data;
   } catch (error) {
     if (cached) {
@@ -52,7 +83,7 @@ export async function readThroughCache<T>(
 
 export async function getCacheAge(key: string): Promise<number | null> {
   try {
-    const raw = await AsyncStorage.getItem(`${PREFIX}${key}`);
+    const raw = await AsyncStorage.getItem(storageKeyFor(key));
     if (!raw) return null;
     const entry = JSON.parse(raw) as CacheEntry<unknown>;
     return Math.max(0, Date.now() - entry.savedAt);

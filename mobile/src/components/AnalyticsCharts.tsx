@@ -7,10 +7,13 @@ import {
   View,
 } from "react-native";
 import { LineChart, PieChart } from "react-native-chart-kit";
+import { Text as SvgText } from "react-native-svg";
 import { colors, font, result, spacing } from "../theme";
 import type { HourlyPoint, MonthlyPoint, Period, RatingPoint } from "../api/types";
+import type { RatingCurve } from "../api/selectors";
 
 const MONTH_INITIALS = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
+const X_LABELS_HEIGHT_PCT = 0.75;
 
 const chartConfig = {
   backgroundGradientFrom: colors.surface,
@@ -70,25 +73,25 @@ function hourTick(hour: number): string {
 
 export function RatingChart({
   points,
+  curves = [],
   period = "all",
 }: {
   points: RatingPoint[];
+  curves?: RatingCurve[];
   period?: Period;
 }) {
   const { width } = useWindowDimensions();
   const animation = useEntranceAnimation();
+  const multi = curves.length > 1;
   const series = useMemo(() => {
+    if (multi) return curves[0].points;
     if (period === "year" || period === "all" || period === "day") return points;
     return sampleSeries(points);
-  }, [points, period]);
+  }, [points, period, multi, curves]);
 
-  if (series.length < 2) return null;
-
-  const spansYears =
-    period === "all" ||
-    (period === "year" &&
-      new Date(series[0].created_at).getFullYear() !==
-        new Date(series[series.length - 1].created_at).getFullYear());
+  if ((!multi && series.length < 2) || (multi && curves.every((c) => c.points.length < 2))) {
+    return null;
+  }
 
   const labels = series.map((point, index) => {
     const date = new Date(point.created_at);
@@ -110,60 +113,114 @@ export function RatingChart({
       return bucket !== previousBucket ? String(bucket * 5 + 1) : "";
     }
 
-    const initial = MONTH_INITIALS[date.getMonth()];
-    const yearChanged =
-      spansYears &&
-      date.getMonth() === 0 &&
-      (previous == null || previous.getFullYear() !== date.getFullYear());
-    if (yearChanged) {
-      return `${initial}\n${String(date.getFullYear()).slice(2)}`;
-    }
-    return initial;
+    return MONTH_INITIALS[date.getMonth()];
   });
 
-  const yearMarks = spansYears
-    ? series
-        .map((point, index) => {
-          const date = new Date(point.created_at);
-          const previous = index === 0 ? null : new Date(series[index - 1].created_at);
-          if (
-            date.getMonth() === 0 &&
-            (previous == null || previous.getFullYear() !== date.getFullYear())
-          ) {
-            return { index, year: String(date.getFullYear()).slice(2) };
-          }
-          return null;
-        })
-        .filter((mark): mark is { index: number; year: string } => mark != null)
-    : [];
+  const yearMarks =
+    period === "year" || period === "all"
+      ? series
+          .map((point, index) => {
+            const date = new Date(point.created_at);
+            const previous =
+              index === 0 ? null : new Date(series[index - 1].created_at);
+            if (
+              date.getMonth() === 0 &&
+              (previous == null || previous.getFullYear() !== date.getFullYear())
+            ) {
+              return { index, year: String(date.getFullYear()) };
+            }
+            return null;
+          })
+          .filter((mark): mark is { index: number; year: string } => mark != null)
+      : [];
+
+  const hexToRgba = (hex: string, opacity: number) => {
+    const cleaned = hex.replace("#", "");
+    const value = cleaned.length === 3
+      ? cleaned.split("").map((ch) => ch + ch).join("")
+      : cleaned;
+    const num = parseInt(value, 16);
+    const r = (num >> 16) & 255;
+    const g = (num >> 8) & 255;
+    const b = num & 255;
+    return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+  };
+
+  const datasets = multi
+    ? curves.map((curve) => ({
+        data: curve.points.map((point) => point.user_rating),
+        color: (opacity = 1) => hexToRgba(curve.color, opacity),
+        strokeWidth: 2,
+      }))
+    : [{ data: series.map((point) => point.user_rating) }];
+
+  const chartWidth = Math.max(280, width - spacing.md * 4);
+  const chartHeight = yearMarks.length ? 216 : 200;
 
   return (
     <Animated.View style={[styles.panel, animation]}>
       <Text style={styles.title}>Rating Progression</Text>
       <LineChart
         data={{
-          labels: labels.map((label) => label.split("\n")[0]),
-          datasets: [{ data: series.map((point) => point.user_rating) }],
+          labels,
+          datasets,
         }}
-        width={Math.max(280, width - spacing.md * 4)}
-        height={200}
+        width={chartWidth}
+        height={chartHeight}
         chartConfig={chartConfig}
         bezier
         withInnerLines
         withOuterLines={false}
         withVerticalLines={false}
+        xLabelsOffset={yearMarks.length ? -2 : 0}
         style={styles.chart}
+        decorator={({
+          width: plotWidth,
+          height: plotHeight,
+          paddingRight = 64,
+          paddingTop = 16,
+        }: {
+          width: number;
+          height: number;
+          paddingRight?: number;
+          paddingTop?: number;
+        }) => {
+          if (!yearMarks.length) return null;
+          const count = Math.max(labels.length, 1);
+          const monthLabelY =
+            plotHeight * X_LABELS_HEIGHT_PCT + paddingTop + 12 * 2 - 2;
+          return (
+            <>
+              {yearMarks.map((mark) => {
+                const x =
+                  ((plotWidth - paddingRight) / count) * mark.index +
+                  paddingRight;
+                return (
+                  <SvgText
+                    key={`year-${mark.year}-${mark.index}`}
+                    x={x}
+                    y={monthLabelY + 11}
+                    fill={colors.textDim}
+                    fontSize="8"
+                    fontFamily={font.mono}
+                    textAnchor="middle"
+                  >
+                    {`(${mark.year})`}
+                  </SvgText>
+                );
+              })}
+            </>
+          );
+        }}
       />
-      {yearMarks.length ? (
-        <View style={styles.yearRow}>
-          {series.map((point, index) => {
-            const mark = yearMarks.find((item) => item.index === index);
-            return (
-              <View key={`${point.created_at}-${index}`} style={styles.yearSlot}>
-                <Text style={styles.yearTick}>{mark ? mark.year : ""}</Text>
-              </View>
-            );
-          })}
+      {multi ? (
+        <View style={styles.legendRow}>
+          {curves.map((curve) => (
+            <View key={curve.key} style={styles.legendItem}>
+              <View style={[styles.legendSwatch, { backgroundColor: curve.color }]} />
+              <Text style={styles.legendLabel}>{curve.label}</Text>
+            </View>
+          ))}
         </View>
       ) : null}
     </Animated.View>
@@ -320,20 +377,25 @@ const styles = StyleSheet.create({
     borderRadius: 0,
     marginLeft: -spacing.sm,
   },
-  yearRow: {
+  legendRow: {
     flexDirection: "row",
-    marginTop: -4,
-    marginLeft: 48,
-    marginRight: 8,
+    flexWrap: "wrap",
+    gap: spacing.sm,
+    marginTop: spacing.sm,
   },
-  yearSlot: {
-    flex: 1,
+  legendItem: {
+    flexDirection: "row",
     alignItems: "center",
+    gap: 6,
   },
-  yearTick: {
+  legendSwatch: {
+    width: 10,
+    height: 10,
+  },
+  legendLabel: {
     color: colors.textDim,
     fontFamily: font.mono,
-    fontSize: 10,
+    fontSize: 11,
   },
   rowBetween: {
     flexDirection: "row",

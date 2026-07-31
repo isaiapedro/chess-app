@@ -1,6 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  KeyboardAvoidingView,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -8,9 +10,10 @@ import {
   View,
 } from "react-native";
 import { Chess } from "chess.js";
-import { fetchStudyGames, type MistakeItem } from "../api/client";
+import { fetchExplorer, fetchMastersPgn, fetchStudyGames, type MistakeItem } from "../api/client";
 import { ChessBoard } from "../components/ChessBoard";
 import { OpeningPrepSection } from "../components/OpeningPrepSection";
+import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
 import {
   BrutalButton,
   DisplayTitle,
@@ -18,15 +21,57 @@ import {
   Pill,
 } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
+import { TARGET_MISTAKE_MOMENTS } from "../engine/analysisConfig";
 import {
   analyzeCriticalMistakes,
+  formatEval,
+  displayCp,
   validateMoveLocal,
+  type AnalyzeProgress,
   type StudyGame,
 } from "../engine/analyzeMistakes";
+import { applyUciMove } from "../engine/chessMoves";
 import { useStockfish } from "../engine/StockfishProvider";
+import { formatGmGameLabel } from "../engine/resolveContinuation";
+import {
+  readCache,
+  STUDY_ANALYSIS_TTL_MS,
+  writeCache,
+} from "../storage/cache";
+import { studyMistakesCacheKey } from "../storage/studyCacheKeys";
 import { colors, font, result, spacing } from "../theme";
 
 type Mode = "mistakes" | "repertoire";
+
+type MistakesCachePayload = {
+  moments: MistakeItem[];
+  pendingCandidates: MistakeItem[];
+  scannedGameIds: string[];
+  remaining: number;
+};
+
+function parseMistakesCache(
+  raw: MistakesCachePayload | MistakeItem[] | null
+): MistakesCachePayload | null {
+  if (!raw) return null;
+  if (Array.isArray(raw)) {
+    return {
+      moments: raw,
+      pendingCandidates: [],
+      scannedGameIds: [...new Set(raw.map((item) => String(item.game_id)))],
+      remaining: 0,
+    };
+  }
+  if (raw.moments) {
+    return {
+      moments: raw.moments,
+      pendingCandidates: raw.pendingCandidates || [],
+      scannedGameIds: raw.scannedGameIds || [],
+      remaining: raw.remaining ?? 0,
+    };
+  }
+  return null;
+}
 
 function formatGameDate(value?: string): string {
   if (!value) return "Unknown date";
@@ -37,24 +82,11 @@ function formatGameDate(value?: string): string {
   });
 }
 
-function formatEval(value: number): string {
-  const pawns = value / 100;
-  return `${pawns > 0 ? "+" : ""}${pawns.toFixed(2)}`;
-}
-
 function applyUci(fen: string, uci?: string | null): string {
   if (!uci) return fen;
   const game = new Chess(fen);
-  try {
-    game.move({
-      from: uci.slice(0, 2),
-      to: uci.slice(2, 4),
-      promotion: uci.length > 4 ? (uci[4] as "q") : undefined,
-    });
-    return game.fen();
-  } catch {
-    return fen;
-  }
+  if (!applyUciMove(game, uci)) return fen;
+  return game.fen();
 }
 
 export function StudyScreen() {
@@ -65,8 +97,18 @@ export function StudyScreen() {
   const [mistakes, setMistakes] = useState<MistakeItem[]>([]);
   const [idx, setIdx] = useState(0);
   const [loadingMistakes, setLoadingMistakes] = useState(false);
+  const [scanningMore, setScanningMore] = useState(false);
   const [mistakesError, setMistakesError] = useState<string | null>(null);
   const [analyzeStatus, setAnalyzeStatus] = useState<string | null>(null);
+  const [analyzeProgress, setAnalyzeProgress] = useState<AnalyzeProgress | null>(
+    null
+  );
+  const [analyzeLog, setAnalyzeLog] = useState<string[]>([]);
+  const [remainingGames, setRemainingGames] = useState(0);
+  const [pendingCount, setPendingCount] = useState(0);
+  const [scanExhausted, setScanExhausted] = useState(false);
+  const [showScanMore, setShowScanMore] = useState(false);
+  const [allDone, setAllDone] = useState(false);
   const [quizFeedback, setQuizFeedback] = useState<string | null>(null);
   const [quizCorrect, setQuizCorrect] = useState<boolean | null>(null);
   const [revealed, setRevealed] = useState(false);
@@ -80,8 +122,14 @@ export function StudyScreen() {
   const cancelRef = useRef({ cancelled: false });
   const playTokenRef = useRef(0);
   const retryTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const loadedCacheKeyRef = useRef<string | null>(null);
+  const lastRefreshRef = useRef(refreshToken);
+  const studyGamesRef = useRef<StudyGame[]>([]);
+  const scannedIdsRef = useRef<string[]>([]);
+  const pendingCandidatesRef = useRef<MistakeItem[]>([]);
 
   const current = mistakes[idx] || null;
+  const mistakesCacheKey = studyMistakesCacheKey(queryFilters);
 
   useEffect(() => {
     if (retryTimerRef.current) {
@@ -144,11 +192,81 @@ export function StudyScreen() {
     setSequencePlaying(false);
   }, []);
 
-  const loadMistakes = useCallback(async () => {
+  const mistakesRef = useRef<MistakeItem[]>([]);
+  mistakesRef.current = mistakes;
+
+  const pushProgress = useCallback((progress: AnalyzeProgress) => {
+    setAnalyzeProgress(progress);
+    setAnalyzeStatus(progress.status);
+    if (progress.log) {
+      setAnalyzeLog((prev) => [...prev.slice(-20), progress.log!]);
+    }
+  }, []);
+
+  const loadMistakes = useCallback(async (force = false) => {
+    if (!engineReady && !force) {
+      const cached = parseMistakesCache(
+        await readCache<MistakesCachePayload | MistakeItem[]>(
+          mistakesCacheKey,
+          STUDY_ANALYSIS_TTL_MS
+        )
+      );
+      if (cached?.moments.length) {
+        setMistakes(cached.moments);
+        setIdx(0);
+        scannedIdsRef.current = cached.scannedGameIds;
+        pendingCandidatesRef.current = cached.pendingCandidates || [];
+        setPendingCount((cached.pendingCandidates || []).length);
+        setRemainingGames(cached.remaining);
+        setScanExhausted(
+          cached.remaining <= 0 && !(cached.pendingCandidates || []).length
+        );
+        setShowScanMore(false);
+        setMistakesError(null);
+        loadedCacheKeyRef.current = mistakesCacheKey;
+        setLoadingMistakes(false);
+        setAnalyzeStatus(null);
+        setAnalyzeProgress(null);
+        return;
+      }
+    }
     if (!engineReady) {
       setMistakesError(engineError || "Waiting for on-device Stockfish…");
       return;
     }
+    if (
+      !force &&
+      loadedCacheKeyRef.current === mistakesCacheKey
+    ) {
+      return;
+    }
+    if (!force) {
+      const cached = parseMistakesCache(
+        await readCache<MistakesCachePayload | MistakeItem[]>(
+          mistakesCacheKey,
+          STUDY_ANALYSIS_TTL_MS
+        )
+      );
+      if (cached?.moments.length) {
+        setMistakes(cached.moments);
+        setIdx(0);
+        scannedIdsRef.current = cached.scannedGameIds;
+        pendingCandidatesRef.current = cached.pendingCandidates || [];
+        setPendingCount((cached.pendingCandidates || []).length);
+        setRemainingGames(cached.remaining);
+        setScanExhausted(
+          cached.remaining <= 0 && !(cached.pendingCandidates || []).length
+        );
+        setShowScanMore(false);
+        setMistakesError(null);
+        loadedCacheKeyRef.current = mistakesCacheKey;
+        setLoadingMistakes(false);
+        setAnalyzeStatus(null);
+        setAnalyzeProgress(null);
+        return;
+      }
+    }
+
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
@@ -158,9 +276,13 @@ export function StudyScreen() {
     setQuizFeedback(null);
     setQuizCorrect(null);
     setRevealed(false);
+    setScanExhausted(false);
+    setShowScanMore(false);
+    setAnalyzeLog([]);
+    setAnalyzeProgress(null);
     setAnalyzeStatus("Loading recent games…");
     try {
-      const rows = await fetchStudyGames(queryFilters, false);
+      const rows = await fetchStudyGames(queryFilters, force);
       const games = rows.map(
         (row): StudyGame => ({
           id: String(row.id || ""),
@@ -177,21 +299,45 @@ export function StudyScreen() {
           moves_str: row.moves_str ? String(row.moves_str) : undefined,
         })
       );
-      const moments = await analyzeCriticalMistakes({
+      studyGamesRef.current = games;
+      const batch = await analyzeCriticalMistakes({
         games,
         evaluate,
         signal,
-        onProgress: (progress) => {
-          setAnalyzeStatus(
-            `${progress.status} · ${progress.found}/5 moments · ${progress.positionsChecked} evals`
-          );
+        fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
+        fetchExplorer: async (fen, source) => {
+          const res = await fetchExplorer(fen, source);
+          return {
+            moves: res.moves || [],
+            topGames: res.topGames || [],
+          };
         },
+        onProgress: pushProgress,
       });
       if (signal.cancelled) return;
-      setMistakes(moments);
+      scannedIdsRef.current = batch.scannedGameIds;
+      pendingCandidatesRef.current = batch.pendingCandidates;
+      setPendingCount(batch.pendingCandidates.length);
+      setRemainingGames(batch.remaining);
+      setScanExhausted(
+        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+      );
+      setMistakes(batch.moments);
       setIdx(0);
-      if (!moments.length) {
+      loadedCacheKeyRef.current = mistakesCacheKey;
+      if (batch.moments.length) {
+        await writeCache(mistakesCacheKey, {
+          moments: batch.moments,
+          pendingCandidates: batch.pendingCandidates,
+          scannedGameIds: batch.scannedGameIds,
+          remaining: batch.remaining,
+        } satisfies MistakesCachePayload);
+        setMistakesError(null);
+      } else {
         setMistakesError("No critical swings found in recent games.");
+        if (batch.remaining > 0 || batch.pendingCandidates.length > 0) {
+          setShowScanMore(true);
+        }
       }
     } catch (e) {
       if (signal.cancelled) return;
@@ -200,22 +346,163 @@ export function StudyScreen() {
     } finally {
       if (!signal.cancelled) {
         setLoadingMistakes(false);
-        setAnalyzeStatus(null);
       }
     }
-  }, [engineReady, engineError, evaluate, queryFilters]);
+  }, [
+    engineReady,
+    engineError,
+    evaluate,
+    queryFilters,
+    mistakesCacheKey,
+    pushProgress,
+  ]);
+
+  const continueScanMistakes = useCallback(async () => {
+    if (
+      !engineReady ||
+      scanningMore ||
+      (remainingGames <= 0 && pendingCandidatesRef.current.length === 0)
+    ) {
+      return;
+    }
+    cancelRef.current.cancelled = true;
+    cancelRef.current = { cancelled: false };
+    const signal = cancelRef.current;
+    const keptMoments = mistakesRef.current;
+    setShowScanMore(false);
+    setAllDone(false);
+    resetQuizChrome();
+    pendingCandidatesRef.current = [];
+    setPendingCount(0);
+    setAnalyzeLog([]);
+    setAnalyzeProgress({
+      gamesScanned: 0,
+      positionsChecked: 0,
+      found: 0,
+      candidates: 0,
+      selected: 0,
+      status: "Scanning next batch…",
+      phase: "scan",
+      engine: "Stockfish",
+    });
+    setAnalyzeStatus("Scanning next batch…");
+    setScanningMore(true);
+    try {
+      let games = studyGamesRef.current;
+      if (!games.length) {
+        const rows = await fetchStudyGames(queryFilters, false);
+        games = rows.map(
+          (row): StudyGame => ({
+            id: String(row.id || ""),
+            created_at: String(row.created_at || ""),
+            speed: row.speed ? String(row.speed) : undefined,
+            user_color: String(row.user_color || "white"),
+            result: String(row.result || ""),
+            opening_name: row.opening_name
+              ? String(row.opening_name)
+              : undefined,
+            opening_eco: row.opening_eco ? String(row.opening_eco) : undefined,
+            opponent_name: row.opponent_name
+              ? String(row.opponent_name)
+              : undefined,
+            pgn_str: row.pgn_str ? String(row.pgn_str) : undefined,
+            moves_str: row.moves_str ? String(row.moves_str) : undefined,
+          })
+        );
+        studyGamesRef.current = games;
+      }
+
+      const batch = await analyzeCriticalMistakes({
+        games,
+        evaluate,
+        signal,
+        excludeGameIds: scannedIdsRef.current,
+        existingMoments: keptMoments,
+        existingCandidates: [],
+        appendCount: TARGET_MISTAKE_MOMENTS,
+        stopOnStrict: true,
+        fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
+        fetchExplorer: async (fen, source) => {
+          const res = await fetchExplorer(fen, source);
+          return {
+            moves: res.moves || [],
+            topGames: res.topGames || [],
+          };
+        },
+        onProgress: pushProgress,
+      });
+      if (signal.cancelled) return;
+      scannedIdsRef.current = [
+        ...scannedIdsRef.current,
+        ...batch.scannedGameIds,
+      ];
+      pendingCandidatesRef.current = batch.pendingCandidates;
+      setPendingCount(batch.pendingCandidates.length);
+      setRemainingGames(batch.remaining);
+      setMistakes(batch.moments);
+      setIdx(
+        batch.moments.length > keptMoments.length
+          ? keptMoments.length
+          : Math.max(0, batch.moments.length - 1)
+      );
+      setScanExhausted(
+        batch.remaining <= 0 && batch.pendingCandidates.length === 0
+      );
+      await writeCache(mistakesCacheKey, {
+        moments: batch.moments,
+        pendingCandidates: batch.pendingCandidates,
+        scannedGameIds: scannedIdsRef.current,
+        remaining: batch.remaining,
+      } satisfies MistakesCachePayload);
+      if (batch.moments.length <= keptMoments.length) {
+        setMistakesError("No further critical swings found.");
+        if (batch.remaining > 0 || batch.pendingCandidates.length > 0) {
+          setShowScanMore(true);
+        } else {
+          setAllDone(true);
+        }
+      } else {
+        setMistakesError(null);
+      }
+    } catch (e) {
+      if (!signal.cancelled) {
+        setMistakesError(e instanceof Error ? e.message : "Failed to scan more");
+      }
+    } finally {
+      if (!signal.cancelled) {
+        setScanningMore(false);
+      }
+    }
+  }, [
+    engineReady,
+    scanningMore,
+    remainingGames,
+    evaluate,
+    queryFilters,
+    mistakesCacheKey,
+    pushProgress,
+    resetQuizChrome,
+  ]);
 
   useEffect(() => {
-    if (mode !== "mistakes") {
-      cancelRef.current.cancelled = true;
-      return;
+    const force = refreshToken !== lastRefreshRef.current;
+    lastRefreshRef.current = refreshToken;
+    if (mode !== "mistakes") return;
+    void loadMistakes(force);
+  }, [mode, loadMistakes, refreshToken]);
+
+  useEffect(() => {
+    if (loadedCacheKeyRef.current && loadedCacheKeyRef.current !== mistakesCacheKey) {
+      loadedCacheKeyRef.current = null;
+      setMistakes([]);
+      setIdx(0);
+      scannedIdsRef.current = [];
+      pendingCandidatesRef.current = [];
+      setPendingCount(0);
+      setRemainingGames(0);
+      setScanExhausted(false);
     }
-    if (!engineReady) {
-      setMistakesError(engineError || "Starting on-device Stockfish…");
-      return;
-    }
-    void loadMistakes();
-  }, [mode, loadMistakes, refreshToken, engineReady, engineError]);
+  }, [mistakesCacheKey]);
 
   useEffect(() => {
     return () => {
@@ -241,7 +528,14 @@ export function StudyScreen() {
         evaluate,
         current.fen,
         uci,
-        current.best_uci
+        current.best_uci,
+        current.best_pv,
+        {
+          gapCp: Math.abs(
+            (current.eval_before_cp ?? 0) - (current.eval_after_cp ?? 0)
+          ),
+          playedUci: current.played_uci,
+        }
       );
 
       if (res.verdict === "illegal") {
@@ -283,12 +577,31 @@ export function StudyScreen() {
     }
   };
 
+  const canScanMoreMistakes =
+    (remainingGames > 0 || pendingCount > 0) && !scanExhausted;
+
   const nextMistake = () => {
+    if (idx >= mistakes.length - 1) {
+      if (canScanMoreMistakes) {
+        resetQuizChrome();
+        setShowScanMore(true);
+        setAllDone(false);
+      } else {
+        resetQuizChrome();
+        setShowScanMore(false);
+        setAllDone(true);
+      }
+      return;
+    }
+    setAllDone(false);
+    setShowScanMore(false);
     resetQuizChrome();
     setIdx((i) => Math.min(i + 1, Math.max(mistakes.length - 1, 0)));
   };
 
   const prevMistake = () => {
+    setAllDone(false);
+    setShowScanMore(false);
     resetQuizChrome();
     setIdx((i) => Math.max(i - 1, 0));
   };
@@ -297,11 +610,22 @@ export function StudyScreen() {
   const evalAfter = current?.eval_after_cp ?? 0;
   const whiteShare = Math.max(
     8,
-    Math.min(92, 50 + evalBefore / 4)
+    Math.min(92, 50 + displayCp(evalBefore) / 4)
   );
 
   return (
-    <ScrollView style={styles.container} contentContainerStyle={styles.content}>
+    <KeyboardAvoidingView
+      style={styles.container}
+      behavior={Platform.OS === "ios" ? "padding" : undefined}
+      keyboardVerticalOffset={Platform.OS === "ios" ? 88 : 0}
+    >
+      <ScrollView
+        style={styles.container}
+        contentContainerStyle={styles.content}
+        keyboardShouldPersistTaps="handled"
+        keyboardDismissMode="interactive"
+        automaticallyAdjustKeyboardInsets
+      >
       <DisplayTitle size={30}>Study Board</DisplayTitle>
 
       <View style={styles.tabRow}>
@@ -319,27 +643,49 @@ export function StudyScreen() {
         </Pressable>
       </View>
 
-      {mode === "mistakes" ? (
+      <View style={mode === "mistakes" ? undefined : styles.hiddenTab}>
         <View>
-          {loadingMistakes ? (
+          {loadingMistakes || scanningMore ? (
             <View style={styles.center}>
               <ActivityIndicator color={colors.red} />
-              <Text style={styles.muted}>
-                {analyzeStatus ||
-                  "Scanning latest games on-device until 5 critical swings…"}
-              </Text>
+              <StudyAnalyzeStatus
+                progress={analyzeProgress}
+                logLines={analyzeLog}
+                fallback={analyzeStatus || "Starting on-device analysis…"}
+              />
             </View>
           ) : null}
-          {mistakesError && !loadingMistakes ? (
+          {mistakesError && !loadingMistakes && !scanningMore ? (
             <Text style={styles.error}>{mistakesError}</Text>
           ) : null}
-          {!loadingMistakes && !mistakesError && mistakes.length === 0 ? (
+          {!loadingMistakes &&
+          !scanningMore &&
+          !mistakesError &&
+          mistakes.length === 0 ? (
             <Text style={styles.muted}>
               No critical swings found in recent games. Try a wider timeframe.
             </Text>
           ) : null}
+          {!loadingMistakes &&
+          !scanningMore &&
+          showScanMore &&
+          canScanMoreMistakes ? (
+            <View style={styles.center}>
+              <BrutalButton
+                label="Scan more"
+                disabled={!engineReady}
+                onPress={() => void continueScanMistakes()}
+              />
+            </View>
+          ) : null}
+          {!loadingMistakes && !scanningMore && allDone ? (
+            <Text style={[styles.muted, { marginTop: spacing.sm }]}>
+              That&apos;s all for today — every candidate position from these
+              games has been reviewed.
+            </Text>
+          ) : null}
 
-          {current ? (
+          {current && !showScanMore && !allDone && !scanningMore ? (
             <View>
               <View style={styles.mistakeHeader}>
                 <View style={styles.gameIdentity}>
@@ -361,11 +707,17 @@ export function StudyScreen() {
                     {formatEval(evalAfter)} → {formatEval(evalBefore)}
                   </Text>
                   <Text style={styles.evalGain}>
-                    +{(Math.abs(evalBefore - evalAfter) / 100).toFixed(2)} improvement
+                    {Math.abs(evalBefore) > 2000 || Math.abs(evalAfter) > 2000
+                      ? "Mating attack"
+                      : `+${(Math.abs(displayCp(evalBefore) - displayCp(evalAfter)) / 100).toFixed(2)} improvement`}
                   </Text>
                   <View style={styles.evalAlign}>
-                    <Pill color={result.loss} style={styles.mistakePill}>
-                      Mistake
+                    <Pill
+                      color={result.loss}
+                      style={styles.mistakePill}
+                      textStyle={styles.movePillText}
+                    >
+                      Played {current.played_san}
                     </Pill>
                   </View>
                 </View>
@@ -447,8 +799,15 @@ export function StudyScreen() {
                   ) : null}
                 </View>
                 {revealed && continuation ? (
-                  <Text style={[styles.comment, { marginTop: spacing.sm }]}>
-                    Continuation: {continuation}
+                  <View style={{ marginTop: spacing.sm }}>
+                    <Text style={styles.comment}>
+                      Continuation: {continuation}
+                    </Text>
+                  </View>
+                ) : null}
+                {revealed && current.gm_game ? (
+                  <Text style={[styles.gmGameLine, { marginTop: spacing.xs }]}>
+                    GM game: {formatGmGameLabel(current.gm_game)}
                   </Text>
                 ) : null}
                 {revealed && current.comment ? (
@@ -472,6 +831,10 @@ export function StudyScreen() {
                     label="Reveal Best Move"
                     onPress={async () => {
                       if (!current.best_uci) return;
+                      if (retryTimerRef.current) {
+                        clearTimeout(retryTimerRef.current);
+                        retryTimerRef.current = null;
+                      }
                       setRevealed(true);
                       setQuizCorrect(null);
                       setQuizFeedback(null);
@@ -485,17 +848,24 @@ export function StudyScreen() {
                           evaluate,
                           current.fen,
                           current.best_uci,
-                          current.best_uci
+                          current.best_uci,
+                          current.best_pv
                         );
                         setContinuation(res.best_continuation_san);
                         setSequencePv(
                           res.best_pv.length
                             ? res.best_pv
-                            : [current.best_uci]
+                            : current.best_pv?.length
+                              ? current.best_pv
+                              : [current.best_uci]
                         );
                       } catch {
                         setContinuation(null);
-                        setSequencePv([current.best_uci]);
+                        setSequencePv(
+                          current.best_pv?.length
+                            ? current.best_pv
+                            : [current.best_uci]
+                        );
                       }
                     }}
                     style={{ marginTop: spacing.sm }}
@@ -512,22 +882,24 @@ export function StudyScreen() {
                   label="Next →"
                   ghost
                   onPress={nextMistake}
-                  disabled={idx >= mistakes.length - 1}
                   style={{ flex: 1 }}
                 />
               </View>
             </View>
           ) : null}
         </View>
-      ) : (
-        <OpeningPrepSection />
-      )}
+      </View>
+      <View style={mode === "repertoire" ? undefined : styles.hiddenTab}>
+        <OpeningPrepSection active={mode === "repertoire"} />
+      </View>
     </ScrollView>
+    </KeyboardAvoidingView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
+  hiddenTab: { display: "none" },
   content: { padding: spacing.md, paddingBottom: 100 },
   tabRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md, marginBottom: spacing.md },
   tab: {
@@ -648,6 +1020,9 @@ const styles = StyleSheet.create({
   mistakePill: {
     alignSelf: "flex-end",
   },
+  movePillText: {
+    textTransform: "none",
+  },
   evalBarTrack: {
     height: 4,
     backgroundColor: result.loss,
@@ -686,6 +1061,13 @@ const styles = StyleSheet.create({
     lineHeight: 20,
     fontFamily: font.sans,
     fontSize: 12,
+  },
+  gmGameLine: {
+    color: colors.cream,
+    marginTop: 4,
+    lineHeight: 18,
+    fontFamily: font.mono,
+    fontSize: 11,
   },
   navRow: {
     flexDirection: "row",

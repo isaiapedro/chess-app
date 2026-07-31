@@ -1,0 +1,12 @@
+export const SCAN_DEPTH = 10;
+export const SCAN_MOVETIME = 300;
+export const REFINE_DEPTH = 20;
+export const REFINE_MOVETIME = 1200;
+export const BATCH_GAMES = 10;
+export const MAX_MISTAKE_GAMES = BATCH_GAMES;
+export const MAX_OPENING_GAMES = 3;
+export const TARGET_MISTAKE_MOMENTS = 5;
+export const TARGET_OPENING_MOMENTS = 3;
+export const APPEND_MOMENTS = 3;
+export const MIN_CONTINUATION_PLIES = 7;
+export const ENGINE_LABEL = "Stockfish 18 lite-single";

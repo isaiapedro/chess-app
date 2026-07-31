@@ -1,6 +1,7 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
+  Image,
   Pressable,
   RefreshControl,
   ScrollView,
@@ -35,6 +36,15 @@ const PERIOD_NOUN: Record<Period, string> = {
   day: "Day",
 };
 
+const HERO_PIECES = [
+  require("../../assets/chess_set/king.png"),
+  require("../../assets/chess_set/queen.png"),
+  require("../../assets/chess_set/rook.png"),
+  require("../../assets/chess_set/bishop.png"),
+  require("../../assets/chess_set/knight.png"),
+  require("../../assets/chess_set/pawn.png"),
+] as const;
+
 export function RecapScreen() {
   const { queryFilters, refreshToken, speed, period, periodLabel } = useFilters();
   const [data, setData] = useState<RecapResponse | null>(null);
@@ -42,6 +52,10 @@ export function RecapScreen() {
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [activeBadge, setActiveBadge] = useState(0);
+  const heroPiece = useMemo(() => {
+    const idx = Math.floor(Math.random() * HERO_PIECES.length);
+    return HERO_PIECES[idx];
+  }, [period, refreshToken, queryFilters.username]);
 
   const load = useCallback(
     async (forceNetwork = false) => {
@@ -62,14 +76,24 @@ export function RecapScreen() {
   );
 
   useEffect(() => {
+    const heavy = period === "year" || period === "all";
     setLoading(true);
+    if (heavy) {
+      setData(null);
+    }
     void load(false);
-  }, [load, refreshToken]);
+  }, [load, refreshToken, period]);
 
   if (loading && !data) {
     return (
       <View style={styles.center}>
         <ActivityIndicator color={colors.red} />
+        {period === "year" || period === "all" ? (
+          <Text style={styles.muted}>
+            Loading {period === "all" ? "all-time" : "yearly"} recap… this can
+            take a bit.
+          </Text>
+        ) : null}
       </View>
     );
   }
@@ -105,18 +129,20 @@ export function RecapScreen() {
       }
     >
       <View style={styles.hero}>
-        <Eyebrow>
-          {view.formatLabel} · {periodLabel}
-        </Eyebrow>
         <View style={styles.heroRow}>
           <View style={styles.heroText}>
+            <Eyebrow>
+              {view.formatLabel} · {periodLabel}
+            </Eyebrow>
             <DisplayTitle size={40}>
               Your {periodNoun}
               {"\n"}in Chess
             </DisplayTitle>
             <Text style={styles.byline}>@{view.username}</Text>
           </View>
-          <Text style={styles.heroPawn}>♟</Text>
+          <View style={styles.heroPieceWrap}>
+            <Image source={heroPiece} style={styles.heroPiece} resizeMode="contain" />
+          </View>
         </View>
       </View>
 
@@ -144,7 +170,11 @@ export function RecapScreen() {
       </View>
 
       <View style={styles.sectionPad}>
-        <RatingChart points={view.ratingSeries} period={period} />
+        <RatingChart
+          points={view.ratingSeries}
+          curves={view.ratingCurves}
+          period={period}
+        />
         {period === "year" || period === "all" ? (
           <MonthlyGamesChart points={view.monthlyActivity} />
         ) : null}
@@ -230,17 +260,26 @@ const styles = StyleSheet.create({
   },
   heroRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
     gap: spacing.md,
   },
   heroText: {
+    flex: 1,
     flexShrink: 1,
+    justifyContent: "center",
   },
-  heroPawn: {
-    color: colors.cream,
-    fontSize: 64,
-    lineHeight: 76,
+  heroPieceWrap: {
+    width: 90,
+    height: 90,
+    marginTop: 5,
+    alignItems: "center",
+    justifyContent: "flex-start",
+    alignSelf: "flex-start",
+  },
+  heroPiece: {
+    width: 90,
+    height: 90,
   },
   byline: {
     marginTop: spacing.sm,

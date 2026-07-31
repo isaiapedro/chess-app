@@ -24,7 +24,8 @@ type StockfishContextValue = {
   evaluate: (
     fen: string,
     depth?: number,
-    multiPv?: number
+    multiPv?: number,
+    movetimeMs?: number
   ) => Promise<EvalResult>;
 };
 
@@ -42,9 +43,9 @@ function debugIngestUrl(): string {
     Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
   const host = hostUri?.split(":")[0];
   if (host) {
-    return `http://${host}:7474/ingest/3d67426d-0ccd-41bb-b08a-f7bf8ec78c30`;
+    return `http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`;
   }
-  return "http://127.0.0.1:7474/ingest/3d67426d-0ccd-41bb-b08a-f7bf8ec78c30";
+  return "http://127.0.0.1:7677/ingest/217f9228-6275-432a-b240-b52166a932e5";
 }
 
 function agentLog(
@@ -62,8 +63,8 @@ function agentLog(
     },
     body: JSON.stringify({
       sessionId: "6840b8",
-      runId: "sf-main-thread",
-      hypothesisId: "K",
+      runId: "sf18-unpkg-post-fix",
+      hypothesisId: String(data.hyp || "K"),
       location,
       message,
       data,
@@ -73,9 +74,13 @@ function agentLog(
   // #endregion
 }
 
-const SF_BASE = "https://cdn.jsdelivr.net/npm/stockfish@11.0.0/src/";
-const SF_JS = `${SF_BASE}stockfish.js`;
-const SF_WASM = `${SF_BASE}stockfish.wasm`;
+const SF_BASE = "https://unpkg.com/stockfish@18.0.8/bin/";
+const SF_JS_URL = `${SF_BASE}stockfish-18-lite-single.js`;
+const SF_WASM_URL = `${SF_BASE}stockfish-18-lite-single.wasm`;
+// #region agent log
+const PROBE_GH_JS =
+  "https://github.com/nmrugg/stockfish.js/releases/download/v18.0.0/stockfish-18-lite-single.js";
+// #endregion
 
 const ENGINE_HTML = `<!DOCTYPE html>
 <html>
@@ -87,8 +92,18 @@ const ENGINE_HTML = `<!DOCTYPE html>
   let currentId = null;
   let bestByPv = {};
   let scoreByPv = {};
+  let pvByMove = {};
+  let scoreByMove = {};
   let wantedMultiPv = 1;
   let bootTimer = null;
+  let searching = false;
+  let queuedReq = null;
+  let seenIds = {};
+  let seenCount = 0;
+  // #region agent log
+  let rawMsgCount = 0;
+  let goCount = 0;
+  // #endregion
 
   function send(type, payload) {
     window.ReactNativeWebView.postMessage(JSON.stringify({ type, ...payload }));
@@ -97,17 +112,30 @@ const ENGINE_HTML = `<!DOCTYPE html>
   function resetCollect() {
     bestByPv = {};
     scoreByPv = {};
+    pvByMove = {};
+    scoreByMove = {};
   }
 
   function handleLine(raw) {
     var line = raw && raw.data != null ? raw.data : raw;
     if (line == null) return;
     line = String(line);
+    // #region agent log
+    if (line.indexOf('__dbg ') === 0) {
+      send('probe', { probe: 'worker-dbg', hyp: 'FG', ok: true, err: line.slice(6, 240) });
+      return;
+    }
+    if (rawMsgCount < 25) {
+      rawMsgCount++;
+      send('probe', { probe: 'worker-msg', hyp: 'HI', ok: true, err: line.slice(0, 200) });
+    }
+    // #endregion
     if (!ready && (line.indexOf('uciok') === 0 || line.indexOf('readyok') === 0 || line.indexOf('id ') === 0)) {
       send('debug', { stage: 'uci-line', line: line.slice(0, 120) });
     }
     if (line === 'uciok' || line.indexOf('uciok') === 0) {
       send('debug', { stage: 'uciok-received' });
+      engine.postMessage('setoption name Hash value 64');
       engine.postMessage('isready');
       return;
     }
@@ -142,9 +170,15 @@ const ENGINE_HTML = `<!DOCTYPE html>
       }
       bestByPv[multipv] = pvUcis;
       scoreByPv[multipv] = cp;
+      var head = pvUcis[0];
+      var known = pvByMove[head];
+      if (!known || pvUcis.length >= known.length) pvByMove[head] = pvUcis;
+      scoreByMove[head] = cp;
       return;
     }
     if (line.indexOf('bestmove') === 0) {
+      var bm = line.split(/\\s+/);
+      var bestmoveUci = bm[1] && bm[1] !== '(none)' ? bm[1] : null;
       var multipvList = [];
       for (var i = 1; i <= wantedMultiPv; i++) {
         if (bestByPv[i] != null && scoreByPv[i] != null) {
@@ -155,14 +189,33 @@ const ENGINE_HTML = `<!DOCTYPE html>
           });
         }
       }
-      var bestUci = multipvList.length ? multipvList[0].uci : null;
-      var bestPv = multipvList.length ? multipvList[0].pv : [];
-      var cpWhite = multipvList.length ? multipvList[0].cpWhite : 0;
-      var bm = line.split(' ');
-      if (!bestUci && bm[1] && bm[1] !== '(none)') {
-        bestUci = bm[1];
-        bestPv = [bm[1]];
-      }
+      var bestUci = bestmoveUci || (multipvList[0] ? multipvList[0].uci : null);
+      var matched = bestUci
+        ? multipvList.find(function (row) { return row.uci === bestUci; })
+        : null;
+      var trackedPv = bestUci ? pvByMove[bestUci] : null;
+      var bestPv =
+        matched && matched.pv && matched.pv.length > 1
+          ? matched.pv
+          : (trackedPv && trackedPv.length
+            ? trackedPv
+            : (matched && matched.pv ? matched.pv : (bestUci ? [bestUci] : [])));
+      var cpWhite = matched
+        ? matched.cpWhite
+        : (bestUci && scoreByMove[bestUci] != null
+          ? scoreByMove[bestUci]
+          : (multipvList[0] ? multipvList[0].cpWhite : 0));
+      searching = false;
+      // #region agent log
+      send('probe', {
+        probe: 'bm-pv', hyp: 'J', ok: bestPv.length > 1,
+        err: 'go#' + goCount + ' bm=' + String(bestmoveUci) +
+          ' matched=' + String(!!matched) +
+          ' tracked=' + String(trackedPv ? trackedPv.length : 0) +
+          ' pvLen=' + bestPv.length + ' cp=' + cpWhite +
+          ' lines=' + multipvList.length
+      });
+      // #endregion
       send('eval', {
         id: currentId,
         cpWhite: cpWhite,
@@ -172,49 +225,172 @@ const ENGINE_HTML = `<!DOCTYPE html>
       });
       currentId = null;
       resetCollect();
+      if (queuedReq) {
+        var next = queuedReq;
+        queuedReq = null;
+        startSearch(next);
+      }
     }
   }
 
   function bindEngine(sf) {
     engine = sf;
-    engine.onmessage = handleLine;
-    send('debug', { stage: 'engine-bound', mode: 'stockfish11-main' });
+    engine.onmessage = function (event) {
+      handleLine(event && event.data != null ? event.data : event);
+    };
+    // #region agent log
+    engine.onerror = function (ev) {
+      send('probe', {
+        probe: 'worker-error', hyp: 'F', ok: false,
+        err: String((ev && (ev.message || ev.filename)) || 'unknown') + ':' + String(ev && ev.lineno)
+      });
+    };
+    engine.onmessageerror = function () {
+      send('probe', { probe: 'worker-messageerror', hyp: 'F', ok: false, err: 'messageerror' });
+    };
+    setTimeout(function () {
+      if (!ready) send('probe', { probe: 'boot-watchdog', hyp: 'HI', ok: false, err: 'msgs=' + rawMsgCount });
+    }, 15000);
+    // #endregion
+    send('debug', { stage: 'engine-bound', mode: 'stockfish18-lite-single' });
     engine.postMessage('uci');
   }
 
-  function bootWithFactory() {
-    if (typeof STOCKFISH !== 'function') {
-      send('error', { message: 'STOCKFISH factory missing after script load' });
-      return;
-    }
+  function bootFromBlobs(jsText, wasmBuffer) {
+    var wasmUrl = URL.createObjectURL(new Blob([wasmBuffer], { type: 'application/wasm' }));
+    var prefix = [
+      // #region agent log
+      'self.__dbg = function (m) { try { self.postMessage("__dbg " + m); } catch (e) {} };',
+      'self.onerror = function (msg, src, line) { self.__dbg("onerror " + String(msg) + " @" + String(src).slice(0, 60) + ":" + String(line)); };',
+      'self.addEventListener("unhandledrejection", function (ev) { self.__dbg("rejection " + String(ev && ev.reason)); });',
+      // #endregion
+      'var __wasmUrl = ' + JSON.stringify(wasmUrl) + ';',
+      'var __origFetch = self.fetch.bind(self);',
+      'self.fetch = function (input, init) {',
+      // #region agent log
+      '  self.__dbg("fetch " + String(typeof input === "string" ? input : (input && input.url) || "").slice(0, 100) + " -> wasm blob");',
+      // #endregion
+      '  return __origFetch(__wasmUrl, init)',
+      // #region agent log
+      '    .then(function (r) { self.__dbg("fetch-done " + r.status); return r; },',
+      '      function (e) { self.__dbg("fetch-fail " + String(e && e.message)); throw e; })',
+      // #endregion
+      '  ;',
+      '};',
+      // #region agent log
+      'self.__dbg("prefix-loaded typeofWA=" + typeof WebAssembly);'
+      // #endregion
+    ].join('\\n');
+    var workerUrl = URL.createObjectURL(
+      new Blob([prefix + '\\n' + jsText], { type: 'application/javascript' })
+    );
+    bindEngine(new Worker(workerUrl));
+  }
+
+  // #region agent log
+  async function probeUrl(id, hyp, url, opts) {
+    var t0 = Date.now();
     try {
-      var sf = STOCKFISH('${SF_WASM}');
-      bindEngine(sf);
-    } catch (err) {
-      send('error', { message: 'STOCKFISH() failed: ' + String(err && err.message ? err.message : err) });
+      var res = await fetch(url, opts || {});
+      var bytes = -1;
+      if (!opts || opts.method !== 'HEAD') {
+        var buf = await res.arrayBuffer();
+        bytes = buf.byteLength;
+      }
+      send('probe', {
+        probe: id, hyp: hyp, ok: res.ok, status: res.status,
+        bytes: bytes, ms: Date.now() - t0
+      });
+    } catch (e) {
+      send('probe', {
+        probe: id, hyp: hyp, ok: false, status: -1,
+        err: String(e && e.message ? e.message : e), ms: Date.now() - t0
+      });
     }
   }
 
-  function boot() {
+  async function probeBlobWorker() {
+    try {
+      var url = URL.createObjectURL(new Blob(
+        ['self.onmessage=function(e){self.postMessage("pong:"+e.data);};'],
+        { type: 'application/javascript' }
+      ));
+      var w = new Worker(url);
+      var outcome = await new Promise(function (resolve) {
+        var done = false;
+        var timer = setTimeout(function () { if (!done) { done = true; resolve('timeout'); } }, 5000);
+        w.onmessage = function (ev) {
+          if (done) return;
+          done = true; clearTimeout(timer); resolve(String(ev.data));
+        };
+        w.onerror = function (ev) {
+          if (done) return;
+          done = true; clearTimeout(timer);
+          resolve('error:' + (ev && ev.message ? ev.message : 'unknown'));
+        };
+        w.postMessage('ping');
+      });
+      w.terminate();
+      send('probe', { probe: 'blob-worker', hyp: 'D', ok: outcome === 'pong:ping', err: outcome });
+    } catch (e) {
+      send('probe', {
+        probe: 'blob-worker', hyp: 'D', ok: false,
+        err: String(e && e.message ? e.message : e)
+      });
+    }
+  }
+
+  async function runProbes() {
+    send('probe', { probe: 'origin', hyp: 'A', ok: true, err: String(location.origin) });
+    await probeUrl('gh-js-control', 'A', '${PROBE_GH_JS}');
+    await probeBlobWorker();
+  }
+  // #endregion
+
+  async function boot() {
+    // #region agent log
+    await runProbes();
+    // #endregion
     send('debug', {
       stage: 'boot-start',
       wasm: typeof WebAssembly,
+      worker: typeof Worker,
       ua: navigator.userAgent
     });
+    if (typeof WebAssembly === 'undefined') {
+      send('error', { message: 'WebAssembly unavailable in WebView' });
+      return;
+    }
+    if (typeof Worker === 'undefined') {
+      send('error', { message: 'Worker unavailable in WebView' });
+      return;
+    }
     bootTimer = setTimeout(function () {
       if (!ready) send('error', { message: 'Stockfish boot timeout (no readyok)' });
-    }, 60000);
+    }, 120000);
 
-    var script = document.createElement('script');
-    script.src = '${SF_JS}';
-    script.onload = function () {
-      send('debug', { stage: 'script-loaded', typeofSTOCKFISH: typeof STOCKFISH });
-      bootWithFactory();
-    };
-    script.onerror = function () {
-      send('error', { message: 'Failed to load stockfish@11 script' });
-    };
-    document.body.appendChild(script);
+    try {
+      send('debug', { stage: 'download-start' });
+      var results = await Promise.all([
+        fetch('${SF_JS_URL}'),
+        fetch('${SF_WASM_URL}')
+      ]);
+      if (!results[0].ok || !results[1].ok) {
+        throw new Error('SF18 download failed: js=' + results[0].status + ' wasm=' + results[1].status);
+      }
+      var jsText = await results[0].text();
+      var wasmBuffer = await results[1].arrayBuffer();
+      send('debug', {
+        stage: 'download-done',
+        jsBytes: jsText.length,
+        wasmBytes: wasmBuffer.byteLength
+      });
+      bootFromBlobs(jsText, wasmBuffer);
+    } catch (err) {
+      send('error', {
+        message: 'Stockfish@18 boot failed: ' + String(err && err.message ? err.message : err)
+      });
+    }
   }
 
   document.addEventListener('message', onRn);
@@ -235,14 +411,32 @@ const ENGINE_HTML = `<!DOCTYPE html>
         send('error', { id: msg.id, message: 'Engine not ready' });
         return;
       }
-      currentId = msg.id;
-      wantedMultiPv = Math.max(1, Math.min(5, msg.multiPv || 1));
-      resetCollect();
-      engine.postMessage('setoption name MultiPV value ' + wantedMultiPv);
-      engine.postMessage('ucinewgame');
-      engine.postMessage('position fen ' + msg.fen);
-      engine.postMessage('go depth ' + (msg.depth || 12));
+      if (msg.id && seenIds[msg.id]) return;
+      if (msg.id) {
+        if (seenCount > 500) { seenIds = {}; seenCount = 0; }
+        seenIds[msg.id] = 1;
+        seenCount++;
+      }
+      if (searching) {
+        queuedReq = msg;
+        try { engine.postMessage('stop'); } catch (e) {}
+        return;
+      }
+      startSearch(msg);
     }
+  }
+
+  function startSearch(msg) {
+    resetCollect();
+    currentId = msg.id;
+    wantedMultiPv = Math.max(1, Math.min(5, msg.multiPv || 1));
+    searching = true;
+    // #region agent log
+    goCount++;
+    // #endregion
+    engine.postMessage('setoption name MultiPV value ' + wantedMultiPv);
+    engine.postMessage('position fen ' + msg.fen);
+    engine.postMessage('go depth ' + (msg.depth || 15) + ' movetime ' + (msg.movetime || 1200));
   }
 
   boot();
@@ -269,7 +463,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     agentLog("StockfishProvider.tsx:mount", "provider mounted", {
-      mode: "stockfish11-main",
+      mode: "stockfish18-lite-single",
     });
     return () => {
       pending.current.forEach((item) =>
@@ -289,7 +483,10 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
       typeofSTOCKFISH?: string;
       line?: string;
       wasm?: string;
+      worker?: string;
       ua?: string;
+      jsBytes?: number;
+      wasmBytes?: number;
       cpWhite?: number;
       bestUci?: string | null;
       bestPv?: string[];
@@ -300,6 +497,13 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
     } catch {
       return;
     }
+    // #region agent log
+    if (msg.type === "probe") {
+      const { type: _t, ...rest } = msg as Record<string, unknown>;
+      agentLog("StockfishProvider.tsx:probe", "webview probe", rest);
+      return;
+    }
+    // #endregion
     if (msg.type === "debug") {
       agentLog("StockfishProvider.tsx:debug", "webview debug", {
         stage: msg.stage,
@@ -307,11 +511,16 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         typeofSTOCKFISH: msg.typeofSTOCKFISH,
         line: msg.line,
         wasm: msg.wasm,
+        worker: msg.worker,
+        jsBytes: msg.jsBytes,
+        wasmBytes: msg.wasmBytes,
       });
       return;
     }
     if (msg.type === "ready") {
-      agentLog("StockfishProvider.tsx:ready", "stockfish ready", {});
+      agentLog("StockfishProvider.tsx:ready", "stockfish ready", {
+        mode: "stockfish18-lite-single",
+      });
       setReady(true);
       setError(null);
       return;
@@ -348,7 +557,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const evaluate = useCallback(
-    (fen: string, depth = 12, multiPv = 1) => {
+    (fen: string, depth = 15, multiPv = 1, movetimeMs = 1200) => {
       return new Promise<EvalResult>((resolve, reject) => {
         if (!ready) {
           reject(new Error("Stockfish not ready"));
@@ -356,12 +565,12 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         }
         const id = `e${++seq.current}`;
         pending.current.set(id, { id, resolve, reject });
-        post({ type: "eval", id, fen, depth, multiPv });
+        post({ type: "eval", id, fen, depth, multiPv, movetime: movetimeMs });
         setTimeout(() => {
           if (!pending.current.has(id)) return;
           pending.current.delete(id);
           reject(new Error("Stockfish timeout"));
-        }, 30000);
+        }, movetimeMs + 5000);
       });
     },
     [post, ready]

@@ -19,6 +19,22 @@ const FORMAT_LABEL: Record<string, string> = {
   bullet: "Bullet",
 };
 
+const FORMAT_COLORS: Record<string, string> = {
+  bullet: colors.red,
+  blitz: colors.blue,
+  rapid: colors.sage,
+  classical: colors.cream,
+};
+
+const FORMAT_ORDER = ["bullet", "blitz", "rapid", "classical"];
+
+export type RatingCurve = {
+  key: string;
+  label: string;
+  color: string;
+  points: RatingPoint[];
+};
+
 const CHARS_PER_MOVE = 5;
 const CHARS_PER_BOOK = 400_000;
 const CHARS_PER_PAGE = 1_800;
@@ -39,7 +55,7 @@ function buildNotationComparison(characters: number) {
   if (characters < CHARS_PER_BOOK) {
     const pages = Math.max(1, Math.round(characters / CHARS_PER_PAGE));
     return {
-      icon: "▣",
+      icon: "☰",
       label: "Pages of notation written",
       value: pages.toLocaleString(),
       sub,
@@ -54,7 +70,7 @@ function buildNotationComparison(characters: number) {
   );
 
   return {
-    icon: "▣",
+    icon: "☰",
     label: "You wrote a book the size of",
     value: match.title,
     sub,
@@ -86,6 +102,14 @@ function formatHour12(hour: number): string {
   const suffix = hour < 12 ? "AM" : "PM";
   const base = hour % 12 === 0 ? 12 : hour % 12;
   return `${base} ${suffix}`;
+}
+
+function formatPeakHourAmPm(peakHour: string): string {
+  const match = peakHour.match(/(\d{1,2})/);
+  if (!match) return peakHour;
+  const hour = Number(match[1]);
+  if (!Number.isFinite(hour) || hour < 0 || hour > 23) return peakHour;
+  return formatHour12(hour);
 }
 
 const MAX_BUCKETS = 400;
@@ -155,6 +179,74 @@ function buildEvenRatingSeries(
     const rating = lastRatingByBucket.get(bucketKey(date));
     if (rating != null) carried = rating;
     return { created_at: date.toISOString(), user_rating: carried };
+  });
+}
+
+function buildAlignedRatingCurves(
+  bySpeed: Record<string, RatingPoint[]>,
+  period: Period
+): RatingCurve[] {
+  const entries = [
+    ...FORMAT_ORDER.filter((key) => (bySpeed[key] || []).length > 0),
+    ...Object.keys(bySpeed).filter(
+      (key) => !FORMAT_ORDER.includes(key) && (bySpeed[key] || []).length > 0
+    ),
+  ]
+    .map((key) => ({
+      key,
+      sorted: [...(bySpeed[key] || [])]
+        .filter((point) => point.user_rating != null)
+        .sort(
+          (a, b) =>
+            new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        ),
+    }))
+    .filter((entry) => entry.sorted.length > 0);
+
+  if (!entries.length) return [];
+
+  const allPoints = entries.flatMap((entry) => entry.sorted);
+  const shared = buildEvenRatingSeries(allPoints, period);
+  if (shared.length < 2) return [];
+
+  const bucketKey = (date: Date) => {
+    if (period === "day") {
+      return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}-${Math.floor(date.getHours() / 2)}`;
+    }
+    if (period === "year" || period === "all") {
+      return `${date.getFullYear()}-${date.getMonth()}`;
+    }
+    return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
+  };
+
+  return entries.map((entry) => {
+    const lastRatingByBucket = new Map<string, number>();
+    for (const point of entry.sorted) {
+      lastRatingByBucket.set(
+        bucketKey(new Date(point.created_at)),
+        point.user_rating
+      );
+    }
+    let carried = entry.sorted[0].user_rating;
+    let started = false;
+    const points = shared.map((bucket) => {
+      const key = bucketKey(new Date(bucket.created_at));
+      const rating = lastRatingByBucket.get(key);
+      if (rating != null) {
+        carried = rating;
+        started = true;
+      }
+      return {
+        created_at: bucket.created_at,
+        user_rating: started ? carried : entry.sorted[0].user_rating,
+      };
+    });
+    return {
+      key: entry.key,
+      label: FORMAT_LABEL[entry.key] || entry.key,
+      color: FORMAT_COLORS[entry.key] || colors.cream,
+      points,
+    };
   });
 }
 
@@ -239,20 +331,33 @@ export function selectRecapView(
       {
         label: "Win Rate",
         value: `${results.win_rate}%`,
-        sub: headline.peak_day ? `Peak day ${headline.peak_day}` : "Filtered games",
+        sub:
+          period === "day"
+            ? "Filtered games"
+            : headline.peak_day
+              ? `Peak day ${headline.peak_day}`
+              : "Filtered games",
       },
       {
         label: "Time Invested",
         value: `${headline.total_hours ?? 0}h`,
-        sub: headline.peak_hour ? `Peak ${headline.peak_hour}` : "Estimated play time",
+        sub:
+          peakHourPoint && peakHourPoint.games > 0
+            ? `Peak ${formatHour12(peakHourPoint.hour)}`
+            : headline.peak_hour
+              ? `Peak ${formatPeakHourAmPm(headline.peak_hour)}`
+              : "Estimated play time",
       },
       {
         label: "Moves Made",
         value: Number(headline.total_moves || 0).toLocaleString(),
-        sub: `Streak W${headline.max_win_streak ?? 0} · U${headline.max_unbeaten_streak ?? 0}`,
+        sub: `Undefeated streak ${headline.max_unbeaten_streak ?? 0}`,
       },
     ],
     ratingSeries: buildEvenRatingSeries(data.rating_series || [], period),
+    ratingCurves: speed
+      ? []
+      : buildAlignedRatingCurves(data.rating_series_by_speed || {}, period),
     monthlyActivity: fillMonthlyGaps(monthly, period),
     hourlyActivity: bucketHoursByTwo(hourlyRaw),
     peakHourLabel:
@@ -273,14 +378,14 @@ export function selectRecapView(
         label: "Weight of captured pieces",
         value: formatWeight(data.comparisons?.captured_piece_weight_g ?? 0),
         sub: "Material taken off the board",
-        icon: "◑",
+        icon: "⚖",
         small: false,
       },
       {
         label: "Km walked by pieces",
         value: String(data.comparisons?.km_walked ?? 0),
         sub: "Distance across the board",
-        icon: "●",
+        icon: "━",
         small: false,
       },
     ],

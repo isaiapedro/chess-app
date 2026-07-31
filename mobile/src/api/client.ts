@@ -5,7 +5,7 @@ import type {
   RecapResponse,
   InsightsResponse,
 } from "./types";
-import { readThroughCache } from "../storage/cache";
+import { readThroughCache, GAMES_TTL_MS, STUDY_API_TTL_MS } from "../storage/cache";
 
 function resolveApiBase(): string {
   const fromEnv = process.env.EXPO_PUBLIC_API_URL?.replace(/\/$/, "");
@@ -49,6 +49,15 @@ export type MistakeItem = {
   played_san: string;
   best_uci: string | null;
   best_san: string | null;
+  best_pv?: string[];
+  continuation_source?: "gm" | "engine";
+  gm_game?: {
+    id?: string;
+    white: string;
+    black: string;
+    date: string | null;
+    event: string | null;
+  } | null;
   eval_before_cp: number;
   eval_after_cp: number;
   eval_delta_cp?: number;
@@ -63,6 +72,15 @@ export type ExplorerMove = {
   draws: number;
   black: number;
   averageRating?: number;
+};
+
+export type ExplorerTopGame = {
+  id?: string;
+  uci?: string;
+  winner?: string | null;
+  year?: number;
+  white?: { name?: string; rating?: number };
+  black?: { name?: string; rating?: number };
 };
 
 function buildParams(filters: QueryFilters): URLSearchParams {
@@ -104,9 +122,21 @@ async function getJson<T>(
     },
     {
       forceNetwork,
-      ttlMs: path.includes("/games/") ? 60 * 60 * 1000 : 15 * 60 * 1000,
+      ttlMs: ttlForPath(path),
     }
   );
+}
+
+function ttlForPath(path: string): number {
+  if (path.includes("/games/")) return GAMES_TTL_MS;
+  if (
+    path.includes("/study/explorer") ||
+    path.includes("/study/masters-pgn") ||
+    path.includes("/study/eval")
+  ) {
+    return STUDY_API_TTL_MS;
+  }
+  return 15 * 60 * 1000;
 }
 
 async function postJson<T>(path: string, body: unknown): Promise<T> {
@@ -208,6 +238,7 @@ export async function fetchExplorer(
     fen: string;
     source: string;
     moves: ExplorerMove[];
+    topGames?: ExplorerTopGame[];
     opening?: { eco?: string; name?: string };
     white: number;
     draws: number;
@@ -215,6 +246,12 @@ export async function fetchExplorer(
     fallback?: boolean;
     note?: string;
   }>("/api/v1/study/explorer", params);
+}
+
+export async function fetchMastersPgn(gameId: string) {
+  return getJson<{ id: string; pgn: string }>(
+    `/api/v1/study/masters-pgn/${encodeURIComponent(gameId)}`
+  );
 }
 
 export async function validateQuizMove(

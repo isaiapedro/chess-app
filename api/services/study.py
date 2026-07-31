@@ -11,6 +11,7 @@ from cache import (
     _dbg,
     get_gm_games,
     get_lichess_stats,
+    get_masters_pgn,
     get_player_prep,
     get_position_eval,
 )
@@ -291,6 +292,19 @@ def explorer_position(
             }
         )
 
+    top_games = []
+    for game in data.get("topGames") or []:
+        top_games.append(
+            {
+                "id": game.get("id"),
+                "uci": game.get("uci"),
+                "winner": game.get("winner"),
+                "year": game.get("year"),
+                "white": game.get("white"),
+                "black": game.get("black"),
+            }
+        )
+
     return {
         "fen": fen,
         "source": source,
@@ -299,6 +313,7 @@ def explorer_position(
         "draws": data.get("draws", 0),
         "black": data.get("black", 0),
         "moves": moves[:12],
+        "topGames": top_games,
         "opening": data.get("opening"),
         "ratings": ratings,
     }
@@ -346,6 +361,7 @@ def _explorer_from_cloud_eval(fen: str, source: str) -> dict:
         "draws": 0,
         "black": 0,
         "moves": moves,
+        "topGames": [],
         "opening": None,
         "note": (
             None
@@ -353,6 +369,13 @@ def _explorer_from_cloud_eval(fen: str, source: str) -> dict:
             else "Set LICHESS_TOKEN for full opening explorer stats."
         ),
     }
+
+
+def masters_game_pgn(game_id: str) -> dict:
+    data = get_masters_pgn(game_id)
+    if not data or not data.get("pgn"):
+        raise HTTPException(status_code=404, detail="Masters game not found")
+    return {"id": game_id, "pgn": data["pgn"]}
 
 
 EVAL_CLAMP_CP = 2000

@@ -8,6 +8,7 @@ import {
 } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import { Chess, Square } from "chess.js";
+import { tryMove, uciFromMove } from "../engine/chessMoves";
 import { colors, withAlpha } from "../theme";
 import {
   ALPHA_PIECES,
@@ -83,10 +84,29 @@ export function ChessBoard({
 
   const legalTargets = useMemo(() => {
     if (!selected) return new Set<string>();
-    return new Set(
+    const selectedPiece = chess.get(selected);
+    const targets = new Set(
       chess.moves({ square: selected, verbose: true }).map((m) => m.to)
     );
+    if (selectedPiece?.type === "k") {
+      const castles = chess
+        .moves({ square: selected, verbose: true })
+        .filter((m) => m.flags.includes("k") || m.flags.includes("q"));
+      for (const castle of castles) {
+        const rookFile = castle.flags.includes("q") ? "a" : "h";
+        targets.add(`${rookFile}${selected[1]}` as Square);
+      }
+    }
+    return targets;
   }, [chess, selected]);
+
+  const commitMove = (from: Square, to: Square) => {
+    const moveResult = tryMove(fen, from, to);
+    if (moveResult) {
+      onMove?.(uciFromMove(moveResult), moveResult.san, moveResult.after);
+    }
+    setSelected(null);
+  };
 
   const handlePress = (sq: Square) => {
     if (!interactive) return;
@@ -104,26 +124,21 @@ export function ChessBoard({
       return;
     }
 
-    if (piece && piece.color === chess.turn()) {
+    const selectedPiece = chess.get(selected);
+    if (
+      piece &&
+      piece.color === chess.turn() &&
+      !(
+        selectedPiece?.type === "k" &&
+        piece.type === "r" &&
+        legalTargets.has(sq)
+      )
+    ) {
       setSelected(sq);
       return;
     }
 
-    const trial = new Chess(fen);
-    try {
-      const moveResult = trial.move({
-        from: selected,
-        to: sq,
-        promotion: "q",
-      });
-      if (moveResult) {
-        const uci = `${moveResult.from}${moveResult.to}${moveResult.promotion || ""}`;
-        onMove?.(uci, moveResult.san, trial.fen());
-      }
-    } catch {
-      /* illegal */
-    }
-    setSelected(null);
+    commitMove(selected, sq);
   };
 
   return (

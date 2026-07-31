@@ -5,6 +5,7 @@ import {
   StyleSheet,
   Text,
   TextInput,
+  TextStyle,
   View,
   ViewStyle,
 } from "react-native";
@@ -63,10 +64,12 @@ export function Pill({
   children,
   color = colors.textMuted,
   style,
+  textStyle,
 }: {
   children: React.ReactNode;
   color?: string;
   style?: ViewStyle;
+  textStyle?: TextStyle;
 }) {
   return (
     <View
@@ -79,7 +82,7 @@ export function Pill({
         style,
       ]}
     >
-      <Text style={[styles.pillText, { color }]}>{children}</Text>
+      <Text style={[styles.pillText, { color }, textStyle]}>{children}</Text>
     </View>
   );
 }

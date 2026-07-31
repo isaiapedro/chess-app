@@ -72,6 +72,7 @@ export type RecapResponse = {
     captured_piece_weight_g?: number;
   };
   rating_series: RatingPoint[];
+  rating_series_by_speed?: Record<string, RatingPoint[]>;
   rating_summary?: {
     peak: number | null;
     current: number | null;
