@@ -1,6 +1,6 @@
 import { Chess, type Move } from "chess.js";
 import type { ExplorerMove, MistakeItem } from "../api/client";
-import { clampCp, toWhiteCp, type StudyGame } from "./analyzeMistakes";
+import { clampCp, formatEval, toWhiteCp, type StudyGame } from "./analyzeMistakes";
 import {
   applyUciMove,
   canonicalUci,
@@ -14,6 +14,10 @@ import {
   familyMatchesSelection,
   resolveEcoFamily,
 } from "./ecoFamilies";
+import {
+  openingNamesMatch,
+  variationEndPlyFromMap,
+} from "./openingLines";
 import {
   ENGINE_LABEL,
   MAX_OPENING_GAMES,
@@ -54,6 +58,7 @@ export type OpeningMoment = MistakeItem & {
   path_frequency_pct: number | null;
   path_rank: number | null;
   frequency_note: string | null;
+  frequency_debug: string | null;
   compound_table: CompoundMoveEntry[];
   source: "lichess" | "masters" | "eval";
   alt_moves: Array<{ uci: string; san: string; score: number }>;
@@ -85,6 +90,7 @@ type ExplorerFn = (
   draws: number;
   black: number;
   fallback?: boolean;
+  opening?: { eco?: string; name?: string };
 }>;
 
 type EvalFn = (
@@ -117,7 +123,46 @@ const MIN_MASTERS_GAMES = 3;
 const GOOD_SCORE_GAP = 0.05;
 const SCORE_TOLERANCE_FRACTION = 0.2;
 const EVAL_GAP_CP = 100;
-const MIN_GAMES_FOR_WINRATE_UI = 10;
+export const MIN_GAMES_FOR_WINRATE_UI = 10;
+
+export function usesWinrateHeader(moment: {
+  games_played?: number | null;
+  games_best?: number | null;
+  winrate_played?: number | null;
+  winrate_best?: number | null;
+}): boolean {
+  return (
+    (moment.games_played ?? 0) >= MIN_GAMES_FOR_WINRATE_UI &&
+    (moment.games_best ?? 0) >= MIN_GAMES_FOR_WINRATE_UI &&
+    moment.winrate_played != null &&
+    moment.winrate_best != null
+  );
+}
+
+export function formatOpeningWorsenedComment(moment: {
+  played_san: string;
+  best_san?: string | null;
+  eval_before_cp: number;
+  eval_after_cp: number;
+  eval_drop_cp: number;
+  games_played?: number | null;
+  games_best?: number | null;
+  winrate_played?: number | null;
+  winrate_best?: number | null;
+}): string {
+  const bestLabel = moment.best_san || "the best move";
+  if (usesWinrateHeader(moment)) {
+    return `Your position worsened in the opening — ${moment.played_san} left ${formatEval(
+      moment.eval_after_cp
+    )} instead of ${formatEval(moment.eval_before_cp)} with ${bestLabel}.`;
+  }
+  if (moment.winrate_played != null && moment.winrate_best != null) {
+    const playedPct = (moment.winrate_played * 100).toFixed(0);
+    const bestPct = (moment.winrate_best * 100).toFixed(0);
+    return `Your position worsened in the opening — ${moment.played_san} left ${playedPct}% instead of ${bestPct}% with ${bestLabel}.`;
+  }
+  return `Your position worsened by ~${Math.round(moment.eval_drop_cp)} cp after ${moment.played_san}.`;
+}
 
 export function winProbability(evalScore: number): number {
   return 1.0 / (1.0 + 10.0 ** (-evalScore / 4.0));
@@ -160,29 +205,119 @@ function toOrdinal(n: number): string {
 const COMPOUND_START_PLY = 2;
 const RARE_COMPOUND_PCT = 1;
 
-function formatFrequencyNote(
+type PathStep = {
+  ply: number;
+  san: string;
+  uci: string;
+  freq: number;
+  rank: number | null;
+};
+
+function moveLabel(ply: number, san: string): string {
+  const moveNumber = Math.floor(ply / 2) + 1;
+  return ply % 2 === 0 ? `${moveNumber}. ${san}` : `${moveNumber}... ${san}`;
+}
+
+/**
+ * Frequency of the move that produced this position — the opponent's last move.
+ *
+ * Classification is always about that opponent move vs the named line:
+ * - still in book, or exactly the last book move → local frequency only
+ * - after the line → compounded opponent-path frequency
+ */
+function positionFrequency(
+  path: PathStep[],
   table: CompoundMoveEntry[],
-  focusPly: number
-): string {
-  const focus = table.find((entry) => entry.ply === focusPly);
-  if (!focus || focus.compound_pct < RARE_COMPOUND_PCT) {
-    return "This move is rare. Probability of occurrence: < 1%";
+  positionPly: number,
+  compoundStartPly: number
+): {
+  pct: number;
+  local_pct: number;
+  compound_pct: number | null;
+  rank: number | null;
+  san: string;
+  ply: number;
+  in_theory: boolean;
+} | null {
+  let prev: PathStep | null = null;
+  for (const step of path) {
+    if (step.ply >= positionPly) continue;
+    if (!prev || step.ply > prev.ply) prev = step;
   }
-  const firstSide = table.find(
-    (entry) =>
-      entry.ply <= focusPly && (entry.rank === 2 || entry.rank === 3)
-  );
+  if (!prev) return null;
+
+  const localPct = prev.freq * 100;
+  const lastBookPly = compoundStartPly - 1;
+  const inTheory = prev.ply <= lastBookPly;
+  if (inTheory) {
+    return {
+      pct: localPct,
+      local_pct: Math.round(localPct * 10) / 10,
+      compound_pct: null,
+      rank: prev.rank,
+      san: prev.san,
+      ply: prev.ply,
+      in_theory: true,
+    };
+  }
+
+  const compound = table.find((entry) => entry.ply === prev!.ply);
+  return {
+    pct: compound ? compound.compound_pct : localPct,
+    local_pct: Math.round(localPct * 10) / 10,
+    compound_pct: compound ? compound.compound_pct : null,
+    rank: prev.rank,
+    san: prev.san,
+    ply: prev.ply,
+    in_theory: false,
+  };
+}
+
+function formatFrequencyDebug(
+  path: PathStep[],
+  table: CompoundMoveEntry[],
+  positionPly: number,
+  compoundStartPly: number
+): string | null {
+  const info = positionFrequency(path, table, positionPly, compoundStartPly);
+  if (!info) return null;
+  const local = `${info.local_pct.toFixed(1)}%`;
+  const compound =
+    info.compound_pct == null
+      ? info.in_theory
+        ? info.ply === compoundStartPly - 1
+          ? "last move of line"
+          : "theory"
+        : "theory (not compounded)"
+      : `${info.compound_pct.toFixed(1)}%`;
+  return `${moveLabel(info.ply, info.san)} · local ${local} · path ${compound}`;
+}
+
+function formatFrequencyNote(
+  path: PathStep[],
+  table: CompoundMoveEntry[],
+  positionPly: number,
+  compoundStartPly: number
+): string | null {
+  const info = positionFrequency(path, table, positionPly, compoundStartPly);
+  if (!info) return null;
+  if (info.pct < RARE_COMPOUND_PCT) {
+    return "This position is rare. Probability of occurrence: < 1%";
+  }
   const rankLabel =
-    focus.rank == null
-      ? "common"
-      : focus.rank === 1
-        ? "most common"
-        : `${toOrdinal(focus.rank)} most common`;
-  const pct = Math.max(1, Math.round(focus.compound_pct));
-  if (firstSide) {
-    return `After ${firstSide.san} this is the ${rankLabel} move. Probability of occurrence: ${pct}%.`;
+    info.rank == null
+      ? "a sideline"
+      : info.rank === 1
+        ? "the most common"
+        : `the ${toOrdinal(info.rank)} most common`;
+  const pct = Math.max(1, Math.round(info.pct));
+  if (info.in_theory && info.ply === compoundStartPly - 1) {
+    return `${moveLabel(info.ply, info.san)} is ${rankLabel} move and the last move of this line. Probability of occurrence: ${pct}%.`;
   }
-  return `This is the ${rankLabel} move. Probability of occurrence: ${pct}%.`;
+  if (info.in_theory) {
+    return `${moveLabel(info.ply, info.san)} is ${rankLabel} move in this line. Probability of occurrence: ${pct}%.`;
+  }
+  return `${moveLabel(info.ply, info.san)} is ${rankLabel} move after this line. Probability of occurrence: ${pct}%.`;
 }
 
 function moveRankAmong(
@@ -216,6 +351,11 @@ function localMoveFrequency(
   };
 }
 
+function isOpponentPly(ply: number, userIsWhite: boolean): boolean {
+  const moverIsWhite = ply % 2 === 0;
+  return moverIsWhite !== userIsWhite;
+}
+
 function pushCompoundEntry(
   table: CompoundMoveEntry[],
   state: { compound: number; rare: boolean },
@@ -223,11 +363,13 @@ function pushCompoundEntry(
   san: string,
   uci: string,
   localFreq: number,
-  rank: number | null
+  rank: number | null,
+  compoundStartPly: number,
+  countsTowardCompound: boolean
 ): void {
-  if (ply < COMPOUND_START_PLY) return;
+  if (ply < compoundStartPly) return;
   const localPct = Math.max(0, localFreq * 100);
-  if (!state.rare) {
+  if (countsTowardCompound && !state.rare) {
     if (localFreq > 0) state.compound *= localFreq;
     else state.compound *= 0.005;
   }
@@ -241,6 +383,33 @@ function pushCompoundEntry(
     compound_pct: Math.round(compoundPct * 10) / 10,
     rank,
   });
+}
+
+/**
+ * Only the opponent's replies are uncertain — the user picks their own moves —
+ * so just those plies multiply into the path probability.
+ */
+function rebuildCompoundTable(
+  path: PathStep[],
+  compoundStartPly: number,
+  userIsWhite: boolean
+): CompoundMoveEntry[] {
+  const table: CompoundMoveEntry[] = [];
+  const state = { compound: 1, rare: false };
+  for (const step of path) {
+    pushCompoundEntry(
+      table,
+      state,
+      step.ply,
+      step.san,
+      step.uci,
+      step.freq,
+      step.rank,
+      compoundStartPly,
+      isOpponentPly(step.ply, userIsWhite)
+    );
+  }
+  return table;
 }
 
 function parseMoves(game: StudyGame): string[] {
@@ -828,8 +997,21 @@ export async function analyzeOpeningMoments(options: {
     const chess = new Chess();
     let prevPopularity: number | null = null;
     const gameMoments: OpeningMoment[] = [];
-    const compoundTable: CompoundMoveEntry[] = [];
-    const compoundState = { compound: 1, rare: false };
+    const pathFreq: PathStep[] = [];
+    const gameOpeningName = String(game.opening_name || "");
+    const mapEndPly = variationEndPlyFromMap(
+      game.opening_name,
+      game.opening_eco,
+      sans
+    );
+    let compoundStartPly = mapEndPly;
+    let explorerNamed = false;
+    if (mapEndPly != null) {
+      report(`Variation end`, "scan", {
+        currentGame: gameLabel,
+        log: `compound from ply ${mapEndPly} · map · ${gameOpeningName || "unknown"}`,
+      });
+    }
 
     const maxPly = Math.min(sans.length, MAX_OPENING_MOVES * 2);
     for (let ply = 0; ply < maxPly; ply += 1) {
@@ -866,6 +1048,25 @@ export async function analyzeOpeningMoments(options: {
         continue;
       }
 
+      if (mapEndPly == null) {
+        const explorerOpeningName =
+          lichess.opening?.name || masters.opening?.name || null;
+        if (
+          gameOpeningName &&
+          openingNamesMatch(explorerOpeningName, gameOpeningName)
+        ) {
+          if (!explorerNamed) {
+            // fenBefore is already the named leaf → last book move was ply-1
+            compoundStartPly = ply;
+            explorerNamed = true;
+            report(`Variation end`, "scan", {
+              currentGame: gameLabel,
+              log: `compound from ply ${ply} · explorer · last book ply ${Math.max(0, ply - 1)} · ${gameOpeningName}`,
+            });
+          }
+        }
+      }
+
       const probe = new Chess(fenBefore);
       const upcoming = applySan(probe, sans[ply]);
       if (!upcoming) break;
@@ -877,19 +1078,28 @@ export async function analyzeOpeningMoments(options: {
         upcomingUci,
         upcoming.san
       );
-      pushCompoundEntry(
-        compoundTable,
-        compoundState,
+      pathFreq.push({
         ply,
-        upcoming.san,
-        upcomingUci,
-        local.freq,
-        local.rank
+        san: upcoming.san,
+        uci: upcomingUci,
+        freq: local.freq,
+        rank: local.rank,
+      });
+      const compoundTable = rebuildCompoundTable(
+        pathFreq,
+        compoundStartPly ?? COMPOUND_START_PLY,
+        userIsWhite
       );
-      const compoundEntry = compoundTable.find((entry) => entry.ply === ply);
+      const resolvedStart = compoundStartPly ?? COMPOUND_START_PLY;
+      const compoundEntry = positionFrequency(
+        pathFreq,
+        compoundTable,
+        ply,
+        resolvedStart
+      );
       const frequencyPct = Math.max(
         0,
-        Math.min(100, compoundEntry?.compound_pct ?? 100)
+        Math.min(100, compoundEntry?.pct ?? 100)
       );
 
       if (!isUserTurn) {
@@ -1104,7 +1314,18 @@ export async function analyzeOpeningMoments(options: {
       priority = Math.round(priority * 10) / 10;
 
       const pathRank = compoundEntry?.rank ?? null;
-      const frequencyNote = formatFrequencyNote(compoundTable, ply);
+      const frequencyNote = formatFrequencyNote(
+        pathFreq,
+        compoundTable,
+        ply,
+        resolvedStart
+      );
+      const frequencyDebug = formatFrequencyDebug(
+        pathFreq,
+        compoundTable,
+        ply,
+        resolvedStart
+      );
 
       const altMoves = scored.slice(0, 5).map((row) => ({
         uci: String(row.move.uci || ""),
@@ -1131,12 +1352,17 @@ export async function analyzeOpeningMoments(options: {
         eval_before_cp: Math.round(evalBefore * 10) / 10,
         eval_after_cp: Math.round(evalAfter * 10) / 10,
         eval_drop_cp: Math.round(evalDrop * 10) / 10,
-        comment:
-          usedSource !== "eval" && winratePlayed != null && winrateBest != null
-            ? `Your position worsened in the opening — ${playedSan} scores ${(
-                winratePlayed * 100
-              ).toFixed(0)}% vs ${(winrateBest * 100).toFixed(0)}% for ${bestSan}.`
-            : `Your position worsened by ~${Math.round(evalDrop)} cp after ${playedSan}.`,
+        comment: formatOpeningWorsenedComment({
+          played_san: playedSan,
+          best_san: bestSan,
+          eval_before_cp: Math.round(evalBefore * 10) / 10,
+          eval_after_cp: Math.round(evalAfter * 10) / 10,
+          eval_drop_cp: Math.round(evalDrop * 10) / 10,
+          games_played: gamesPlayed,
+          games_best: gamesBest,
+          winrate_played: winratePlayed,
+          winrate_best: winrateBest,
+        }),
         winrate_played: winratePlayed,
         winrate_best: winrateBest,
         winrate_gap: winrateGap,
@@ -1147,6 +1373,7 @@ export async function analyzeOpeningMoments(options: {
         path_frequency_pct: Math.round(frequencyPct * 10) / 10,
         path_rank: pathRank,
         frequency_note: frequencyNote,
+        frequency_debug: frequencyDebug,
         compound_table: compoundTable.map((entry) => ({ ...entry })),
         source: usedSource,
         alt_moves: altMoves,
@@ -1155,6 +1382,36 @@ export async function analyzeOpeningMoments(options: {
       };
 
       gameMoments.push(item);
+    }
+
+    const finalStartPly = compoundStartPly ?? COMPOUND_START_PLY;
+    const finalCompoundTable = rebuildCompoundTable(
+      pathFreq,
+      finalStartPly,
+      userIsWhite
+    );
+    for (const moment of gameMoments) {
+      const entry = positionFrequency(
+        pathFreq,
+        finalCompoundTable,
+        moment.ply,
+        finalStartPly
+      );
+      moment.compound_table = finalCompoundTable.map((row) => ({ ...row }));
+      moment.path_frequency_pct = Math.round((entry?.pct ?? 100) * 10) / 10;
+      moment.path_rank = entry?.rank ?? null;
+      moment.frequency_note = formatFrequencyNote(
+        pathFreq,
+        finalCompoundTable,
+        moment.ply,
+        finalStartPly
+      );
+      moment.frequency_debug = formatFrequencyDebug(
+        pathFreq,
+        finalCompoundTable,
+        moment.ply,
+        finalStartPly
+      );
     }
 
     gameMoments.sort((a, b) => b.priority_score - a.priority_score);

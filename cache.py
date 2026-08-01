@@ -120,7 +120,7 @@ def lichess_get(url: str, params: dict, label: str):
         return None
 
 
-def disk_cache(subdir: str):
+def disk_cache(subdir: str, is_stale=None):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -132,8 +132,10 @@ def disk_cache(subdir: str):
             cache_file = cache_dir / f"{param_hash}.json"
 
             if cache_file.exists():
-                with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                cached_at = cache_file.stat().st_mtime
+                if is_stale is None or not is_stale(cached_at, args, kwargs):
+                    with open(cache_file, "r", encoding="utf-8") as f:
+                        return json.load(f)
 
             result = func(*args, **kwargs)
             if result is not None:

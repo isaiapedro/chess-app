@@ -105,7 +105,7 @@ const FilterContext = createContext<FilterContextValue | null>(null);
 export function FilterProvider({ children }: { children: React.ReactNode }) {
   const [username, setUsername] = useState("pedroisaia");
   const [platform, setPlatform] = useState<Platform>("chesscom");
-  const [period, setPeriod] = useState<Period>("month");
+  const [period, setPeriod] = useState<Period>("day");
   const [selectedDay, setSelectedDay] = useState<Date>(new Date());
   const [speed, setSpeed] = useState<string | null>(null);
   const [refreshToken, setRefreshToken] = useState(0);

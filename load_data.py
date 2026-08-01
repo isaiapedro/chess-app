@@ -29,7 +29,24 @@ def fetch_lichess_games_raw(username: str, since_ms: int):
 
 
 # --- CHESS.COM FETCHING ---
-@disk_cache("user_games_chesscom")
+def _archive_sealed_at(archive_url: str) -> float | None:
+    match = re.search(r"/(\d{4})/(\d{2})/?$", archive_url)
+    if not match:
+        return None
+    year, month = int(match.group(1)), int(match.group(2))
+    next_month = (
+        datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
+    )
+    return next_month.timestamp()
+
+
+def _archive_cache_is_stale(cached_at: float, args: tuple, kwargs: dict) -> bool:
+    archive_url = args[0] if args else kwargs.get("archive_url", "")
+    sealed_at = _archive_sealed_at(archive_url)
+    return sealed_at is None or cached_at < sealed_at
+
+
+@disk_cache("user_games_chesscom", is_stale=_archive_cache_is_stale)
 def fetch_chesscom_archive_raw(archive_url: str):
     headers = {
         "User-Agent": "LichessChesscomDashboard/1.0 (contact: dev@example.com)"
@@ -51,19 +68,10 @@ def fetch_chesscom_games_raw(username: str, since_timestamp: float):
         return []
 
     archives = res.json().get("archives", [])
-    current_month_str = datetime.now().strftime("%Y/%m")
     all_games = []
 
     for archive_url in archives:
-        if archive_url.endswith(current_month_str):
-            res = requests.get(archive_url, headers=headers)
-            games = (
-                res.json().get("games", []) if res.status_code == 200 else []
-            )
-        else:
-            games = fetch_chesscom_archive_raw(archive_url)
-
-        for g in games:
+        for g in fetch_chesscom_archive_raw(archive_url):
             if g.get("end_time", 0) >= since_timestamp:
                 all_games.append(g)
 

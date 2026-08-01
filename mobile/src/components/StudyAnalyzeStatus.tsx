@@ -1,7 +1,12 @@
-import React, { useEffect, useRef, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import type { AnalyzeProgress } from "../engine/analyzeMistakes";
-import { colors, font, spacing } from "../theme";
+import {
+  TARGET_MISTAKE_MOMENTS,
+  TARGET_OPENING_MOMENTS,
+} from "../engine/analysisConfig";
+import { colors, font } from "../theme";
+import { AnalysisLoadingBars } from "./LoadingSkeletons";
 
 const WAITING_LINES = [
   "Buying the chess board…",
@@ -42,24 +47,23 @@ function pickRandomLine(exclude?: string): string {
   return next;
 }
 
-const LOG_WINDOW = 12;
-const LOG_REFRESH_MS = 700;
-
 type Props = {
-  progress: AnalyzeProgress | null;
+  progress?: AnalyzeProgress | null;
   logLines?: string[];
   fallback?: string;
+  targetMoments?: number;
+  complete?: boolean;
+  onComplete?: () => void;
 };
 
 export function StudyAnalyzeStatus({
-  progress,
-  logLines = [],
+  progress = null,
   fallback = "Setting up the pieces…",
+  targetMoments,
+  complete = false,
+  onComplete,
 }: Props) {
   const [phrase, setPhrase] = useState(() => pickRandomLine());
-  const [visibleLogs, setVisibleLogs] = useState<string[]>([]);
-  const latestLogs = useRef(logLines);
-  latestLogs.current = logLines;
 
   useEffect(() => {
     const timer = setInterval(() => {
@@ -68,34 +72,20 @@ export function StudyAnalyzeStatus({
     return () => clearInterval(timer);
   }, []);
 
-  useEffect(() => {
-    const timer = setInterval(() => {
-      setVisibleLogs(latestLogs.current.slice(-LOG_WINDOW));
-    }, LOG_REFRESH_MS);
-    return () => clearInterval(timer);
-  }, []);
-
-  const candidates = progress?.candidates ?? 0;
-  const selected = progress?.selected ?? 0;
-  const recentLogs = visibleLogs.length
-    ? visibleLogs
-    : logLines.slice(-LOG_WINDOW);
+  const target =
+    targetMoments ??
+    Math.max(TARGET_MISTAKE_MOMENTS, TARGET_OPENING_MOMENTS);
 
   return (
     <View style={styles.wrap}>
       <Text style={styles.phrase}>{phrase || fallback}</Text>
-      <Text style={styles.counts}>
-        Moments found: {candidates} · Ready to study: {selected}
-      </Text>
-      {recentLogs.length ? (
-        <View style={styles.logBox}>
-          {recentLogs.map((line, index) => (
-            <Text key={`${index}-${line.slice(0, 24)}`} style={styles.logLine}>
-              {line}
-            </Text>
-          ))}
-        </View>
-      ) : null}
+      <AnalysisLoadingBars
+        selected={progress?.selected ?? 0}
+        candidates={progress?.candidates ?? 0}
+        target={target}
+        complete={complete}
+        onComplete={onComplete}
+      />
     </View>
   );
 }
@@ -107,23 +97,5 @@ const styles = StyleSheet.create({
     fontFamily: font.monoBold,
     fontSize: 14,
     textAlign: "center",
-  },
-  counts: {
-    color: colors.cream,
-    fontFamily: font.mono,
-    fontSize: 12,
-    textAlign: "center",
-  },
-  logBox: {
-    marginTop: spacing.xs,
-    width: "100%",
-    gap: 2,
-    paddingHorizontal: spacing.sm,
-  },
-  logLine: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    textAlign: "left",
   },
 });

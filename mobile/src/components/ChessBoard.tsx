@@ -26,6 +26,7 @@ type Props = {
   interactive?: boolean;
   onMove?: (uci: string, san: string, fenAfter: string) => void;
   highlightUci?: string | null;
+  guessUci?: string | null;
 };
 
 function squareColor(fileIdx: number, rankIdx: number): string {
@@ -56,6 +57,7 @@ export function ChessBoard({
   interactive = true,
   onMove,
   highlightUci,
+  guessUci,
 }: Props) {
   const [size, setSize] = useState(320);
   const [selected, setSelected] = useState<Square | null>(null);
@@ -73,6 +75,8 @@ export function ChessBoard({
 
   const fromHi = highlightUci?.slice(0, 2) as Square | undefined;
   const toHi = highlightUci?.slice(2, 4) as Square | undefined;
+  const fromGuess = guessUci?.slice(0, 2) as Square | undefined;
+  const toGuess = guessUci?.slice(2, 4) as Square | undefined;
 
   const onLayout = (e: LayoutChangeEvent) => {
     const w = e.nativeEvent.layout.width;
@@ -156,6 +160,8 @@ export function ChessBoard({
                 const isSel = selected === sq;
                 const isTarget = legalTargets.has(sq);
                 const isHi = sq === fromHi || sq === toHi;
+                const isGuess =
+                  !isHi && (sq === fromGuess || sq === toGuess);
                 const isLight = (fileIdx + rankIdx) % 2 === 0;
                 return (
                   <Pressable
@@ -169,6 +175,7 @@ export function ChessBoard({
                         backgroundColor: squareColor(fileIdx, rankIdx),
                       },
                       isSel && styles.selected,
+                      isGuess && styles.guessHighlight,
                       isHi && styles.highlight,
                     ]}
                   >
@@ -237,6 +244,9 @@ const styles = StyleSheet.create({
   },
   highlight: {
     backgroundColor: withAlpha(colors.sage, 0.55),
+  },
+  guessHighlight: {
+    backgroundColor: withAlpha(colors.blue, 0.55),
   },
   coord: {
     position: "absolute",

@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -14,6 +13,7 @@ import { fetchExplorer, fetchMastersPgn, fetchStudyGames, type MistakeItem } fro
 import { ChessBoard } from "../components/ChessBoard";
 import { OpeningPrepSection } from "../components/OpeningPrepSection";
 import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
+import { PageLoadingTransition } from "../components/LoadingSkeletons";
 import {
   BrutalButton,
   DisplayTitle,
@@ -32,6 +32,7 @@ import {
   type ThresholdPass,
 } from "../engine/analyzeMistakes";
 import { applyUciMove } from "../engine/chessMoves";
+import { cancelStudyPrefetch } from "../engine/studyPrefetch";
 import { useStockfish } from "../engine/StockfishProvider";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
 import {
@@ -52,6 +53,10 @@ type MistakesCachePayload = {
   remaining: number;
   thresholdPass?: ThresholdPass;
   baselineAvailable?: boolean;
+};
+
+type PendingMistakesBatch = MistakesCachePayload & {
+  previousLength: number;
 };
 
 function parseMistakesCache(
@@ -105,11 +110,17 @@ export function StudyScreen() {
   const [idx, setIdx] = useState(0);
   const [loadingMistakes, setLoadingMistakes] = useState(false);
   const [scanningMore, setScanningMore] = useState(false);
+  const [analysisComplete, setAnalysisComplete] = useState(false);
   const [mistakesError, setMistakesError] = useState<string | null>(null);
   const [analyzeStatus, setAnalyzeStatus] = useState<string | null>(null);
   const [analyzeProgress, setAnalyzeProgress] = useState<AnalyzeProgress | null>(
     null
   );
+  const finishLoadingVisual = useCallback(() => {
+    setAnalysisComplete(false);
+    setLoadingMistakes(false);
+    setScanningMore(false);
+  }, []);
   const [analyzeLog, setAnalyzeLog] = useState<string[]>([]);
   const [remainingGames, setRemainingGames] = useState(0);
   const [pendingCount, setPendingCount] = useState(0);
@@ -124,6 +135,7 @@ export function StudyScreen() {
   const [puzzleFen, setPuzzleFen] = useState<string | null>(null);
   const [puzzleMoveSan, setPuzzleMoveSan] = useState<string | null>(null);
   const [highlightUci, setHighlightUci] = useState<string | null>(null);
+  const [guessUci, setGuessUci] = useState<string | null>(null);
   const [sequencePv, setSequencePv] = useState<string[]>([]);
   const [sequencePlaying, setSequencePlaying] = useState(false);
   const cancelRef = useRef({ cancelled: false });
@@ -137,6 +149,12 @@ export function StudyScreen() {
   const baselineAvailableRef = useRef(false);
   const pendingCandidatesRef = useRef<MistakeItem[]>([]);
   const deferredCandidatesRef = useRef<MistakeItem[]>([]);
+  const backgroundScanningRef = useRef(false);
+  const secondPagePrefetchKeyRef = useRef<string | null>(null);
+  const pendingBatchRef = useRef<PendingMistakesBatch | null>(null);
+  const visibleBatchStartRef = useRef(0);
+  const revealPendingOnCompleteRef = useRef(false);
+  const [pendingReady, setPendingReady] = useState(false);
 
   const current = mistakes[idx] || null;
   const mistakesCacheKey = studyMistakesCacheKey(queryFilters);
@@ -155,6 +173,7 @@ export function StudyScreen() {
     setContinuation(null);
     setUserMoveEval(null);
     setHighlightUci(null);
+    setGuessUci(null);
     setSequencePv([]);
     setSequencePlaying(false);
   }, [current?.game_id, current?.ply, current?.fen]);
@@ -166,6 +185,7 @@ export function StudyScreen() {
     setSequencePlaying(true);
     setPuzzleFen(startFen);
     setHighlightUci(null);
+    setGuessUci(null);
     let i = 0;
     const step = () => {
       if (playTokenRef.current !== token) return;
@@ -197,6 +217,7 @@ export function StudyScreen() {
     setContinuation(null);
     setUserMoveEval(null);
     setHighlightUci(null);
+    setGuessUci(null);
     setPuzzleMoveSan(null);
     setSequencePv([]);
     setSequencePlaying(false);
@@ -224,6 +245,10 @@ export function StudyScreen() {
       if (cached?.moments.length) {
         setMistakes(cached.moments);
         setIdx(0);
+        visibleBatchStartRef.current = 0;
+        pendingBatchRef.current = null;
+        setPendingReady(false);
+        secondPagePrefetchKeyRef.current = null;
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         deferredCandidatesRef.current = cached.deferredCandidates || [];
@@ -265,6 +290,10 @@ export function StudyScreen() {
       if (cached?.moments.length) {
         setMistakes(cached.moments);
         setIdx(0);
+        visibleBatchStartRef.current = 0;
+        pendingBatchRef.current = null;
+        setPendingReady(false);
+        secondPagePrefetchKeyRef.current = null;
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         deferredCandidatesRef.current = cached.deferredCandidates || [];
@@ -290,7 +319,13 @@ export function StudyScreen() {
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
+    cancelStudyPrefetch();
 
+    secondPagePrefetchKeyRef.current = null;
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    visibleBatchStartRef.current = 0;
+    setAnalysisComplete(false);
     setLoadingMistakes(true);
     setMistakesError(null);
     setQuizFeedback(null);
@@ -301,6 +336,7 @@ export function StudyScreen() {
     setAnalyzeLog([]);
     setAnalyzeProgress(null);
     setAnalyzeStatus("Loading recent games…");
+    let completed = false;
     try {
       const rows = await fetchStudyGames(queryFilters, force);
       const games = rows.map(
@@ -350,6 +386,10 @@ export function StudyScreen() {
       );
       setMistakes(batch.moments);
       setIdx(0);
+      visibleBatchStartRef.current = 0;
+      pendingBatchRef.current = null;
+      setPendingReady(false);
+      secondPagePrefetchKeyRef.current = null;
       loadedCacheKeyRef.current = mistakesCacheKey;
       if (batch.moments.length) {
         await writeCache(mistakesCacheKey, {
@@ -372,13 +412,18 @@ export function StudyScreen() {
           setShowScanMore(true);
         }
       }
+      completed = true;
     } catch (e) {
       if (signal.cancelled) return;
       setMistakes([]);
       setMistakesError(e instanceof Error ? e.message : "Failed to analyze");
     } finally {
       if (!signal.cancelled) {
-        setLoadingMistakes(false);
+        if (completed) {
+          setAnalysisComplete(true);
+        } else {
+          setLoadingMistakes(false);
+        }
       }
     }
   }, [
@@ -390,8 +435,14 @@ export function StudyScreen() {
     pushProgress,
   ]);
 
-  const continueScanMistakes = useCallback(async () => {
-    if (!engineReady || scanningMore || scanExhausted) {
+  const continueScanMistakes = useCallback(async (silent = false) => {
+    if (
+      !engineReady ||
+      scanningMore ||
+      backgroundScanningRef.current ||
+      scanExhausted ||
+      (silent && pendingBatchRef.current)
+    ) {
       return;
     }
     const canBaseline =
@@ -413,31 +464,42 @@ export function StudyScreen() {
     const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
     const carriedCandidates = pendingCandidatesRef.current;
     const carriedDeferred = deferredCandidatesRef.current;
-    setShowScanMore(false);
-    setAllDone(false);
-    resetQuizChrome();
+    if (!silent) {
+      setShowScanMore(false);
+      setAllDone(false);
+      resetQuizChrome();
+    }
     pendingCandidatesRef.current = [];
     setPendingCount(0);
-    setAnalyzeLog([]);
-    setAnalyzeProgress({
-      gamesScanned: 0,
-      positionsChecked: 0,
-      found: 0,
-      candidates: 0,
-      selected: 0,
-      status:
+    if (!silent) {
+      setAnalyzeLog([]);
+      setAnalyzeProgress({
+        gamesScanned: 0,
+        positionsChecked: 0,
+        found: 0,
+        candidates: 0,
+        selected: 0,
+        status:
+          nextPass === "baseline"
+            ? "Baseline pass · broader threshold…"
+            : "Scanning next batch…",
+        phase: "scan",
+        engine: "Stockfish",
+      });
+      setAnalyzeStatus(
         nextPass === "baseline"
           ? "Baseline pass · broader threshold…"
-          : "Scanning next batch…",
-      phase: "scan",
-      engine: "Stockfish",
-    });
-    setAnalyzeStatus(
-      nextPass === "baseline"
-        ? "Baseline pass · broader threshold…"
-        : "Scanning next batch…"
-    );
-    setScanningMore(true);
+          : "Scanning next batch…"
+      );
+    }
+    cancelStudyPrefetch();
+    if (silent) {
+      backgroundScanningRef.current = true;
+    } else {
+      setAnalysisComplete(false);
+      setScanningMore(true);
+    }
+    let completed = false;
     try {
       let games = studyGamesRef.current;
       if (!games.length) {
@@ -482,7 +544,7 @@ export function StudyScreen() {
             topGames: res.topGames || [],
           };
         },
-        onProgress: pushProgress,
+        onProgress: silent ? undefined : pushProgress,
       });
       if (signal.cancelled) return;
       scannedIdsRef.current =
@@ -495,47 +557,109 @@ export function StudyScreen() {
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
       baselineAvailableRef.current = batch.baselineAvailable;
-      setMistakes(batch.moments);
-      setIdx(
-        batch.moments.length > keptMoments.length
-          ? keptMoments.length
-          : Math.max(0, batch.moments.length - 1)
-      );
       setScanExhausted(
         batch.thresholdPass === "baseline" &&
           batch.remaining <= 0 &&
           batch.pendingCandidates.length === 0
       );
-      await writeCache(mistakesCacheKey, {
-        moments: batch.moments,
-        pendingCandidates: batch.pendingCandidates,
-        deferredCandidates: batch.deferredCandidates,
-        scannedGameIds: scannedIdsRef.current,
-        remaining: batch.remaining,
-        thresholdPass: batch.thresholdPass,
-        baselineAvailable: batch.baselineAvailable,
-      } satisfies MistakesCachePayload);
-      if (batch.moments.length <= keptMoments.length) {
-        setMistakesError("No further critical swings found.");
-        if (
-          batch.remaining > 0 ||
-          batch.pendingCandidates.length > 0 ||
-          batch.baselineAvailable
-        ) {
-          setShowScanMore(true);
-        } else {
-          setAllDone(true);
+
+      const hasNew = batch.moments.length > keptMoments.length;
+      if (silent) {
+        if (hasNew) {
+          pendingBatchRef.current = {
+            moments: batch.moments,
+            pendingCandidates: batch.pendingCandidates,
+            deferredCandidates: batch.deferredCandidates,
+            scannedGameIds: scannedIdsRef.current,
+            remaining: batch.remaining,
+            thresholdPass: batch.thresholdPass,
+            baselineAvailable: batch.baselineAvailable,
+            previousLength: keptMoments.length,
+          };
+          setPendingReady(true);
         }
+        await writeCache(mistakesCacheKey, {
+          moments: keptMoments,
+          pendingCandidates: batch.pendingCandidates,
+          deferredCandidates: batch.deferredCandidates,
+          scannedGameIds: scannedIdsRef.current,
+          remaining: batch.remaining,
+          thresholdPass: batch.thresholdPass,
+          baselineAvailable: batch.baselineAvailable,
+        } satisfies MistakesCachePayload);
       } else {
-        setMistakesError(null);
+        setMistakes(batch.moments);
+        visibleBatchStartRef.current = hasNew ? keptMoments.length : 0;
+        secondPagePrefetchKeyRef.current = null;
+        setIdx(
+          hasNew
+            ? keptMoments.length
+            : Math.max(0, batch.moments.length - 1)
+        );
+        await writeCache(mistakesCacheKey, {
+          moments: batch.moments,
+          pendingCandidates: batch.pendingCandidates,
+          deferredCandidates: batch.deferredCandidates,
+          scannedGameIds: scannedIdsRef.current,
+          remaining: batch.remaining,
+          thresholdPass: batch.thresholdPass,
+          baselineAvailable: batch.baselineAvailable,
+        } satisfies MistakesCachePayload);
+        if (!hasNew) {
+          setMistakesError("No further critical swings found.");
+          if (
+            batch.remaining > 0 ||
+            batch.pendingCandidates.length > 0 ||
+            batch.baselineAvailable
+          ) {
+            setShowScanMore(true);
+          } else {
+            setAllDone(true);
+          }
+        } else {
+          setMistakesError(null);
+        }
       }
+      completed = true;
     } catch (e) {
-      if (!signal.cancelled) {
+      if (!silent && !signal.cancelled) {
         setMistakesError(e instanceof Error ? e.message : "Failed to scan more");
       }
     } finally {
-      if (!signal.cancelled) {
-        setScanningMore(false);
+      if (silent) {
+        backgroundScanningRef.current = false;
+        if (revealPendingOnCompleteRef.current) {
+          revealPendingOnCompleteRef.current = false;
+          const pending = pendingBatchRef.current;
+          if (pending) {
+            pendingBatchRef.current = null;
+            setPendingReady(false);
+            setMistakes(pending.moments);
+            visibleBatchStartRef.current = pending.previousLength;
+            secondPagePrefetchKeyRef.current = null;
+            setIdx(pending.previousLength);
+            setShowScanMore(false);
+            setAllDone(false);
+            setMistakesError(null);
+            resetQuizChrome();
+            void writeCache(mistakesCacheKey, {
+              moments: pending.moments,
+              pendingCandidates: pending.pendingCandidates,
+              deferredCandidates: pending.deferredCandidates,
+              scannedGameIds: pending.scannedGameIds,
+              remaining: pending.remaining,
+              thresholdPass: pending.thresholdPass,
+              baselineAvailable: pending.baselineAvailable,
+            } satisfies MistakesCachePayload);
+          }
+          setScanningMore(false);
+        }
+      } else if (!signal.cancelled) {
+        if (completed) {
+          setAnalysisComplete(true);
+        } else {
+          setScanningMore(false);
+        }
       }
     }
   }, [
@@ -547,6 +671,76 @@ export function StudyScreen() {
     mistakesCacheKey,
     pushProgress,
     resetQuizChrome,
+  ]);
+
+  const applyPendingMistakesBatch = useCallback(() => {
+    const pending = pendingBatchRef.current;
+    if (!pending) return false;
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    setMistakes(pending.moments);
+    visibleBatchStartRef.current = pending.previousLength;
+    secondPagePrefetchKeyRef.current = null;
+    setIdx(pending.previousLength);
+    setShowScanMore(false);
+    setAllDone(false);
+    setMistakesError(null);
+    resetQuizChrome();
+    void writeCache(mistakesCacheKey, {
+      moments: pending.moments,
+      pendingCandidates: pending.pendingCandidates,
+      deferredCandidates: pending.deferredCandidates,
+      scannedGameIds: pending.scannedGameIds,
+      remaining: pending.remaining,
+      thresholdPass: pending.thresholdPass,
+      baselineAvailable: pending.baselineAvailable,
+    } satisfies MistakesCachePayload);
+    return true;
+  }, [mistakesCacheKey, resetQuizChrome]);
+
+  const requestScanMoreMistakes = useCallback(() => {
+    if (applyPendingMistakesBatch()) return;
+    if (backgroundScanningRef.current) {
+      revealPendingOnCompleteRef.current = true;
+      setScanningMore(true);
+      return;
+    }
+    void continueScanMistakes(false);
+  }, [applyPendingMistakesBatch, continueScanMistakes]);
+
+  useEffect(() => {
+    if (
+      mode !== "mistakes" ||
+      idx !== visibleBatchStartRef.current + 1 ||
+      loadingMistakes ||
+      scanningMore ||
+      scanExhausted ||
+      pendingReady ||
+      pendingBatchRef.current
+    ) {
+      return;
+    }
+    const canLoadMore =
+      remainingGames > 0 ||
+      pendingCount > 0 ||
+      baselineAvailableRef.current ||
+      thresholdPassRef.current === "strict";
+    if (!canLoadMore) return;
+    const key = `${mistakesCacheKey}:batch:${visibleBatchStartRef.current}`;
+    if (secondPagePrefetchKeyRef.current === key) return;
+    secondPagePrefetchKeyRef.current = key;
+    void continueScanMistakes(true);
+  }, [
+    mode,
+    idx,
+    loadingMistakes,
+    scanningMore,
+    scanExhausted,
+    pendingReady,
+    remainingGames,
+    pendingCount,
+    mistakesCacheKey,
+    continueScanMistakes,
   ]);
 
   useEffect(() => {
@@ -588,7 +782,7 @@ export function StudyScreen() {
     }
     setPuzzleFen(nextFen);
     setPuzzleMoveSan(san);
-    setHighlightUci(uci);
+    setGuessUci(uci);
     setQuizFeedback("Checking…");
     setQuizCorrect(null);
     try {
@@ -610,7 +804,7 @@ export function StudyScreen() {
         setQuizFeedback("Illegal move — try again.");
         setPuzzleFen(current.fen);
         setPuzzleMoveSan(null);
-        setHighlightUci(null);
+        setGuessUci(null);
         return;
       }
 
@@ -621,7 +815,7 @@ export function StudyScreen() {
         setUserMoveEval(null);
         retryTimerRef.current = setTimeout(() => {
           setPuzzleFen(current.fen);
-          setHighlightUci(null);
+          setGuessUci(null);
           setQuizFeedback("Not quite — try a different move.");
         }, 1600);
         return;
@@ -641,12 +835,13 @@ export function StudyScreen() {
       setQuizFeedback(e instanceof Error ? e.message : "Validate failed");
       setPuzzleFen(current.fen);
       setPuzzleMoveSan(null);
-      setHighlightUci(null);
+      setGuessUci(null);
     }
   };
 
   const canScanMoreMistakes =
-    (remainingGames > 0 || pendingCount > 0) && !scanExhausted;
+    pendingReady ||
+    ((remainingGames > 0 || pendingCount > 0) && !scanExhausted);
 
   const nextMistake = () => {
     if (idx >= mistakes.length - 1) {
@@ -712,48 +907,57 @@ export function StudyScreen() {
       </View>
 
       <View style={mode === "mistakes" ? undefined : styles.hiddenTab}>
-        <View>
-          {loadingMistakes || scanningMore ? (
+        <PageLoadingTransition
+          active={loadingMistakes || scanningMore}
+          contentKey={
+            showScanMore
+              ? "scan-more"
+              : allDone
+                ? "all-done"
+                : mistakesError
+                  ? `error:${mistakesError}`
+                  : mistakes.length === 0
+                    ? "empty"
+                    : `batch:${visibleBatchStartRef.current}:${mistakes.length}`
+          }
+          loader={
             <View style={styles.center}>
-              <ActivityIndicator color={colors.red} />
               <StudyAnalyzeStatus
                 progress={analyzeProgress}
                 logLines={analyzeLog}
+                targetMoments={TARGET_MISTAKE_MOMENTS}
                 fallback={analyzeStatus || "Starting on-device analysis…"}
+                complete={analysisComplete}
+                onComplete={finishLoadingVisual}
               />
             </View>
-          ) : null}
-          {mistakesError && !loadingMistakes && !scanningMore ? (
+          }
+        >
+          {mistakesError ? (
             <Text style={styles.error}>{mistakesError}</Text>
           ) : null}
-          {!loadingMistakes &&
-          !scanningMore &&
-          !mistakesError &&
-          mistakes.length === 0 ? (
+          {!mistakesError && mistakes.length === 0 ? (
             <Text style={styles.muted}>
               No critical swings found in recent games. Try a wider timeframe.
             </Text>
           ) : null}
-          {!loadingMistakes &&
-          !scanningMore &&
-          showScanMore &&
-          canScanMoreMistakes ? (
+          {showScanMore && canScanMoreMistakes ? (
             <View style={styles.center}>
               <BrutalButton
                 label="Scan more"
                 disabled={!engineReady}
-                onPress={() => void continueScanMistakes()}
+                onPress={requestScanMoreMistakes}
               />
             </View>
           ) : null}
-          {!loadingMistakes && !scanningMore && allDone ? (
+          {allDone ? (
             <Text style={[styles.muted, { marginTop: spacing.sm }]}>
               That&apos;s all for today — every candidate position from these
               games has been reviewed.
             </Text>
           ) : null}
 
-          {current && !showScanMore && !allDone && !scanningMore ? (
+          {current && !showScanMore && !allDone ? (
             <View>
               <View style={styles.mistakeHeader}>
                 <View style={styles.gameIdentity}>
@@ -805,6 +1009,7 @@ export function StudyScreen() {
                 interactive={!revealed}
                 onMove={(uci, san, nextFen) => void onQuizMove(uci, san, nextFen)}
                 highlightUci={highlightUci || (revealed ? current.best_uci : null)}
+                guessUci={guessUci}
               />
 
               {revealed && sequencePv.length > 0 ? (
@@ -955,7 +1160,7 @@ export function StudyScreen() {
               </View>
             </View>
           ) : null}
-        </View>
+        </PageLoadingTransition>
       </View>
       <View style={mode === "repertoire" ? undefined : styles.hiddenTab}>
         <OpeningPrepSection active={mode === "repertoire"} />

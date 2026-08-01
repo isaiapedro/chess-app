@@ -26,7 +26,7 @@ export function studyOpeningCacheKey(
   color: "white" | "black",
   openingKey: string
 ): string {
-  return `study:opening:v16:${studyFiltersKey(filters)}:${color}:${part(
+  return `study:opening:v23:${studyFiltersKey(filters)}:${color}:${part(
     openingKey
   ).toLowerCase()}`;
 }

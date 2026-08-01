@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  ActivityIndicator,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -12,6 +11,10 @@ import {
 import { Chess } from "chess.js";
 import { fetchExplorer, fetchMastersPgn, fetchStudyGames, type MistakeItem } from "../api/client";
 import { ChessBoard } from "../components/ChessBoard";
+import {
+  OpeningChoiceSkeleton,
+  PageLoadingTransition,
+} from "../components/LoadingSkeletons";
 import { BrutalButton, EdgeCard, Pill } from "../components/ui";
 import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
 import { useFilters } from "../context/FilterContext";
@@ -26,8 +29,10 @@ import {
   analyzeOpeningMoments,
   averageUserRating,
   filterGamesByOpening,
+  formatOpeningWorsenedComment,
   searchOpeningsForColor,
   topOpeningsForColor,
+  usesWinrateHeader,
   validateOpeningMove,
   type OpeningChoice,
   type OpeningMoment,
@@ -37,6 +42,7 @@ import {
 import { resolveFamilyByName } from "../engine/ecoFamilies";
 import { useStockfish } from "../engine/StockfishProvider";
 import { applyUciMove } from "../engine/chessMoves";
+import { cancelStudyPrefetch } from "../engine/studyPrefetch";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
 import {
   readCache,
@@ -56,6 +62,10 @@ type OpeningCachePayload = {
   remaining: number;
   thresholdPass?: ThresholdPass;
   baselineAvailable?: boolean;
+};
+
+type PendingOpeningBatch = OpeningCachePayload & {
+  previousLength: number;
 };
 
 function openingHeaderLabel(
@@ -132,7 +142,7 @@ function toStudyGames(rows: Array<Record<string, unknown>>): StudyGame[] {
   }));
 }
 
-export function OpeningPrepSection(_props: Props = {}) {
+export function OpeningPrepSection({ active = false }: Props = {}) {
   const { queryFilters, refreshToken } = useFilters();
   const { ready: engineReady, evaluate } = useStockfish();
 
@@ -151,6 +161,7 @@ export function OpeningPrepSection(_props: Props = {}) {
   const [moments, setMoments] = useState<OpeningMoment[]>([]);
   const [idx, setIdx] = useState(0);
   const [scanningMore, setScanningMore] = useState(false);
+  const [analysisComplete, setAnalysisComplete] = useState(false);
   const [remainingGames, setRemainingGames] = useState(0);
   const [pendingCount, setPendingCount] = useState(0);
   const [scanExhausted, setScanExhausted] = useState(false);
@@ -167,7 +178,25 @@ export function OpeningPrepSection(_props: Props = {}) {
   const momentsRef = useRef<OpeningMoment[]>([]);
   const thresholdPassRef = useRef<ThresholdPass>("strict");
   const baselineAvailableRef = useRef(false);
+  const completionTargetRef = useRef<"quiz" | "scan" | null>(null);
+  const backgroundScanningRef = useRef(false);
+  const secondPagePrefetchKeyRef = useRef<string | null>(null);
+  const pendingBatchRef = useRef<PendingOpeningBatch | null>(null);
+  const visibleBatchStartRef = useRef(0);
+  const revealPendingOnCompleteRef = useRef(false);
+  const [pendingReady, setPendingReady] = useState(false);
   momentsRef.current = moments;
+
+  const finishLoadingVisual = useCallback(() => {
+    const target = completionTargetRef.current;
+    completionTargetRef.current = null;
+    setAnalysisComplete(false);
+    if (target === "quiz") {
+      setPhase("quiz");
+    } else if (target === "scan") {
+      setScanningMore(false);
+    }
+  }, []);
 
   const [quizFeedback, setQuizFeedback] = useState<string | null>(null);
   const [quizCorrect, setQuizCorrect] = useState<boolean | null>(null);
@@ -177,6 +206,7 @@ export function OpeningPrepSection(_props: Props = {}) {
   const [puzzleFen, setPuzzleFen] = useState<string | null>(null);
   const [puzzleMoveSan, setPuzzleMoveSan] = useState<string | null>(null);
   const [highlightUci, setHighlightUci] = useState<string | null>(null);
+  const [guessUci, setGuessUci] = useState<string | null>(null);
   const [sequencePv, setSequencePv] = useState<string[]>([]);
   const [sequencePlaying, setSequencePlaying] = useState(false);
 
@@ -247,6 +277,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setContinuation(null);
     setUserMoveEval(null);
     setHighlightUci(null);
+    setGuessUci(null);
     setSequencePv([]);
     setSequencePlaying(false);
   }, [current?.game_id, current?.ply, current?.fen]);
@@ -266,6 +297,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setSequencePlaying(true);
     setPuzzleFen(startFen);
     setHighlightUci(null);
+    setGuessUci(null);
     let i = 0;
     const step = () => {
       if (playTokenRef.current !== token) return;
@@ -291,6 +323,10 @@ export function OpeningPrepSection(_props: Props = {}) {
     setScanExhausted(false);
     setMoments([]);
     setIdx(0);
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    visibleBatchStartRef.current = 0;
+    secondPagePrefetchKeyRef.current = null;
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
     deferredCandidatesRef.current = [];
@@ -310,6 +346,12 @@ export function OpeningPrepSection(_props: Props = {}) {
     const signal = cancelRef.current;
     const cacheKey = studyOpeningCacheKey(queryFilters, color, opening.key);
 
+    secondPagePrefetchKeyRef.current = null;
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    visibleBatchStartRef.current = 0;
+    completionTargetRef.current = null;
+    setAnalysisComplete(false);
     setSelectedOpening(opening);
     setPhase("analyze");
     setAnalyzeStatus("Loading cached analysis…");
@@ -340,6 +382,10 @@ export function OpeningPrepSection(_props: Props = {}) {
         if (signal.cancelled) return;
         setMoments(cached.moments);
         setIdx(0);
+        visibleBatchStartRef.current = 0;
+        pendingBatchRef.current = null;
+        setPendingReady(false);
+        secondPagePrefetchKeyRef.current = null;
         scannedIdsRef.current = cached.scannedGameIds;
         pendingCandidatesRef.current = cached.pendingCandidates || [];
         deferredCandidatesRef.current = cached.deferredCandidates || [];
@@ -367,6 +413,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       return;
     }
 
+    cancelStudyPrefetch();
     setAnalyzeStatus("Filtering games…");
 
     const filtered = filterGamesByOpening(allGames, color, opening);
@@ -379,6 +426,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     }
 
     const rating = averageUserRating(filtered.length ? filtered : allGames);
+    let completed = false;
     try {
       const batch = await analyzeOpeningMoments({
         games: filtered,
@@ -403,6 +451,7 @@ export function OpeningPrepSection(_props: Props = {}) {
             draws: res.draws || 0,
             black: res.black || 0,
             fallback: res.fallback,
+            opening: res.opening,
           };
         },
         onProgress: (p) => {
@@ -426,6 +475,10 @@ export function OpeningPrepSection(_props: Props = {}) {
       );
       setMoments(batch.moments);
       setIdx(0);
+      visibleBatchStartRef.current = 0;
+      pendingBatchRef.current = null;
+      setPendingReady(false);
+      secondPagePrefetchKeyRef.current = null;
       if (!batch.moments.length) {
         setError("No opening improvement moments found. Try another opening.");
         setPhase("opening");
@@ -440,23 +493,31 @@ export function OpeningPrepSection(_props: Props = {}) {
         thresholdPass: batch.thresholdPass,
         baselineAvailable: batch.baselineAvailable,
       } satisfies OpeningCachePayload);
-      setPhase("quiz");
+      completed = true;
     } catch (e) {
       if (signal.cancelled) return;
       setError(e instanceof Error ? e.message : "Opening analysis failed");
       setPhase("opening");
     } finally {
-      if (!signal.cancelled) setAnalyzeStatus(null);
+      if (!signal.cancelled) {
+        setAnalyzeStatus(null);
+        if (completed) {
+          completionTargetRef.current = "quiz";
+          setAnalysisComplete(true);
+        }
+      }
     }
   };
 
-  const continueScanOpenings = async () => {
+  const continueScanOpenings = async (silent = false) => {
     if (
       !color ||
       !selectedOpening ||
       !engineReady ||
       scanningMore ||
-      scanExhausted
+      backgroundScanningRef.current ||
+      scanExhausted ||
+      (silent && pendingBatchRef.current)
     ) {
       return;
     }
@@ -475,30 +536,41 @@ export function OpeningPrepSection(_props: Props = {}) {
     const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
     const carriedCandidates = pendingCandidatesRef.current;
     const carriedDeferred = deferredCandidatesRef.current;
-    setShowScanMore(false);
-    setAllDone(false);
+    if (!silent) {
+      setShowScanMore(false);
+      setAllDone(false);
+    }
     pendingCandidatesRef.current = [];
     setPendingCount(0);
-    setAnalyzeLog([]);
-    setAnalyzeProgress({
-      gamesScanned: 0,
-      positionsChecked: 0,
-      found: 0,
-      candidates: 0,
-      selected: 0,
-      status:
+    if (!silent) {
+      setAnalyzeLog([]);
+      setAnalyzeProgress({
+        gamesScanned: 0,
+        positionsChecked: 0,
+        found: 0,
+        candidates: 0,
+        selected: 0,
+        status:
+          nextPass === "baseline"
+            ? "Baseline pass · broader threshold…"
+            : "Scanning next batch…",
+        phase: "scan",
+        engine: "Stockfish",
+      });
+      setAnalyzeStatus(
         nextPass === "baseline"
           ? "Baseline pass · broader threshold…"
-          : "Scanning next batch…",
-      phase: "scan",
-      engine: "Stockfish",
-    });
-    setAnalyzeStatus(
-      nextPass === "baseline"
-        ? "Baseline pass · broader threshold…"
-        : "Scanning next batch…"
-    );
-    setScanningMore(true);
+          : "Scanning next batch…"
+      );
+    }
+    cancelStudyPrefetch();
+    if (silent) {
+      backgroundScanningRef.current = true;
+    } else {
+      completionTargetRef.current = null;
+      setAnalysisComplete(false);
+      setScanningMore(true);
+    }
     const cacheKey = studyOpeningCacheKey(
       queryFilters,
       color,
@@ -511,6 +583,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     filteredGamesRef.current = filtered;
     const rating = averageUserRating(filtered.length ? filtered : allGames);
 
+    let completed = false;
     try {
       const batch = await analyzeOpeningMoments({
         games: filtered,
@@ -541,13 +614,16 @@ export function OpeningPrepSection(_props: Props = {}) {
             draws: res.draws || 0,
             black: res.black || 0,
             fallback: res.fallback,
+            opening: res.opening,
           };
         },
-        onProgress: (p) => {
-          setAnalyzeProgress(p);
-          setAnalyzeStatus(p.status);
-          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
-        },
+        onProgress: silent
+          ? undefined
+          : (p) => {
+              setAnalyzeProgress(p);
+              setAnalyzeStatus(p.status);
+              if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
+            },
       });
       if (signal.cancelled) return;
       scannedIdsRef.current =
@@ -560,50 +636,186 @@ export function OpeningPrepSection(_props: Props = {}) {
       setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
       baselineAvailableRef.current = batch.baselineAvailable;
-      setMoments(batch.moments);
-      setIdx(
-        batch.moments.length > keptMoments.length
-          ? keptMoments.length
-          : Math.max(0, batch.moments.length - 1)
-      );
       setScanExhausted(
         batch.thresholdPass === "baseline" &&
           batch.remaining <= 0 &&
           batch.pendingCandidates.length === 0
       );
-      await writeCache(cacheKey, {
-        moments: batch.moments,
-        pendingCandidates: batch.pendingCandidates,
-        deferredCandidates: batch.deferredCandidates,
-        scannedGameIds: scannedIdsRef.current,
-        remaining: batch.remaining,
-        thresholdPass: batch.thresholdPass,
-        baselineAvailable: batch.baselineAvailable,
-      } satisfies OpeningCachePayload);
-      if (batch.moments.length <= keptMoments.length) {
-        setError("No further opening improvement moments found.");
-        if (
-          batch.remaining > 0 ||
-          batch.pendingCandidates.length > 0 ||
-          batch.baselineAvailable
-        ) {
-          setShowScanMore(true);
-        } else {
-          setAllDone(true);
+
+      const hasNew = batch.moments.length > keptMoments.length;
+      if (silent) {
+        if (hasNew) {
+          pendingBatchRef.current = {
+            moments: batch.moments,
+            pendingCandidates: batch.pendingCandidates,
+            deferredCandidates: batch.deferredCandidates,
+            scannedGameIds: scannedIdsRef.current,
+            remaining: batch.remaining,
+            thresholdPass: batch.thresholdPass,
+            baselineAvailable: batch.baselineAvailable,
+            previousLength: keptMoments.length,
+          };
+          setPendingReady(true);
         }
+        await writeCache(cacheKey, {
+          moments: keptMoments,
+          pendingCandidates: batch.pendingCandidates,
+          deferredCandidates: batch.deferredCandidates,
+          scannedGameIds: scannedIdsRef.current,
+          remaining: batch.remaining,
+          thresholdPass: batch.thresholdPass,
+          baselineAvailable: batch.baselineAvailable,
+        } satisfies OpeningCachePayload);
       } else {
-        setError(null);
+        setMoments(batch.moments);
+        visibleBatchStartRef.current = hasNew ? keptMoments.length : 0;
+        secondPagePrefetchKeyRef.current = null;
+        setIdx(
+          hasNew
+            ? keptMoments.length
+            : Math.max(0, batch.moments.length - 1)
+        );
+        await writeCache(cacheKey, {
+          moments: batch.moments,
+          pendingCandidates: batch.pendingCandidates,
+          deferredCandidates: batch.deferredCandidates,
+          scannedGameIds: scannedIdsRef.current,
+          remaining: batch.remaining,
+          thresholdPass: batch.thresholdPass,
+          baselineAvailable: batch.baselineAvailable,
+        } satisfies OpeningCachePayload);
+        if (!hasNew) {
+          setError("No further opening improvement moments found.");
+          if (
+            batch.remaining > 0 ||
+            batch.pendingCandidates.length > 0 ||
+            batch.baselineAvailable
+          ) {
+            setShowScanMore(true);
+          } else {
+            setAllDone(true);
+          }
+        } else {
+          setError(null);
+        }
       }
+      completed = true;
     } catch (e) {
-      if (!signal.cancelled) {
+      if (!silent && !signal.cancelled) {
         setError(e instanceof Error ? e.message : "Failed to scan more");
       }
     } finally {
-      if (!signal.cancelled) {
-        setScanningMore(false);
+      if (silent) {
+        backgroundScanningRef.current = false;
+        if (revealPendingOnCompleteRef.current) {
+          revealPendingOnCompleteRef.current = false;
+          const pending = pendingBatchRef.current;
+          if (pending) {
+            pendingBatchRef.current = null;
+            setPendingReady(false);
+            setMoments(pending.moments);
+            visibleBatchStartRef.current = pending.previousLength;
+            secondPagePrefetchKeyRef.current = null;
+            setIdx(pending.previousLength);
+            setShowScanMore(false);
+            setAllDone(false);
+            setError(null);
+            void writeCache(cacheKey, {
+              moments: pending.moments,
+              pendingCandidates: pending.pendingCandidates,
+              deferredCandidates: pending.deferredCandidates,
+              scannedGameIds: pending.scannedGameIds,
+              remaining: pending.remaining,
+              thresholdPass: pending.thresholdPass,
+              baselineAvailable: pending.baselineAvailable,
+            } satisfies OpeningCachePayload);
+          }
+          setScanningMore(false);
+        }
+      } else if (!signal.cancelled) {
+        if (completed) {
+          completionTargetRef.current = "scan";
+          setAnalysisComplete(true);
+        } else {
+          setScanningMore(false);
+        }
       }
     }
   };
+
+  const applyPendingOpeningBatch = () => {
+    const pending = pendingBatchRef.current;
+    if (!pending || !color || !selectedOpening) return false;
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    setMoments(pending.moments);
+    visibleBatchStartRef.current = pending.previousLength;
+    secondPagePrefetchKeyRef.current = null;
+    setIdx(pending.previousLength);
+    setShowScanMore(false);
+    setAllDone(false);
+    setError(null);
+    void writeCache(
+      studyOpeningCacheKey(queryFilters, color, selectedOpening.key),
+      {
+        moments: pending.moments,
+        pendingCandidates: pending.pendingCandidates,
+        deferredCandidates: pending.deferredCandidates,
+        scannedGameIds: pending.scannedGameIds,
+        remaining: pending.remaining,
+        thresholdPass: pending.thresholdPass,
+        baselineAvailable: pending.baselineAvailable,
+      } satisfies OpeningCachePayload
+    );
+    return true;
+  };
+
+  const requestScanMoreOpenings = () => {
+    if (applyPendingOpeningBatch()) return;
+    if (backgroundScanningRef.current) {
+      revealPendingOnCompleteRef.current = true;
+      setScanningMore(true);
+      return;
+    }
+    void continueScanOpenings(false);
+  };
+
+  useEffect(() => {
+    if (
+      !active ||
+      phase !== "quiz" ||
+      idx !== visibleBatchStartRef.current + 1 ||
+      !color ||
+      !selectedOpening ||
+      scanningMore ||
+      scanExhausted ||
+      pendingReady ||
+      pendingBatchRef.current
+    ) {
+      return;
+    }
+    const canLoadMore =
+      remainingGames > 0 ||
+      pendingCount > 0 ||
+      baselineAvailableRef.current ||
+      thresholdPassRef.current === "strict";
+    if (!canLoadMore) return;
+    const key = `${color}:${selectedOpening.key}:batch:${visibleBatchStartRef.current}`;
+    if (secondPagePrefetchKeyRef.current === key) return;
+    secondPagePrefetchKeyRef.current = key;
+    void continueScanOpenings(true);
+  }, [
+    active,
+    phase,
+    idx,
+    color,
+    selectedOpening,
+    scanningMore,
+    scanExhausted,
+    pendingReady,
+    remainingGames,
+    pendingCount,
+  ]);
 
   const onQuizMove = async (uci: string, san: string, nextFen: string) => {
     if (!current?.best_uci || revealed) return;
@@ -613,7 +825,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     }
     setPuzzleFen(nextFen);
     setPuzzleMoveSan(san);
-    setHighlightUci(uci);
+    setGuessUci(uci);
     setQuizFeedback("Checking…");
     setQuizCorrect(null);
 
@@ -622,7 +834,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       setQuizFeedback("Illegal move — try again.");
       setPuzzleFen(current.fen);
       setPuzzleMoveSan(null);
-      setHighlightUci(null);
+      setGuessUci(null);
       return;
     }
     if (res.verdict === "retry") {
@@ -632,7 +844,7 @@ export function OpeningPrepSection(_props: Props = {}) {
       setUserMoveEval(null);
       retryTimerRef.current = setTimeout(() => {
         setPuzzleFen(current.fen);
-        setHighlightUci(null);
+        setGuessUci(null);
         setQuizFeedback("Not quite — try a different move.");
       }, 1600);
       return;
@@ -660,7 +872,7 @@ export function OpeningPrepSection(_props: Props = {}) {
     setSequencePlaying(false);
   };
 
-  const resetFlow = () => {
+  const resetFlow = useCallback(() => {
     cancelRef.current.cancelled = true;
     setPhase("color");
     setColor(null);
@@ -673,6 +885,10 @@ export function OpeningPrepSection(_props: Props = {}) {
     setAllDone(false);
     setShowScanMore(false);
     setScanExhausted(false);
+    pendingBatchRef.current = null;
+    setPendingReady(false);
+    visibleBatchStartRef.current = 0;
+    secondPagePrefetchKeyRef.current = null;
     scannedIdsRef.current = [];
     pendingCandidatesRef.current = [];
     deferredCandidatesRef.current = [];
@@ -682,15 +898,25 @@ export function OpeningPrepSection(_props: Props = {}) {
     setRemainingGames(0);
     setPendingCount(0);
     setScanningMore(false);
-  };
+    setTopOpenings([]);
+  }, []);
+
+  const filtersKey = useMemo(() => JSON.stringify(queryFilters), [queryFilters]);
+  const lastFiltersKeyRef = useRef(filtersKey);
+
+  useEffect(() => {
+    if (lastFiltersKeyRef.current === filtersKey) return;
+    lastFiltersKeyRef.current = filtersKey;
+    resetFlow();
+  }, [filtersKey, resetFlow]);
+
+  useEffect(() => {
+    if (!color) return;
+    setTopOpenings(topOpeningsForColor(allGames, color, 3));
+  }, [allGames, color]);
 
   if (loadingGames) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={colors.red} />
-        <Text style={styles.muted}>Loading your games…</Text>
-      </View>
-    );
+    return <OpeningChoiceSkeleton />;
   }
 
   if (phase === "color") {
@@ -827,75 +1053,55 @@ export function OpeningPrepSection(_props: Props = {}) {
     );
   }
 
-  if (phase === "analyze" || scanningMore) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={colors.red} />
-        <StudyAnalyzeStatus
-          progress={analyzeProgress}
-          logLines={analyzeLog}
-          fallback={
-            analyzeStatus ||
-            "Scanning opening games against Lichess & Masters…"
-          }
-        />
-        {!engineReady ? (
-          <Text style={styles.muted}>Waiting for on-device Stockfish…</Text>
-        ) : null}
-      </View>
-    );
-  }
-
-  if (showScanMore) {
-    return (
-      <View>
-        <View style={styles.headerRow}>
-          <Text style={styles.openingTitle}>
-            {openingHeaderLabel(selectedOpening, color)}
+  if (phase === "analyze" || scanningMore || phase === "quiz") {
+    let content: React.ReactNode = null;
+    if (showScanMore) {
+      content = (
+        <View>
+          <View style={styles.headerRow}>
+            <Text style={styles.openingTitle}>
+              {openingHeaderLabel(selectedOpening, color)}
+            </Text>
+            <BrutalButton label="Change" ghost onPress={resetFlow} />
+          </View>
+          <View style={styles.center}>
+            <BrutalButton
+              label="Scan more"
+              disabled={!engineReady}
+              onPress={requestScanMoreOpenings}
+            />
+          </View>
+        </View>
+      );
+    } else if (allDone) {
+      content = (
+        <View>
+          <View style={styles.headerRow}>
+            <Text style={styles.openingTitle}>
+              {openingHeaderLabel(selectedOpening, color)}
+            </Text>
+            <BrutalButton label="Change" ghost onPress={resetFlow} />
+          </View>
+          <Text style={[styles.muted, { marginTop: spacing.sm }]}>
+            That&apos;s all for today — every candidate position from these games
+            has been reviewed.
           </Text>
-          <BrutalButton label="Change" ghost onPress={resetFlow} />
         </View>
-        <View style={styles.center}>
-          <BrutalButton
-            label="Scan more"
-            disabled={!engineReady}
-            onPress={() => void continueScanOpenings()}
-          />
+      );
+    } else if (!current) {
+      content = (
+        <View>
+          <Text style={styles.muted}>No moments to study.</Text>
+          <BrutalButton label="Choose another opening" onPress={resetFlow} />
         </View>
-      </View>
-    );
-  }
+      );
+    } else {
+      const asMistake = current as MistakeItem;
+      const showWinrateHeader = usesWinrateHeader(current);
+      const worsenedComment = formatOpeningWorsenedComment(current);
 
-  if (allDone) {
-    return (
-      <View>
-        <View style={styles.headerRow}>
-          <Text style={styles.openingTitle}>
-            {openingHeaderLabel(selectedOpening, color)}
-          </Text>
-          <BrutalButton label="Change" ghost onPress={resetFlow} />
-        </View>
-        <Text style={[styles.muted, { marginTop: spacing.sm }]}>
-          That&apos;s all for today — every candidate position from these games
-          has been reviewed.
-        </Text>
-      </View>
-    );
-  }
-
-  if (!current) {
-    return (
-      <View>
-        <Text style={styles.muted}>No moments to study.</Text>
-        <BrutalButton label="Choose another opening" onPress={resetFlow} />
-      </View>
-    );
-  }
-
-  const asMistake = current as MistakeItem;
-
-  return (
-    <View>
+      content = (
+        <View>
       <View style={styles.headerRow}>
         <Text style={styles.openingTitle}>
           {openingHeaderLabel(selectedOpening, color)}
@@ -922,15 +1128,12 @@ export function OpeningPrepSection(_props: Props = {}) {
           </Text>
         </View>
         <View style={styles.evalSummary}>
-          {(current.games_played ?? 0) > 10 &&
-          (current.games_best ?? 0) > 10 &&
-          current.winrate_played != null &&
-          current.winrate_best != null ? (
+          {showWinrateHeader ? (
             <>
               <Text style={styles.metaLine}>Win rate gap</Text>
               <Text style={styles.evalDrop}>
-                {(current.winrate_played * 100).toFixed(0)}% →{" "}
-                {(current.winrate_best * 100).toFixed(0)}%
+                {((current.winrate_played ?? 0) * 100).toFixed(0)}% →{" "}
+                {((current.winrate_best ?? 0) * 100).toFixed(0)}%
               </Text>
             </>
           ) : (
@@ -961,6 +1164,7 @@ export function OpeningPrepSection(_props: Props = {}) {
         interactive={!revealed}
         onMove={(uci, san, nextFen) => void onQuizMove(uci, san, nextFen)}
         highlightUci={highlightUci || (revealed ? current.best_uci : null)}
+        guessUci={guessUci}
       />
 
       {revealed && sequencePv.length > 0 ? (
@@ -1005,7 +1209,9 @@ export function OpeningPrepSection(_props: Props = {}) {
                 ]}
               >
                 {puzzleMoveSan}
-                {userMoveEval != null ? ` ${userMoveEval.toFixed(0)}%` : ""}
+                {!showWinrateHeader && userMoveEval != null
+                  ? ` ${userMoveEval.toFixed(0)}%`
+                  : ""}
               </Text>
             </View>
           ) : null}
@@ -1036,7 +1242,7 @@ export function OpeningPrepSection(_props: Props = {}) {
           </Text>
         ) : null}
         {revealed && current.comment ? (
-          <Text style={styles.comment}>{current.comment}</Text>
+          <Text style={styles.comment}>{worsenedComment}</Text>
         ) : null}
         {quizFeedback ? (
           <Text
@@ -1100,12 +1306,13 @@ export function OpeningPrepSection(_props: Props = {}) {
           onPress={() => {
             if (idx >= moments.length - 1) {
               const canScanMore =
-                !scanExhausted &&
-                (remainingGames > 0 ||
-                  pendingCount > 0 ||
-                  baselineAvailableRef.current ||
-                  (thresholdPassRef.current === "strict" &&
-                    remainingGames <= 0));
+                pendingReady ||
+                (!scanExhausted &&
+                  (remainingGames > 0 ||
+                    pendingCount > 0 ||
+                    baselineAvailableRef.current ||
+                    (thresholdPassRef.current === "strict" &&
+                      remainingGames <= 0)));
               if (canScanMore) {
                 setShowScanMore(true);
                 setAllDone(false);
@@ -1123,7 +1330,44 @@ export function OpeningPrepSection(_props: Props = {}) {
         />
       </View>
     </View>
-  );
+      );
+    }
+
+    return (
+      <PageLoadingTransition
+        active={phase === "analyze" || scanningMore}
+        contentKey={
+          showScanMore
+            ? "scan-more"
+            : allDone
+              ? "all-done"
+              : !current
+                ? "empty"
+                : `batch:${visibleBatchStartRef.current}:${moments.length}`
+        }
+        loader={
+          <View style={styles.center}>
+            <StudyAnalyzeStatus
+              progress={analyzeProgress}
+              logLines={analyzeLog}
+              targetMoments={5}
+              fallback={
+                analyzeStatus ||
+                "Scanning opening games against Lichess & Masters…"
+              }
+              complete={analysisComplete}
+              onComplete={finishLoadingVisual}
+            />
+            {!engineReady ? (
+              <Text style={styles.muted}>Waiting for on-device Stockfish…</Text>
+            ) : null}
+          </View>
+        }
+      >
+        {content}
+      </PageLoadingTransition>
+    );
+  }
 }
 
 const styles = StyleSheet.create({

@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
-  ActivityIndicator,
   Image,
   Pressable,
   RefreshControl,
@@ -17,6 +16,10 @@ import {
   MonthlyGamesChart,
   RatingChart,
 } from "../components/AnalyticsCharts";
+import {
+  PageLoadingTransition,
+  RecapSkeleton,
+} from "../components/LoadingSkeletons";
 import {
   DisplayTitle,
   EdgeCard,
@@ -45,6 +48,16 @@ const HERO_PIECES = [
   require("../../assets/chess_set/pawn.png"),
 ] as const;
 
+const FIXED_LOADER_MS = 2000;
+
+function usesFixedLoader(period: Period): boolean {
+  return period === "day" || period === "week" || period === "month";
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function RecapScreen() {
   const { queryFilters, refreshToken, speed, period, periodLabel } = useFilters();
   const [data, setData] = useState<RecapResponse | null>(null);
@@ -59,6 +72,7 @@ export function RecapScreen() {
 
   const load = useCallback(
     async (forceNetwork = false) => {
+      const startedAt = Date.now();
       try {
         setError(null);
         const recap = await fetchRecap(queryFilters, forceNetwork);
@@ -68,11 +82,14 @@ export function RecapScreen() {
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load recap");
       } finally {
+        if (!forceNetwork && usesFixedLoader(period)) {
+          await wait(Math.max(0, FIXED_LOADER_MS - (Date.now() - startedAt)));
+        }
         setLoading(false);
         setRefreshing(false);
       }
     },
-    [queryFilters]
+    [period, queryFilters]
   );
 
   useEffect(() => {
@@ -84,50 +101,48 @@ export function RecapScreen() {
     void load(false);
   }, [load, refreshToken, period]);
 
-  if (loading && !data) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={colors.red} />
-        {period === "year" || period === "all" ? (
-          <Text style={styles.muted}>
-            Loading {period === "all" ? "all-time" : "yearly"} recap… this can
-            take a bit.
-          </Text>
-        ) : null}
-      </View>
-    );
-  }
+  const showPieceLoader = loading && usesFixedLoader(period);
+  const showSkeleton = loading && !data && !usesFixedLoader(period);
+  const contentKey = showPieceLoader
+    ? `loader:${period}:${periodLabel}`
+    : showSkeleton
+      ? `skeleton:${period}`
+      : error && !data
+        ? "error"
+        : data
+          ? `${period}:${periodLabel}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
+          : "empty";
 
-  if (error && !data) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.error}>{error}</Text>
-        <Text style={styles.muted}>Cached analytics load automatically offline.</Text>
-      </View>
-    );
-  }
-
-  if (!data) return null;
-
-  const view = selectRecapView(data, speed, period);
-  const badge = view.badges[activeBadge];
+  const view = data ? selectRecapView(data, speed, period) : null;
+  const badge = view?.badges[activeBadge];
   const periodNoun = PERIOD_NOUN[period];
 
   return (
-    <ScrollView
-      style={styles.scroll}
-      contentContainerStyle={styles.content}
-      refreshControl={
-        <RefreshControl
-          refreshing={refreshing}
-          tintColor={colors.red}
-          onRefresh={() => {
-            setRefreshing(true);
-            void load(true);
-          }}
-        />
-      }
-    >
+    <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
+      {showSkeleton ? (
+        <RecapSkeleton />
+      ) : error && !data ? (
+        <View style={styles.center}>
+          <Text style={styles.error}>{error}</Text>
+          <Text style={styles.muted}>
+            Cached analytics load automatically offline.
+          </Text>
+        </View>
+      ) : view ? (
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            tintColor={colors.red}
+            onRefresh={() => {
+              setRefreshing(true);
+              void load(true);
+            }}
+          />
+        }
+      >
       <View style={styles.hero}>
         <View style={styles.heroRow}>
           <View style={styles.heroText}>
@@ -231,7 +246,9 @@ export function RecapScreen() {
           ))}
         </View>
       </View>
-    </ScrollView>
+      </ScrollView>
+      ) : null}
+    </PageLoadingTransition>
   );
 }
 

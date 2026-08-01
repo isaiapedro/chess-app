@@ -1,6 +1,5 @@
-import React, { useEffect } from "react";
+import React from "react";
 import {
-  ActivityIndicator,
   StatusBar,
   StyleSheet,
   TurboModuleRegistry,
@@ -20,8 +19,10 @@ import {
 } from "@expo-google-fonts/ibm-plex-mono";
 import { FilterProvider } from "./src/context/FilterContext";
 import { FilterHeader } from "./src/components/FilterHeader";
+import { BootSkeleton } from "./src/components/LoadingSkeletons";
 import { TabNavigator } from "./src/navigation/TabNavigator";
 import { StockfishProvider } from "./src/engine/StockfishProvider";
+import { StudyPrefetch } from "./src/engine/StudyPrefetch";
 import { colors } from "./src/theme";
 
 const ghAvailable =
@@ -59,37 +60,8 @@ export default function App() {
     IBMPlexMono_700Bold,
   });
 
-  useEffect(() => {
-    // #region agent log
-    fetch("http://127.0.0.1:7474/ingest/3d67426d-0ccd-41bb-b08a-f7bf8ec78c30", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Debug-Session-Id": "6840b8",
-      },
-      body: JSON.stringify({
-        sessionId: "6840b8",
-        runId: "pre-fix",
-        hypothesisId: "D",
-        location: "App.tsx:mount",
-        message: "App mounted",
-        data: {
-          ghAvailable,
-          rootIsView: GestureRoot === View,
-          fontsLoaded,
-        },
-        timestamp: Date.now(),
-      }),
-    }).catch(() => {});
-    // #endregion
-  }, [fontsLoaded]);
-
   if (!fontsLoaded) {
-    return (
-      <View style={styles.boot}>
-        <ActivityIndicator color={colors.red} />
-      </View>
-    );
+    return <BootSkeleton />;
   }
 
   return (
@@ -97,6 +69,7 @@ export default function App() {
       <SafeAreaProvider>
         <FilterProvider>
           <StockfishProvider>
+            <StudyPrefetch />
             <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
               <StatusBar barStyle="light-content" />
               <View style={styles.shell}>
@@ -115,12 +88,6 @@ export default function App() {
 
 const styles = StyleSheet.create({
   flex: { flex: 1 },
-  boot: {
-    flex: 1,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: colors.bg,
-  },
   safe: {
     flex: 1,
     backgroundColor: colors.bg,

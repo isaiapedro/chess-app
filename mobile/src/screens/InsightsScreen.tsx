@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
 import {
-  ActivityIndicator,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -11,14 +10,33 @@ import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
 import { fetchInsights, fetchRecap } from "../api/client";
 import { selectFactors } from "../api/selectors";
-import type { FactorItem, InsightsResponse, RecapResponse } from "../api/types";
+import type {
+  FactorItem,
+  InsightsResponse,
+  Period,
+  RecapResponse,
+} from "../api/types";
+import {
+  InsightsSkeleton,
+  PageLoadingTransition,
+} from "../components/LoadingSkeletons";
 import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
 import { colors, font, result, spacing, withAlpha } from "../theme";
 import { CatalogScreen } from "./CatalogScreen";
 
+const FIXED_LOADER_MS = 2000;
+
+function usesFixedLoader(period: Period): boolean {
+  return period === "day" || period === "week" || period === "month";
+}
+
+function wait(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export function InsightsScreen() {
-  const { queryFilters, refreshToken } = useFilters();
+  const { queryFilters, refreshToken, period } = useFilters();
   const [data, setData] = useState<InsightsResponse | null>(null);
   const [recap, setRecap] = useState<RecapResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -28,6 +46,7 @@ export function InsightsScreen() {
 
   const load = useCallback(
     async (forceNetwork = false) => {
+      const startedAt = Date.now();
       try {
         setError(null);
         const [insights, recapData] = await Promise.all([
@@ -39,11 +58,14 @@ export function InsightsScreen() {
       } catch (e) {
         setError(e instanceof Error ? e.message : "Failed to load insights");
       } finally {
+        if (!forceNetwork && usesFixedLoader(period)) {
+          await wait(Math.max(0, FIXED_LOADER_MS - (Date.now() - startedAt)));
+        }
         setLoading(false);
         setRefreshing(false);
       }
     },
-    [queryFilters]
+    [period, queryFilters]
   );
 
   useEffect(() => {
@@ -55,49 +77,51 @@ export function InsightsScreen() {
     return <CatalogScreen data={data} onBack={() => setShowCatalog(false)} />;
   }
 
-  if (loading && !data) {
-    return (
-      <View style={styles.center}>
-        <ActivityIndicator color={colors.red} />
-      </View>
-    );
-  }
+  const showPieceLoader = loading && usesFixedLoader(period);
+  const showSkeleton = loading && !data && !usesFixedLoader(period);
+  const contentKey = showPieceLoader
+    ? `loader:${period}:${refreshToken}`
+    : showSkeleton
+      ? `skeleton:${period}`
+      : error && !data
+        ? "error"
+        : data
+          ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
+          : "empty";
 
-  if (error && !data) {
-    return (
-      <View style={styles.center}>
-        <Text style={styles.error}>{error}</Text>
-      </View>
-    );
-  }
-
-  if (!data) return null;
-
-  const factors = selectFactors(data);
+  const factors = data ? selectFactors(data) : null;
   const results = recap?.results || {
     wins: 0,
     draws: 0,
     losses: 0,
-    win_rate: factors.baseline_win_rate || 0,
+    win_rate: factors?.baseline_win_rate || 0,
   };
   const ratingSeries = (recap?.rating_series || []).slice(-12);
-  const winRate = results.win_rate || factors.baseline_win_rate || 0;
+  const winRate = results.win_rate || factors?.baseline_win_rate || 0;
 
   return (
-    <ScrollView
-      style={styles.scroll}
-      contentContainerStyle={styles.content}
-      refreshControl={
-        <RefreshControl
-          refreshing={refreshing}
-          tintColor={colors.red}
-          onRefresh={() => {
-            setRefreshing(true);
-            void load(true);
-          }}
-        />
-      }
-    >
+    <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
+      {showSkeleton ? (
+        <InsightsSkeleton />
+      ) : error && !data ? (
+        <View style={styles.center}>
+          <Text style={styles.error}>{error}</Text>
+        </View>
+      ) : data && factors ? (
+      <ScrollView
+        style={styles.scroll}
+        contentContainerStyle={styles.content}
+        refreshControl={
+          <RefreshControl
+            refreshing={refreshing}
+            tintColor={colors.red}
+            onRefresh={() => {
+              setRefreshing(true);
+              void load(true);
+            }}
+          />
+        }
+      >
       <View style={styles.hero}>
         <Eyebrow>Performance Analysis</Eyebrow>
         <DisplayTitle size={34}>
@@ -186,7 +210,9 @@ export function InsightsScreen() {
           onPress={() => setShowCatalog(true)}
         />
       </View>
-    </ScrollView>
+      </ScrollView>
+      ) : null}
+    </PageLoadingTransition>
   );
 }
 
