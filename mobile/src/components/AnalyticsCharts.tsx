@@ -155,7 +155,7 @@ export function RatingChart({
     : [{ data: series.map((point) => point.user_rating) }];
 
   const chartWidth = Math.max(280, width - spacing.md * 4);
-  const chartHeight = yearMarks.length ? 216 : 200;
+  const chartHeight = yearMarks.length ? 270 : 250;
 
   return (
     <Animated.View style={[styles.panel, animation]}>

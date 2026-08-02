@@ -11,6 +11,12 @@ import { StyleSheet, View } from "react-native";
 import Constants from "expo-constants";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { Chess } from "chess.js";
+import {
+  GLOBAL_DEPTH,
+  GLOBAL_HASH_MB,
+  GLOBAL_MULTIPV,
+  GLOBAL_THREADS,
+} from "./analysisConfig";
 
 type EvalResult = {
   cpWhite: number;
@@ -29,6 +35,10 @@ type StockfishContextValue = {
     movetimeMs?: number
   ) => Promise<EvalResult>;
 };
+
+function depthOnlyTimeoutMs(depth: number): number {
+  return Math.min(120000, Math.max(20000, depth * 4000));
+}
 
 const StockfishContext = createContext<StockfishContextValue | null>(null);
 
@@ -67,26 +77,38 @@ function debugIngestUrl(): string {
   return "http://127.0.0.1:7677/ingest/217f9228-6275-432a-b240-b52166a932e5";
 }
 
+let evalLogCount = 0;
+
 function agentLog(
   location: string,
   message: string,
   data: Record<string, unknown>
 ) {
   // #region agent log
+  const isEvalNoise =
+    message === "eval start" ||
+    message === "eval ok" ||
+    message === "eval fail" ||
+    message === "eval timeout" ||
+    message === "eval terminal";
+  if (isEvalNoise) {
+    evalLogCount += 1;
+    if (evalLogCount > 6 && evalLogCount % 100 !== 0) return;
+  }
   console.log(`[sf-debug] ${message}`, data);
   fetch(debugIngestUrl(), {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6840b8",
+      "X-Debug-Session-Id": "6d2375",
     },
     body: JSON.stringify({
-      sessionId: "6840b8",
-      runId: "sf18-unpkg-post-fix",
+      sessionId: "6d2375",
+      runId: String(data.runId || "month-freeze"),
       hypothesisId: String(data.hyp || "K"),
       location,
       message,
-      data,
+      data: { ...data, evalLogCount },
       timestamp: Date.now(),
     }),
   }).catch(() => {});
@@ -154,7 +176,9 @@ const ENGINE_HTML = `<!DOCTYPE html>
     }
     if (line === 'uciok' || line.indexOf('uciok') === 0) {
       send('debug', { stage: 'uciok-received' });
-      engine.postMessage('setoption name Hash value 64');
+      engine.postMessage('setoption name Threads value ${GLOBAL_THREADS}');
+      engine.postMessage('setoption name Hash value ${GLOBAL_HASH_MB}');
+      engine.postMessage('setoption name MultiPV value ${GLOBAL_MULTIPV}');
       engine.postMessage('isready');
       return;
     }
@@ -277,6 +301,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
 
   function bootFromBlobs(jsText, wasmBuffer) {
     var wasmUrl = URL.createObjectURL(new Blob([wasmBuffer], { type: 'application/wasm' }));
+    send('probe', { probe: 'wasm-blob-url', hyp: 'B', ok: true, err: String(wasmUrl).slice(0, 120) });
     var prefix = [
       // #region agent log
       'self.__dbg = function (m) { try { self.postMessage("__dbg " + m); } catch (e) {} };',
@@ -287,7 +312,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
       'var __origFetch = self.fetch.bind(self);',
       'self.fetch = function (input, init) {',
       // #region agent log
-      '  self.__dbg("fetch " + String(typeof input === "string" ? input : (input && input.url) || "").slice(0, 100) + " -> wasm blob");',
+      '  self.__dbg("fetch in=" + String(typeof input === "string" ? input : (input && input.url) || "").slice(0, 100) + " blob=" + String(__wasmUrl).slice(0, 80));',
       // #endregion
       '  return __origFetch(__wasmUrl, init)',
       // #region agent log
@@ -453,9 +478,15 @@ const ENGINE_HTML = `<!DOCTYPE html>
     // #region agent log
     goCount++;
     // #endregion
+    var depth = msg.depth || ${GLOBAL_DEPTH};
+    var movetime = msg.movetime;
     engine.postMessage('setoption name MultiPV value ' + wantedMultiPv);
     engine.postMessage('position fen ' + msg.fen);
-    engine.postMessage('go depth ' + (msg.depth || 15) + ' movetime ' + (msg.movetime || 1200));
+    if (movetime == null || movetime <= 0) {
+      engine.postMessage('go depth ' + depth);
+    } else {
+      engine.postMessage('go depth ' + depth + ' movetime ' + movetime);
+    }
   }
 
   boot();
@@ -576,25 +607,97 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const evaluate = useCallback(
-    (fen: string, depth = 15, multiPv = 1, movetimeMs = 1200) => {
+    (
+      fen: string,
+      depth = GLOBAL_DEPTH,
+      multiPv = GLOBAL_MULTIPV,
+      movetimeMs?: number
+    ) => {
       return new Promise<EvalResult>((resolve, reject) => {
         const terminal = terminalEval(fen);
         if (terminal) {
+          // #region agent log
+          agentLog("StockfishProvider.tsx:evaluate", "eval terminal", {
+            hyp: "C",
+            fen: fen.slice(0, 40),
+          });
+          // #endregion
           resolve(terminal);
           return;
         }
         if (!ready) {
+          // #region agent log
+          agentLog("StockfishProvider.tsx:evaluate", "eval not-ready", {
+            hyp: "A",
+            fen: fen.slice(0, 40),
+          });
+          // #endregion
           reject(new Error("Stockfish not ready"));
           return;
         }
         const id = `e${++seq.current}`;
-        pending.current.set(id, { id, resolve, reject });
-        post({ type: "eval", id, fen, depth, multiPv, movetime: movetimeMs });
+        const useMovetime =
+          typeof movetimeMs === "number" && movetimeMs > 0
+            ? movetimeMs
+            : undefined;
+        const timeoutMs = useMovetime
+          ? useMovetime + 5000
+          : depthOnlyTimeoutMs(depth);
+        // #region agent log
+        agentLog("StockfishProvider.tsx:evaluate", "eval start", {
+          hyp: "C",
+          id,
+          depth,
+          multiPv,
+          movetime: useMovetime ?? 0,
+          fen: fen.slice(0, 40),
+          pending: pending.current.size,
+        });
+        // #endregion
+        pending.current.set(id, {
+          id,
+          resolve: (value) => {
+            // #region agent log
+            agentLog("StockfishProvider.tsx:evaluate", "eval ok", {
+              hyp: "C",
+              id,
+              cpWhite: value.cpWhite,
+              bestUci: value.bestUci,
+            });
+            // #endregion
+            resolve(value);
+          },
+          reject: (error) => {
+            // #region agent log
+            agentLog("StockfishProvider.tsx:evaluate", "eval fail", {
+              hyp: "D",
+              id,
+              err: error instanceof Error ? error.message : String(error),
+            });
+            // #endregion
+            reject(error);
+          },
+        });
+        post({
+          type: "eval",
+          id,
+          fen,
+          depth,
+          multiPv,
+          movetime: useMovetime ?? 0,
+        });
         setTimeout(() => {
           if (!pending.current.has(id)) return;
           pending.current.delete(id);
+          // #region agent log
+          agentLog("StockfishProvider.tsx:evaluate", "eval timeout", {
+            hyp: "D",
+            id,
+            timeoutMs,
+          });
+          // #endregion
           reject(new Error("Stockfish timeout"));
-        }, movetimeMs + 5000);
+        }, timeoutMs);
       });
     },
     [post, ready]

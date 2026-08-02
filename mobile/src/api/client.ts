@@ -129,6 +129,7 @@ async function getJson<T>(
 
 function ttlForPath(path: string): number {
   if (path.includes("/games/")) return GAMES_TTL_MS;
+  if (path.includes("/baselines")) return 7 * 24 * 60 * 60 * 1000;
   if (
     path.includes("/study/explorer") ||
     path.includes("/study/masters-pgn") ||
@@ -180,6 +181,47 @@ export async function fetchInsights(
   return getJson<InsightsResponse>(
     "/api/v1/stats/insights",
     buildParams(filters),
+    forceNetwork
+  );
+}
+
+export type BaselinesResponse = {
+  meta: {
+    available: boolean;
+    source_month?: string | null;
+    row_count?: number;
+    band_count?: number;
+    speed_count?: number;
+    cell_count?: number;
+  };
+  bands: string[];
+  speeds: string[];
+  rows: Array<Record<string, unknown>>;
+  by_cell: Record<
+    string,
+    Record<
+      string,
+      {
+        mean: number | null;
+        n: number;
+        sample?: string | null;
+        source_month?: string | null;
+        p10?: number | null;
+        p25?: number | null;
+        p50?: number | null;
+        p75?: number | null;
+        p90?: number | null;
+      }
+    >
+  >;
+};
+
+export async function fetchBaselines(
+  forceNetwork = false
+): Promise<BaselinesResponse> {
+  return getJson<BaselinesResponse>(
+    "/api/v1/baselines",
+    undefined,
     forceNetwork
   );
 }

@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { BrutalButton, DisplayTitle } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
+import { resetPrefetchMemory } from "../engine/studyPrefetch";
 import { clearAppCache } from "../storage/cache";
 import { colors, font, result, spacing } from "../theme";
 
@@ -17,11 +18,12 @@ export function ProfileScreen() {
     setStatus(null);
     setFailed(false);
     try {
+      resetPrefetchMemory();
       const removed = await clearAppCache();
       refresh();
       setStatus(
         removed
-          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"}.`
+          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"} (incl. Stockfish vault).`
           : "Nothing cached."
       );
     } catch (e) {

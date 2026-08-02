@@ -1,3 +1,4 @@
+import Constants from "expo-constants";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Image,
@@ -8,9 +9,8 @@ import {
   Text,
   View,
 } from "react-native";
-import { fetchGames, fetchRecap } from "../api/client";
 import { selectRecapView } from "../api/selectors";
-import type { Period, RecapResponse } from "../api/types";
+import type { Period } from "../api/types";
 import {
   HourlyGamesChart,
   MonthlyGamesChart,
@@ -28,8 +28,56 @@ import {
   Pill,
   SectionLabel,
 } from "../components/ui";
+import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
+import {
+  normalizeSpeed,
+  peerGamesPlayedCaption,
+  peerTimeInvestedCaption,
+  ratingBand,
+} from "../data/baselines";
 import { colors, font, result, spacing, withAlpha } from "../theme";
+
+function debugRecapLog(
+  message: string,
+  hypothesisId: string,
+  data: Record<string, unknown>
+) {
+  // #region agent log
+  const hostUri =
+    Constants.expoConfig?.hostUri ||
+    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
+  const host = hostUri?.split(":")[0] || "127.0.0.1";
+  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Debug-Session-Id": "6d2375",
+    },
+    body: JSON.stringify({
+      sessionId: "6d2375",
+      runId: "month-freeze",
+      hypothesisId,
+      location: "RecapScreen.tsx",
+      message,
+      data,
+      timestamp: Date.now(),
+    }),
+  }).catch(() => {});
+  // #endregion
+}
+
+const STREAK_OUTLINE_COLOR = "#7C2D12";
+const STREAK_OUTLINE = [
+  [-1, -1],
+  [0, -1],
+  [1, -1],
+  [-1, 0],
+  [1, 0],
+  [-1, 1],
+  [0, 1],
+  [1, 1],
+] as const;
 
 const PERIOD_NOUN: Record<Period, string> = {
   all: "Story",
@@ -54,15 +102,17 @@ function usesFixedLoader(period: Period): boolean {
   return period === "day" || period === "week" || period === "month";
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export function RecapScreen() {
   const { queryFilters, refreshToken, speed, period, periodLabel } = useFilters();
-  const [data, setData] = useState<RecapResponse | null>(null);
+  const {
+    recap: data,
+    baselines,
+    gamesLoading,
+    sessionKey,
+    refreshAnalytics,
+  } = useAnalytics();
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [minLoaderDone, setMinLoaderDone] = useState(!usesFixedLoader(period));
   const [refreshing, setRefreshing] = useState(false);
   const [activeBadge, setActiveBadge] = useState(0);
   const heroPiece = useMemo(() => {
@@ -70,37 +120,48 @@ export function RecapScreen() {
     return HERO_PIECES[idx];
   }, [period, refreshToken, queryFilters.username]);
 
-  const load = useCallback(
-    async (forceNetwork = false) => {
-      const startedAt = Date.now();
-      try {
-        setError(null);
-        const recap = await fetchRecap(queryFilters, forceNetwork);
-        setData(recap);
-        setActiveBadge(0);
-        void fetchGames(queryFilters, forceNetwork).catch(() => undefined);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to load recap");
-      } finally {
-        if (!forceNetwork && usesFixedLoader(period)) {
-          await wait(Math.max(0, FIXED_LOADER_MS - (Date.now() - startedAt)));
-        }
-        setLoading(false);
-        setRefreshing(false);
-      }
-    },
-    [period, queryFilters]
-  );
+  useEffect(() => {
+    setActiveBadge(0);
+    setError(null);
+    setMinLoaderDone(!usesFixedLoader(period));
+    if (!usesFixedLoader(period)) return;
+    const startedAt = Date.now();
+    debugRecapLog("recap load start", "H2", {
+      period,
+      forceNetwork: false,
+      user: queryFilters.username,
+    });
+    const t = setTimeout(() => {
+      setMinLoaderDone(true);
+      debugRecapLog("recap load end", "H2", {
+        totalMs: Date.now() - startedAt,
+        period,
+      });
+    }, FIXED_LOADER_MS);
+    return () => clearTimeout(t);
+  }, [sessionKey, refreshToken, period, queryFilters.username]);
 
   useEffect(() => {
-    const heavy = period === "year" || period === "all";
-    setLoading(true);
-    if (heavy) {
-      setData(null);
-    }
-    void load(false);
-  }, [load, refreshToken, period]);
+    if (!data) return;
+    debugRecapLog("recap done", "H2", {
+      games: data?.meta?.games_count,
+      runId: "post-fix",
+    });
+  }, [data]);
 
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      await refreshAnalytics(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load recap");
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshAnalytics]);
+
+  const loading = (gamesLoading && !data) || !minLoaderDone;
   const showPieceLoader = loading && usesFixedLoader(period);
   const showSkeleton = loading && !data && !usesFixedLoader(period);
   const contentKey = showPieceLoader
@@ -113,14 +174,66 @@ export function RecapScreen() {
           ? `${period}:${periodLabel}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
           : "empty";
 
-  const view = data ? selectRecapView(data, speed, period) : null;
+  const view = useMemo(() => {
+    if (!data) return null;
+    const base = selectRecapView(data, speed, period);
+    const wdl = `${base.results.wins}W · ${base.results.draws}D · ${base.results.losses}L`;
+    const withWdl = {
+      ...base,
+      stats: base.stats.map((stat) =>
+        stat.label === "Win Rate" ? { ...stat, sub: wdl } : stat
+      ),
+    };
+
+    const peerSpeed =
+      normalizeSpeed(speed) ||
+      normalizeSpeed(
+        Object.entries(data.rating_series_by_speed || {})
+          .sort(
+            (a, b) => (b[1]?.length || 0) - (a[1]?.length || 0)
+          )[0]?.[0]
+      );
+    const band = ratingBand(base.currentRating ?? base.peakRating);
+    if (!baselines?.available || !band || !peerSpeed) return withWdl;
+
+    const gamesCaption = peerGamesPlayedCaption(
+      baselines,
+      Number(data.headline?.total_games ?? base.gamesCount ?? 0),
+      band,
+      peerSpeed,
+      period
+    );
+    const timeCaption = peerTimeInvestedCaption(
+      baselines,
+      Number(data.headline?.total_hours ?? 0),
+      Number(data.headline?.total_games ?? base.gamesCount ?? 0),
+      band,
+      peerSpeed,
+      period
+    );
+
+    return {
+      ...withWdl,
+      stats: withWdl.stats.map((stat) => {
+        if (stat.label === "Games Played" && gamesCaption) {
+          return { ...stat, sub: gamesCaption };
+        }
+        if (stat.label === "Time Invested" && timeCaption) {
+          return { ...stat, sub: timeCaption };
+        }
+        return stat;
+      }),
+    };
+  }, [baselines, data, period, speed]);
   const badge = view?.badges[activeBadge];
   const periodNoun = PERIOD_NOUN[period];
 
   return (
     <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
       {showSkeleton ? (
-        <RecapSkeleton />
+        <View style={{ flex: 1 }}>
+          <RecapSkeleton />
+        </View>
       ) : error && !data ? (
         <View style={styles.center}>
           <Text style={styles.error}>{error}</Text>
@@ -137,8 +250,7 @@ export function RecapScreen() {
             refreshing={refreshing}
             tintColor={colors.red}
             onRefresh={() => {
-              setRefreshing(true);
-              void load(true);
+              void onRefresh();
             }}
           />
         }
@@ -162,18 +274,36 @@ export function RecapScreen() {
       </View>
 
       <View style={styles.peakRow}>
-        <Text style={styles.peakLabel}>Peak Rating</Text>
-        <View style={styles.peakValueRow}>
-          <Text style={styles.peakValue}>{view.peakRating ?? "—"}</Text>
-          {view.ratingChange != null ? (
-            <Pill color={view.ratingChange >= 0 ? result.win : result.loss}>
-              {view.ratingChange >= 0 ? "+" : ""}
-              {view.ratingChange}
-            </Pill>
-          ) : null}
-          {view.currentWinStreak >= 2 ? (
-            <Pill color="#E4572E">{`🔥 ${view.currentWinStreak}`}</Pill>
-          ) : null}
+        <View style={styles.peakMain}>
+          <Text style={styles.peakLabel}>Peak Rating</Text>
+          <View style={styles.peakValueRow}>
+            <Text style={styles.peakValue}>{view.peakRating ?? "—"}</Text>
+            {view.ratingChange != null ? (
+              <Pill color={view.ratingChange >= 0 ? result.win : result.loss}>
+                {view.ratingChange >= 0 ? "+" : ""}
+                {view.ratingChange}
+              </Pill>
+            ) : null}
+            {view.currentWinStreak >= 2 ? (
+              <View style={styles.streakBadge}>
+                <Text style={styles.streakFire}>🔥</Text>
+                <View style={styles.streakCountWrap}>
+                  {STREAK_OUTLINE.map(([dx, dy]) => (
+                    <Text
+                      key={`${dx},${dy}`}
+                      style={[
+                        styles.streakCountOutline,
+                        { transform: [{ translateX: dx }, { translateY: dy }] },
+                      ]}
+                    >
+                      {view.currentWinStreak}
+                    </Text>
+                  ))}
+                  <Text style={styles.streakCount}>{view.currentWinStreak}</Text>
+                </View>
+              </View>
+            ) : null}
+          </View>
         </View>
       </View>
 
@@ -311,6 +441,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
     marginBottom: spacing.md,
   },
+  peakMain: {
+    flex: 1,
+  },
   peakLabel: {
     color: colors.textDim,
     fontFamily: font.mono,
@@ -321,7 +454,7 @@ const styles = StyleSheet.create({
   },
   peakValueRow: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-end",
     gap: spacing.sm,
   },
   peakValue: {
@@ -332,6 +465,47 @@ const styles = StyleSheet.create({
     letterSpacing: -1,
     includeFontPadding: false,
     fontVariant: ["tabular-nums"],
+  },
+  streakBadge: {
+    width: 50,
+    height: 50,
+    marginBottom: 8,
+    alignItems: "center",
+    justifyContent: "flex-end",
+  },
+  streakFire: {
+    fontSize: 48,
+    lineHeight: 50,
+    opacity: 0.9,
+  },
+  streakCountWrap: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 4,
+    alignItems: "center",
+    justifyContent: "flex-end",
+    zIndex: 2,
+  },
+  streakCountOutline: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    textAlign: "center",
+    color: STREAK_OUTLINE_COLOR,
+    fontFamily: font.monoBold,
+    fontSize: 28,
+    lineHeight: 29,
+    fontVariant: ["tabular-nums"],
+  },
+  streakCount: {
+    color: "#FFF7ED",
+    fontFamily: font.monoBold,
+    fontSize: 28,
+    lineHeight: 29,
+    textAlign: "center",
+    fontVariant: ["tabular-nums"],
+    zIndex: 1,
   },
   grid: {
     flexDirection: "row",

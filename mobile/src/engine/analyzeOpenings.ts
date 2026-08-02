@@ -20,14 +20,21 @@ import {
 } from "./openingLines";
 import {
   ENGINE_LABEL,
+  GLOBAL_MULTIPV,
   MAX_OPENING_GAMES,
   MIN_CONTINUATION_PLIES,
   REFINE_DEPTH,
   REFINE_MOVETIME,
+  REFINE_MULTIPV,
   SCAN_DEPTH,
   SCAN_MOVETIME,
   TARGET_OPENING_MOMENTS,
 } from "./analysisConfig";
+import {
+  candidateKey,
+  selectRecentPeriodCandidates,
+  stubOpeningMoment,
+} from "./candidateBucket";
 
 export type OpeningChoice = {
   key: string;
@@ -696,6 +703,11 @@ function passesOpeningCriteria(
   return (item.priority_score || 0) >= floor;
 }
 
+type LookupEvalFn = (
+  gameId: string,
+  fen: string
+) => { cpWhite: number; bestUci: string | null } | null;
+
 export async function analyzeOpeningMoments(options: {
   games: StudyGame[];
   color: "white" | "black";
@@ -713,6 +725,7 @@ export async function analyzeOpeningMoments(options: {
   stopOnStrict?: boolean;
   appendCount?: number;
   thresholdPass?: ThresholdPass;
+  lookupEval?: LookupEvalFn;
 }): Promise<OpeningAnalyzeBatchResult> {
   const {
     games,
@@ -731,6 +744,7 @@ export async function analyzeOpeningMoments(options: {
     stopOnStrict = true,
     appendCount,
     thresholdPass: initialPass = "strict",
+    lookupEval,
   } = options;
   const ratings = ratingsForElo(userRating);
   const candidates: OpeningMoment[] = [];
@@ -858,13 +872,13 @@ export async function analyzeOpeningMoments(options: {
       const beforeRaw = await evaluate(
         moment.fen,
         REFINE_DEPTH,
-        1,
+        REFINE_MULTIPV,
         REFINE_MOVETIME
       );
       const afterRaw = await evaluate(
         fenAfter,
         REFINE_DEPTH,
-        1,
+        REFINE_MULTIPV,
         REFINE_MOVETIME
       );
       const beforeCp = clampCp(toWhiteCp(moment.fen, beforeRaw.cpWhite));
@@ -1164,18 +1178,30 @@ export async function analyzeOpeningMoments(options: {
       let userAfterPawns = 0;
       if (!explorerDecisive) {
         try {
-          const beforeRaw = await evaluate(
-            fenBefore,
-            SCAN_DEPTH,
-            1,
-            SCAN_MOVETIME
-          );
-          const afterRaw = await evaluate(
-            fenAfter,
-            SCAN_DEPTH,
-            1,
-            SCAN_MOVETIME
-          );
+          const cachedBefore = lookupEval?.(String(game.id), fenBefore);
+          const cachedAfter = lookupEval?.(String(game.id), fenAfter);
+          const beforeRaw = cachedBefore
+            ? {
+                cpWhite: cachedBefore.cpWhite,
+                bestUci: cachedBefore.bestUci,
+              }
+            : await evaluate(
+                fenBefore,
+                SCAN_DEPTH,
+                GLOBAL_MULTIPV,
+                SCAN_MOVETIME || undefined
+              );
+          const afterRaw = cachedAfter
+            ? {
+                cpWhite: cachedAfter.cpWhite,
+                bestUci: cachedAfter.bestUci,
+              }
+            : await evaluate(
+                fenAfter,
+                SCAN_DEPTH,
+                GLOBAL_MULTIPV,
+                SCAN_MOVETIME || undefined
+              );
           const beforeCp = clampCp(toWhiteCp(fenBefore, beforeRaw.cpWhite));
           const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
           const userBefore = userIsWhite ? beforeCp : -beforeCp;
@@ -1588,6 +1614,89 @@ export async function analyzeOpeningMoments(options: {
     thresholdPass,
     baselineAvailable,
   };
+}
+
+export async function refineRecentOpeningCandidates(options: {
+  candidates: MistakeItem[];
+  games: StudyGame[];
+  fallbackCandidates?: MistakeItem[];
+  fallbackGames?: StudyGame[];
+  color: "white" | "black";
+  userRating: number;
+  fetchExplorer: ExplorerFn;
+  fetchMastersPgn: MastersPgnFn;
+  evaluate: EvalFn;
+  onProgress?: (progress: OpeningProgress) => void;
+  signal?: { cancelled: boolean };
+  limit?: number;
+  existingMoments?: OpeningMoment[];
+  lookupEval?: LookupEvalFn;
+}): Promise<OpeningAnalyzeBatchResult> {
+  const limit = options.limit ?? TARGET_OPENING_MOMENTS;
+  const existingMoments = options.existingMoments || [];
+  const periodIds = options.games.map((game) => String(game.id));
+  const primary = selectRecentPeriodCandidates({
+    candidates: options.candidates,
+    periodGameIds: periodIds,
+    limit: Number.MAX_SAFE_INTEGER,
+  });
+  const primaryResult = await analyzeOpeningMoments({
+    games: options.games,
+    color: options.color,
+    userRating: options.userRating,
+    fetchExplorer: options.fetchExplorer,
+    fetchMastersPgn: options.fetchMastersPgn,
+    evaluate: options.evaluate,
+    onProgress: options.onProgress,
+    signal: options.signal,
+    existingMoments,
+    existingCandidates: primary.map(stubOpeningMoment),
+    excludeGameIds: periodIds,
+    appendCount: limit,
+    stopOnStrict: false,
+    thresholdPass: "baseline",
+    lookupEval: options.lookupEval,
+  });
+  const filled = Math.max(
+    0,
+    primaryResult.moments.length - existingMoments.length
+  );
+  const fallbackGames = options.fallbackGames || [];
+  const fallbackCandidates = options.fallbackCandidates || [];
+  if (
+    filled >= limit ||
+    !fallbackCandidates.length ||
+    !fallbackGames.length ||
+    options.signal?.cancelled
+  ) {
+    return primaryResult;
+  }
+  const primaryKeys = new Set(primary.map((item) => candidateKey(item)));
+  const fallbackIds = fallbackGames.map((game) => String(game.id));
+  const fallback = selectRecentPeriodCandidates({
+    candidates: fallbackCandidates,
+    periodGameIds: fallbackIds,
+    limit: Number.MAX_SAFE_INTEGER,
+  }).filter((item) => !primaryKeys.has(candidateKey(item)));
+  if (!fallback.length) return primaryResult;
+  const stillNeed = limit - filled;
+  return analyzeOpeningMoments({
+    games: fallbackGames,
+    color: options.color,
+    userRating: options.userRating,
+    fetchExplorer: options.fetchExplorer,
+    fetchMastersPgn: options.fetchMastersPgn,
+    evaluate: options.evaluate,
+    onProgress: options.onProgress,
+    signal: options.signal,
+    existingMoments: primaryResult.moments,
+    existingCandidates: fallback.map(stubOpeningMoment),
+    excludeGameIds: fallbackIds,
+    appendCount: stillNeed,
+    stopOnStrict: false,
+    thresholdPass: "baseline",
+    lookupEval: options.lookupEval,
+  });
 }
 
 export function validateOpeningMove(

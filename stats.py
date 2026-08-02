@@ -48,7 +48,7 @@ def extract_move_times_from_pgn(pgn_str: str, time_control: str, user_color: str
     if base is None:
         return None
 
-    tags = re.findall(r"\{\[%clk ([^\]]+)\]\}", pgn_str)
+    tags = re.findall(r"\[%clk\s+([^\]]+)\]", pgn_str, flags=re.IGNORECASE)
     if len(tags) < 2:
         return None
 
@@ -86,6 +86,8 @@ def extract_move_times_from_pgn(pgn_str: str, time_control: str, user_color: str
         "opp_longest": max(opp_times),
         "user_moves": len(user_times),
         "opp_moves": len(opp_times),
+        "user_times": user_times,
+        "opp_times": opp_times,
     }
 
 
@@ -94,10 +96,21 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
     if df.empty:
         return {}
 
-    df_sorted = df.sort_values("created_at")
+    work = df.copy()
+    work["created_at"] = pd.to_datetime(work["created_at"], errors="coerce")
+    work["result_norm"] = work["result"].astype(str).str.strip()
+    sort_cols = ["created_at"]
+    ascending = [True]
+    if "id" in work.columns:
+        sort_cols.append("id")
+        ascending.append(True)
+    oldest_first = work.sort_values(
+        sort_cols, ascending=ascending, kind="mergesort"
+    )
+    newest_first = oldest_first.iloc[::-1]
 
-    total_games = len(df)
-    total_moves = df["move_count"].sum()
+    total_games = len(work)
+    total_moves = work["move_count"].sum()
 
     seconds_per_move_map = {
         "bullet": 3,
@@ -106,27 +119,26 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
         "classical": 60,
         "daily": 60,
     }
-    df = df.copy()
-    df["est_seconds"] = df.apply(
+    work["est_seconds"] = work.apply(
         lambda r: r["move_count"]
         * seconds_per_move_map.get(str(r["speed"]).lower(), 8),
         axis=1,
     )
-    total_hours = df["est_seconds"].sum() / 3600
+    total_hours = work["est_seconds"].sum() / 3600
 
     max_win_streak = 0
     curr_win_streak = 0
     max_unbeaten_streak = 0
     curr_unbeaten_streak = 0
 
-    for res in df_sorted["result"]:
+    for res in oldest_first["result_norm"]:
         if res == "Win":
             curr_win_streak += 1
             max_win_streak = max(max_win_streak, curr_win_streak)
         else:
             curr_win_streak = 0
 
-        if res in ["Win", "Draw"]:
+        if res in ("Win", "Draw"):
             curr_unbeaten_streak += 1
             max_unbeaten_streak = max(
                 max_unbeaten_streak, curr_unbeaten_streak
@@ -135,18 +147,16 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
             curr_unbeaten_streak = 0
 
     current_win_streak = 0
-    for res in reversed(list(df_sorted["result"])):
+    for res in newest_first["result_norm"]:
         if res == "Win":
             current_win_streak += 1
-        elif res == "Draw":
             continue
-        else:
-            break
+        break
 
-    day_counts = df["created_at"].dt.day_name().value_counts()
+    day_counts = work["created_at"].dt.day_name().value_counts()
     peak_day = day_counts.index[0] if not day_counts.empty else "N/A"
 
-    hour_counts = df["created_at"].dt.hour.value_counts()
+    hour_counts = work["created_at"].dt.hour.value_counts()
     peak_hour = hour_counts.index[0] if not hour_counts.empty else 0
     peak_hour_str = f"{peak_hour:02d}:00 - {(peak_hour+1)%24:02d}:00"
 
@@ -863,3 +873,559 @@ def calculate_archetype_badges(
         )
 
     return badges
+
+
+_ORTHODOX_NAME_RE = re.compile(
+    r"italian|giuoco|ruy\s*lopez|spanish\s*opening|sicilian|"
+    r"french\s*defen[cs]e|caro[\s-]*kann|queen'?s?\s*gambit|"
+    r"london\s*system|king'?s?\s*indian",
+    re.IGNORECASE,
+)
+
+
+def _eco_number(eco: str):
+    eco = normalize_opening_eco(eco)
+    if len(eco) < 2 or not eco[1:].isdigit():
+        return None, None
+    return eco[0], int(eco[1:])
+
+
+def is_orthodox_opening(eco: str, opening_name: str = "") -> bool:
+    letter, num = _eco_number(eco)
+    if letter is not None and num is not None:
+        if letter == "C" and (
+            0 <= num <= 19 or 50 <= num <= 59 or 60 <= num <= 99
+        ):
+            return True
+        if letter == "B" and 10 <= num <= 99:
+            return True
+        if letter == "D" and 6 <= num <= 69:
+            return True
+        if letter == "E" and 60 <= num <= 99:
+            return True
+
+    name = str(opening_name or "")
+    if _ORTHODOX_NAME_RE.search(name):
+        return True
+    return False
+
+
+def _bucket_games_wr(subset: pd.DataFrame) -> dict:
+    games = int(len(subset))
+    if games == 0:
+        return {"games": 0, "wins": 0, "win_rate": 0.0}
+    wins = int((subset["result"] == "Win").sum())
+    return {
+        "games": games,
+        "wins": wins,
+        "win_rate": round((wins / games) * 100, 1),
+    }
+
+
+def _first_white_move_uci(row: pd.Series) -> str | None:
+    pgn_str = row.get("pgn_str", "") or ""
+    moves_str = row.get("moves_str", "") or ""
+
+    if pgn_str:
+        try:
+            game = chess.pgn.read_game(io.StringIO(pgn_str))
+            if game:
+                moves = list(game.mainline_moves())
+                if moves:
+                    return moves[0].uci()
+        except Exception:
+            pass
+
+        match = re.search(r"1\.\s*(e4|d4|c4|Nf3|g3|b3|f4|b4|Nc3|e3|d3)\b", pgn_str)
+        if match:
+            board = chess.Board()
+            try:
+                return board.parse_san(match.group(1)).uci()
+            except Exception:
+                token = match.group(1)
+                if token == "e4":
+                    return "e2e4"
+                if token == "d4":
+                    return "d2d4"
+
+    if moves_str:
+        board = chess.Board()
+        for token in moves_str.split():
+            try:
+                move = board.parse_san(token)
+                return move.uci()
+            except Exception:
+                continue
+    return None
+
+
+def _opening_context(user_color: str, first_uci: str | None) -> str | None:
+    if first_uci == "e2e4":
+        pawn = "e4"
+    elif first_uci == "d2d4":
+        pawn = "d4"
+    else:
+        return None
+
+    color = str(user_color or "").lower()
+    if color == "white":
+        return f"white_{pawn}"
+    if color == "black":
+        return f"black_vs_{pawn}"
+    return None
+
+
+_CONTEXT_LABELS = {
+    "white_e4": "White 1.e4",
+    "white_d4": "White 1.d4",
+    "black_vs_e4": "Black vs 1.e4",
+    "black_vs_d4": "Black vs 1.d4",
+}
+
+
+def calculate_opening_mix_stats(df: pd.DataFrame) -> dict:
+    empty_bucket = {"games": 0, "wins": 0, "win_rate": 0.0}
+    empty_sigs = {
+        key: {
+            "context": key,
+            "label": label,
+            "opening_eco": None,
+            "opening_name": None,
+            "games": 0,
+        }
+        for key, label in _CONTEXT_LABELS.items()
+    }
+    if df.empty:
+        return {
+            "same_openings": empty_bucket.copy(),
+            "different_openings": empty_bucket.copy(),
+            "orthodox": empty_bucket.copy(),
+            "unorthodox": empty_bucket.copy(),
+            "avg_time_per_move_s": None,
+            "games_with_clock": 0,
+            "signature_openings": empty_sigs,
+        }
+
+    work = df.copy()
+    work["opening_eco"] = work["opening_eco"].apply(normalize_opening_eco)
+    work["opening_name"] = work["opening_name"].fillna("Unknown")
+    work["_first_uci"] = work.apply(_first_white_move_uci, axis=1)
+    work["_context"] = work.apply(
+        lambda r: _opening_context(r.get("user_color"), r.get("_first_uci")),
+        axis=1,
+    )
+
+    signatures = {}
+    for context, label in _CONTEXT_LABELS.items():
+        bucket = work[work["_context"] == context]
+        if bucket.empty:
+            signatures[context] = {
+                "context": context,
+                "label": label,
+                "opening_eco": None,
+                "opening_name": None,
+                "games": 0,
+            }
+            continue
+        eco_mode = bucket["opening_eco"].mode()
+        sig_eco = (
+            eco_mode.iloc[0]
+            if not eco_mode.empty and eco_mode.iloc[0] != "UNK"
+            else None
+        )
+        if sig_eco is None:
+            name_mode = bucket["opening_name"].mode()
+            sig_name = name_mode.iloc[0] if not name_mode.empty else None
+            sig_games = (
+                int((bucket["opening_name"] == sig_name).sum())
+                if sig_name
+                else 0
+            )
+            signatures[context] = {
+                "context": context,
+                "label": label,
+                "opening_eco": None,
+                "opening_name": sig_name,
+                "games": sig_games,
+            }
+        else:
+            name_in_eco = bucket[bucket["opening_eco"] == sig_eco][
+                "opening_name"
+            ].mode()
+            signatures[context] = {
+                "context": context,
+                "label": label,
+                "opening_eco": sig_eco,
+                "opening_name": (
+                    name_in_eco.iloc[0] if not name_in_eco.empty else None
+                ),
+                "games": int((bucket["opening_eco"] == sig_eco).sum()),
+            }
+
+    def _is_same_opening(row) -> bool:
+        context = row.get("_context")
+        if not context or context not in signatures:
+            return False
+        sig = signatures[context]
+        if sig.get("opening_eco"):
+            return row.get("opening_eco") == sig["opening_eco"]
+        if sig.get("opening_name"):
+            return row.get("opening_name") == sig["opening_name"]
+        return False
+
+    same_mask = work.apply(_is_same_opening, axis=1)
+    same = _bucket_games_wr(work[same_mask])
+    different = _bucket_games_wr(work[~same_mask])
+
+    orthodox_mask = work.apply(
+        lambda r: is_orthodox_opening(r["opening_eco"], r["opening_name"]),
+        axis=1,
+    )
+    orthodox = _bucket_games_wr(work[orthodox_mask])
+    unorthodox = _bucket_games_wr(work[~orthodox_mask])
+
+    user_avgs = []
+    for _, row in work.iterrows():
+        parsed = extract_move_times_from_pgn(
+            row.get("pgn_str", ""),
+            row.get("time_control", ""),
+            row.get("user_color", "white"),
+        )
+        if parsed:
+            user_avgs.append(parsed["user_avg"])
+
+    avg_time = (
+        round(sum(user_avgs) / len(user_avgs), 1) if user_avgs else None
+    )
+
+    return {
+        "same_openings": same,
+        "different_openings": different,
+        "orthodox": orthodox,
+        "unorthodox": unorthodox,
+        "avg_time_per_move_s": avg_time,
+        "games_with_clock": len(user_avgs),
+        "signature_openings": signatures,
+    }
+
+
+LOW_PAWN_MOBILITY_MAX = 4
+POSITIONAL_SCAN_FROM_PLY = 16
+
+
+def is_closed_eco(eco: str) -> bool:
+    letter, num = _eco_number(eco)
+    return letter == "D" and num is not None and 0 <= num <= 69
+
+
+def is_semi_closed_eco(eco: str) -> bool:
+    letter, num = _eco_number(eco)
+    if letter is None or num is None:
+        return False
+    if letter == "A":
+        return (
+            40 <= num <= 44
+            or 51 <= num <= 52
+            or 56 <= num <= 79
+            or 80 <= num <= 99
+        )
+    if letter == "D":
+        return 70 <= num <= 99
+    if letter == "E":
+        return 0 <= num <= 9 or 12 <= num <= 99
+    return False
+
+
+def _count_piece(board: chess.Board, piece_type: chess.PieceType, color: chess.Color) -> int:
+    return len(board.pieces(piece_type, color))
+
+
+def _pawn_mobility_both(board: chess.Board) -> int:
+    total = 0
+    for color in (chess.WHITE, chess.BLACK):
+        probe = board.copy(stack=False)
+        probe.turn = color
+        for move in probe.legal_moves:
+            piece = probe.piece_at(move.from_square)
+            if piece and piece.piece_type == chess.PAWN:
+                total += 1
+    return total
+
+
+def _parse_moves_for_positional(row: pd.Series):
+    pgn_str = row.get("pgn_str", "") or ""
+    moves_str = row.get("moves_str", "") or ""
+    moves = []
+    if pgn_str:
+        try:
+            game = chess.pgn.read_game(io.StringIO(pgn_str))
+            if game:
+                moves = list(game.mainline_moves())
+        except Exception:
+            moves = []
+    if not moves and moves_str:
+        board = chess.Board()
+        for token in moves_str.split():
+            try:
+                move = board.parse_san(token)
+                moves.append(move)
+                board.push(move)
+            except Exception:
+                break
+    return moves
+
+
+def _is_bishop_vs_knight(board: chess.Board) -> bool:
+    bw = _count_piece(board, chess.BISHOP, chess.WHITE)
+    bb = _count_piece(board, chess.BISHOP, chess.BLACK)
+    nw = _count_piece(board, chess.KNIGHT, chess.WHITE)
+    nb = _count_piece(board, chess.KNIGHT, chess.BLACK)
+    return (bw > bb and nw < nb) or (bw < bb and nw > nb)
+
+
+def _is_rook_vs_two_minors(board: chess.Board) -> bool:
+    rw = _count_piece(board, chess.ROOK, chess.WHITE)
+    rb = _count_piece(board, chess.ROOK, chess.BLACK)
+    mw = _count_piece(board, chess.KNIGHT, chess.WHITE) + _count_piece(
+        board, chess.BISHOP, chess.WHITE
+    )
+    mb = _count_piece(board, chess.KNIGHT, chess.BLACK) + _count_piece(
+        board, chess.BISHOP, chess.BLACK
+    )
+    rook_diff = rw - rb
+    minor_diff = mw - mb
+    return abs(rook_diff) == 1 and abs(minor_diff) == 2 and rook_diff == -(
+        minor_diff // 2
+    )
+
+
+def _scan_structure_texture(row: pd.Series) -> dict:
+    empty = {
+        "scanned_positions": 0,
+        "locked_positions": 0,
+        "had_locked": False,
+        "pawn_diff_positions": 0,
+        "had_pawn_diff": False,
+        "piece_diff_positions": 0,
+        "had_piece_diff": False,
+        "bishop_vs_knight_positions": 0,
+        "had_bishop_vs_knight": False,
+        "rook_vs_two_minors_positions": 0,
+        "had_rook_vs_two_minors": False,
+        "max_pawn_diff": 0,
+        "max_piece_diff": 0,
+        "pawn_moves": 0,
+        "user_pawn_moves": 0,
+    }
+    moves = _parse_moves_for_positional(row)
+    if not moves:
+        return empty
+
+    user_is_white = str(row.get("user_color", "white")).lower() == "white"
+    user_color = chess.WHITE if user_is_white else chess.BLACK
+
+    board = chess.Board()
+    scanned = 0
+    locked = 0
+    pawn_diff_pos = 0
+    piece_diff_pos = 0
+    bvsn_pos = 0
+    rv2m_pos = 0
+    max_pawn_diff = 0
+    max_piece_diff = 0
+    pawn_moves = 0
+    user_pawn_moves = 0
+
+    for ply, move in enumerate(moves):
+        moving = board.piece_at(move.from_square)
+        if moving and moving.piece_type == chess.PAWN:
+            pawn_moves += 1
+            if board.turn == user_color:
+                user_pawn_moves += 1
+
+        board.push(move)
+        if ply + 1 < POSITIONAL_SCAN_FROM_PLY:
+            continue
+
+        scanned += 1
+        pw = _count_piece(board, chess.PAWN, chess.WHITE)
+        pb = _count_piece(board, chess.PAWN, chess.BLACK)
+        pawn_diff = abs(pw - pb)
+        max_pawn_diff = max(max_pawn_diff, pawn_diff)
+        if pawn_diff >= 1:
+            pawn_diff_pos += 1
+
+        pieces_w = sum(
+            _count_piece(board, pt, chess.WHITE)
+            for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+        )
+        pieces_b = sum(
+            _count_piece(board, pt, chess.BLACK)
+            for pt in (chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN)
+        )
+        piece_diff = abs(pieces_w - pieces_b)
+        max_piece_diff = max(max_piece_diff, piece_diff)
+        if piece_diff >= 1:
+            piece_diff_pos += 1
+
+        if _is_bishop_vs_knight(board):
+            bvsn_pos += 1
+        if _is_rook_vs_two_minors(board):
+            rv2m_pos += 1
+
+        mobility = _pawn_mobility_both(board)
+        if mobility <= LOW_PAWN_MOBILITY_MAX:
+            locked += 1
+
+    return {
+        "scanned_positions": scanned,
+        "locked_positions": locked,
+        "had_locked": locked > 0,
+        "pawn_diff_positions": pawn_diff_pos,
+        "had_pawn_diff": pawn_diff_pos > 0,
+        "piece_diff_positions": piece_diff_pos,
+        "had_piece_diff": piece_diff_pos > 0,
+        "bishop_vs_knight_positions": bvsn_pos,
+        "had_bishop_vs_knight": bvsn_pos > 0,
+        "rook_vs_two_minors_positions": rv2m_pos,
+        "had_rook_vs_two_minors": rv2m_pos > 0,
+        "max_pawn_diff": max_pawn_diff,
+        "max_piece_diff": max_piece_diff,
+        "pawn_moves": pawn_moves,
+        "user_pawn_moves": user_pawn_moves,
+    }
+
+
+def calculate_positional_stats(df: pd.DataFrame) -> dict:
+    empty_bucket = {"games": 0, "wins": 0, "win_rate": 0.0}
+    if df.empty:
+        return {
+            "closed": empty_bucket.copy(),
+            "semi_closed": empty_bucket.copy(),
+            "other": empty_bucket.copy(),
+            "closed_share_pct": 0.0,
+            "semi_closed_share_pct": 0.0,
+        }
+
+    work = df.copy()
+    work["opening_eco"] = work["opening_eco"].apply(normalize_opening_eco)
+    closed_mask = work["opening_eco"].apply(is_closed_eco)
+    semi_mask = work["opening_eco"].apply(is_semi_closed_eco)
+    other_mask = ~(closed_mask | semi_mask)
+
+    closed = _bucket_games_wr(work[closed_mask])
+    semi = _bucket_games_wr(work[semi_mask])
+    other = _bucket_games_wr(work[other_mask])
+    total = len(work)
+
+    return {
+        "closed": closed,
+        "semi_closed": semi,
+        "other": other,
+        "closed_share_pct": round((closed["games"] / total) * 100, 1)
+        if total
+        else 0.0,
+        "semi_closed_share_pct": round((semi["games"] / total) * 100, 1)
+        if total
+        else 0.0,
+    }
+
+
+def calculate_imbalance_mobility_stats(df: pd.DataFrame) -> dict:
+    empty = {
+        "games_scanned": 0,
+        "positions_scanned": 0,
+        "pawn_diff_position_rate_pct": 0.0,
+        "pawn_diff_game_rate_pct": 0.0,
+        "avg_max_pawn_diff": 0.0,
+        "piece_diff_position_rate_pct": 0.0,
+        "piece_diff_game_rate_pct": 0.0,
+        "avg_max_piece_diff": 0.0,
+        "bishop_vs_knight_position_rate_pct": 0.0,
+        "bishop_vs_knight_game_rate_pct": 0.0,
+        "rook_vs_two_minors_position_rate_pct": 0.0,
+        "rook_vs_two_minors_game_rate_pct": 0.0,
+        "locked_position_rate_pct": 0.0,
+        "locked_game_rate_pct": 0.0,
+        "avg_pawn_moves": 0.0,
+        "avg_user_pawn_moves": 0.0,
+    }
+    if df.empty:
+        return empty
+
+    positions_scanned = 0
+    pawn_diff_positions = 0
+    piece_diff_positions = 0
+    bvsn_positions = 0
+    rv2m_positions = 0
+    locked_positions = 0
+
+    games_scanned = 0
+    games_pawn_diff = 0
+    games_piece_diff = 0
+    games_bvsn = 0
+    games_rv2m = 0
+    games_locked = 0
+    max_pawn_diffs = []
+    max_piece_diffs = []
+    pawn_moves_list = []
+    user_pawn_moves_list = []
+
+    for _, row in df.iterrows():
+        scan = _scan_structure_texture(row)
+        if scan["scanned_positions"] <= 0 and scan["pawn_moves"] <= 0:
+            continue
+        games_scanned += 1
+        positions_scanned += scan["scanned_positions"]
+        pawn_diff_positions += scan["pawn_diff_positions"]
+        piece_diff_positions += scan["piece_diff_positions"]
+        bvsn_positions += scan["bishop_vs_knight_positions"]
+        rv2m_positions += scan["rook_vs_two_minors_positions"]
+        locked_positions += scan["locked_positions"]
+        max_pawn_diffs.append(scan["max_pawn_diff"])
+        max_piece_diffs.append(scan["max_piece_diff"])
+        pawn_moves_list.append(scan["pawn_moves"])
+        user_pawn_moves_list.append(scan["user_pawn_moves"])
+        if scan["had_pawn_diff"]:
+            games_pawn_diff += 1
+        if scan["had_piece_diff"]:
+            games_piece_diff += 1
+        if scan["had_bishop_vs_knight"]:
+            games_bvsn += 1
+        if scan["had_rook_vs_two_minors"]:
+            games_rv2m += 1
+        if scan["had_locked"]:
+            games_locked += 1
+
+    def rate(num, den):
+        return round((num / den) * 100, 1) if den else 0.0
+
+    def mean(vals):
+        return round(sum(vals) / len(vals), 1) if vals else 0.0
+
+    return {
+        "games_scanned": games_scanned,
+        "positions_scanned": positions_scanned,
+        "pawn_diff_position_rate_pct": rate(
+            pawn_diff_positions, positions_scanned
+        ),
+        "pawn_diff_game_rate_pct": rate(games_pawn_diff, games_scanned),
+        "avg_max_pawn_diff": mean(max_pawn_diffs),
+        "piece_diff_position_rate_pct": rate(
+            piece_diff_positions, positions_scanned
+        ),
+        "piece_diff_game_rate_pct": rate(games_piece_diff, games_scanned),
+        "avg_max_piece_diff": mean(max_piece_diffs),
+        "bishop_vs_knight_position_rate_pct": rate(
+            bvsn_positions, positions_scanned
+        ),
+        "bishop_vs_knight_game_rate_pct": rate(games_bvsn, games_scanned),
+        "rook_vs_two_minors_position_rate_pct": rate(
+            rv2m_positions, positions_scanned
+        ),
+        "rook_vs_two_minors_game_rate_pct": rate(games_rv2m, games_scanned),
+        "locked_position_rate_pct": rate(locked_positions, positions_scanned),
+        "locked_game_rate_pct": rate(games_locked, games_scanned),
+        "avg_pawn_moves": mean(pawn_moves_list),
+        "avg_user_pawn_moves": mean(user_pawn_moves_list),
+    }

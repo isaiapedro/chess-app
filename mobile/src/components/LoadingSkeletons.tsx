@@ -9,6 +9,7 @@ import {
   type DimensionValue,
   type ViewStyle,
 } from "react-native";
+import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { colors, spacing, withAlpha } from "../theme";
 
 type BoneProps = {
@@ -182,8 +183,12 @@ export function BootSkeleton() {
   );
 }
 
+const TAB_BAR_BODY = 58;
+
 export function ChessPieceLoader() {
   const rotation = useRef(new Animated.Value(0)).current;
+  const insets = useSafeAreaInsets();
+  const tabClearance = TAB_BAR_BODY + Math.max(insets.bottom, 12);
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -201,7 +206,14 @@ export function ChessPieceLoader() {
 
   return (
     <View style={styles.pieceLoaderScreen}>
-      <View style={styles.pieceLoaderTrack}>
+      <View
+        style={[
+          styles.pieceLoaderTrack,
+          {
+            marginTop: -tabClearance / 2,
+          },
+        ]}
+      >
         <Animated.View
           style={[
             styles.pieceLoaderOrbit,
@@ -383,12 +395,14 @@ export function AnalysisLoadingBars({
   candidates = 0,
   target = 5,
   complete = false,
+  progressRatio = null,
   onComplete,
 }: {
   selected?: number;
   candidates?: number;
   target?: number;
   complete?: boolean;
+  progressRatio?: number | null;
   onComplete?: () => void;
 }) {
   const fill = useRef(new Animated.Value(0)).current;
@@ -396,6 +410,7 @@ export function AnalysisLoadingBars({
   const bufferRef = useRef(0);
   const onCompleteRef = useRef(onComplete);
   const [introDone, setIntroDone] = useState(false);
+  const useLinearProgress = progressRatio != null;
   bufferRef.current = bufferProgress(selected, candidates, target);
   onCompleteRef.current = onComplete;
 
@@ -416,17 +431,40 @@ export function AnalysisLoadingBars({
   useEffect(() => {
     const animation = Animated.timing(fill, {
       toValue: INTRO_END,
-      duration: INTRO_MS,
+      duration: useLinearProgress ? Math.round(INTRO_MS * 0.35) : INTRO_MS,
       useNativeDriver: false,
     });
     animation.start(({ finished }) => {
       if (finished) setIntroDone(true);
     });
     return () => animation.stop();
-  }, [fill]);
+  }, [fill, useLinearProgress]);
 
   useEffect(() => {
-    if (!introDone || complete) return;
+    if (!introDone || complete || !useLinearProgress) return;
+    const ratio = Math.max(0, Math.min(1, Number(progressRatio) || 0));
+    const targetFill =
+      INTRO_END + (MIDDLE_RUNNING_LIMIT - INTRO_END) * ratio;
+    let animation: Animated.CompositeAnimation | null = null;
+    fill.stopAnimation((current) => {
+      const from = Math.max(INTRO_END, Number(current) || 0);
+      const to = Math.max(from, targetFill);
+      if (to <= from + 0.0005) return;
+      animation = Animated.timing(fill, {
+        toValue: to,
+        duration: MIDDLE_STEP_MS,
+        easing: Easing.out(Easing.quad),
+        useNativeDriver: false,
+      });
+      animation.start();
+    });
+    return () => {
+      animation?.stop();
+    };
+  }, [introDone, complete, fill, useLinearProgress, progressRatio]);
+
+  useEffect(() => {
+    if (!introDone || complete || useLinearProgress) return;
     let stopped = false;
     let animation: Animated.CompositeAnimation | null = null;
 
@@ -458,7 +496,7 @@ export function AnalysisLoadingBars({
       stopped = true;
       animation?.stop();
     };
-  }, [introDone, complete, fill]);
+  }, [introDone, complete, fill, useLinearProgress]);
 
   useEffect(() => {
     if (!introDone || !complete) return;

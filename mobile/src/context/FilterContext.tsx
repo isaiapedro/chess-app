@@ -23,14 +23,6 @@ const PERIOD_TIMEFRAME: Record<Period, Timeframe> = {
   day: "1 month",
 };
 
-function startOfWeek(d: Date): Date {
-  const copy = new Date(d);
-  const weekday = copy.getDay();
-  copy.setDate(copy.getDate() + (weekday === 0 ? -6 : 1 - weekday));
-  copy.setHours(0, 0, 0, 0);
-  return copy;
-}
-
 function resolveDateRange(
   period: Period,
   selectedDay: Date
@@ -41,10 +33,15 @@ function resolveDateRange(
     return { dateFrom: day, dateTo: day };
   }
   if (period === "week") {
-    return { dateFrom: isoDate(startOfWeek(now)), dateTo: isoDate(now) };
+    const start = new Date(now);
+    start.setDate(start.getDate() - 6);
+    start.setHours(0, 0, 0, 0);
+    return { dateFrom: isoDate(start), dateTo: isoDate(now) };
   }
   if (period === "month") {
-    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const start = new Date(now);
+    start.setDate(start.getDate() - 29);
+    start.setHours(0, 0, 0, 0);
     return { dateFrom: isoDate(start), dateTo: isoDate(now) };
   }
   if (period === "year") {
@@ -68,10 +65,14 @@ function buildPeriodLabel(period: Period, selectedDay: Date): string {
     return `${shortDate(start)} – ${shortDate(now)}`;
   }
   if (period === "month") {
-    return now.toLocaleDateString(undefined, { month: "long", year: "numeric" });
+    const start = new Date(now);
+    start.setDate(start.getDate() - 29);
+    return `${shortDate(start)} – ${shortDate(now)}`;
   }
   if (period === "week") {
-    return `${shortDate(startOfWeek(now))} – ${shortDate(now)}`;
+    const start = new Date(now);
+    start.setDate(start.getDate() - 6);
+    return `${shortDate(start)} – ${shortDate(now)}`;
   }
   if (period === "day") {
     return selectedDay.toLocaleDateString(undefined, {
@@ -95,6 +96,10 @@ type FilterContextValue = {
   periodLabel: string;
   speed: string | null;
   setSpeed: (v: string | null) => void;
+  dayCalendarOpen: boolean;
+  setDayCalendarOpen: (open: boolean) => void;
+  filterChromeBottom: number;
+  setFilterChromeBottom: (n: number) => void;
   queryFilters: QueryFilters;
   refreshToken: number;
   refresh: () => void;
@@ -105,13 +110,20 @@ const FilterContext = createContext<FilterContextValue | null>(null);
 export function FilterProvider({ children }: { children: React.ReactNode }) {
   const [username, setUsername] = useState("pedroisaia");
   const [platform, setPlatform] = useState<Platform>("chesscom");
-  const [period, setPeriod] = useState<Period>("day");
+  const [period, setPeriod] = useState<Period>("month");
   const [selectedDay, setSelectedDay] = useState<Date>(new Date());
   const [speed, setSpeed] = useState<string | null>(null);
+  const [dayCalendarOpen, setDayCalendarOpen] = useState(false);
+  const [filterChromeBottom, setFilterChromeBottom] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
 
   const refresh = useCallback(() => {
     setRefreshToken((n) => n + 1);
+  }, []);
+
+  const setPeriodAndCloseCalendar = useCallback((v: Period) => {
+    setPeriod(v);
+    if (v !== "day") setDayCalendarOpen(false);
   }, []);
 
   const queryFilters = useMemo<QueryFilters>(() => {
@@ -138,12 +150,16 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
       platform,
       setPlatform,
       period,
-      setPeriod,
+      setPeriod: setPeriodAndCloseCalendar,
       selectedDay,
       setSelectedDay,
       periodLabel,
       speed,
       setSpeed,
+      dayCalendarOpen,
+      setDayCalendarOpen,
+      filterChromeBottom,
+      setFilterChromeBottom,
       queryFilters,
       refreshToken,
       refresh,
@@ -152,9 +168,12 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
       username,
       platform,
       period,
+      setPeriodAndCloseCalendar,
       selectedDay,
       periodLabel,
       speed,
+      dayCalendarOpen,
+      filterChromeBottom,
       queryFilters,
       refreshToken,
       refresh,

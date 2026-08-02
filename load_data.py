@@ -153,12 +153,11 @@ def _parse_lichess_games(raw_games: list, username: str) -> pd.DataFrame:
         else:
             time_control = ""
 
+        ended_ms = g.get("lastMoveAt") or g.get("createdAt") or 0
         parsed.append(
             {
                 "id": g.get("id"),
-                "created_at": datetime.fromtimestamp(
-                    g.get("createdAt", 0) / 1000
-                ),
+                "created_at": datetime.fromtimestamp(ended_ms / 1000),
                 "speed": g.get("speed", "blitz"),
                 "user_color": user_color,
                 "user_rating": g.get("players", {})

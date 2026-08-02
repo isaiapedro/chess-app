@@ -9,7 +9,8 @@ import {
   View,
 } from "react-native";
 import { Chess } from "chess.js";
-import { fetchExplorer, fetchMastersPgn, fetchStudyGames, type MistakeItem } from "../api/client";
+import { fetchExplorer, fetchMastersPgn, type MistakeItem } from "../api/client";
+import { ensureStudyGames } from "../storage/analyticsLoaders";
 import { ChessBoard } from "../components/ChessBoard";
 import { OpeningPrepSection } from "../components/OpeningPrepSection";
 import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
@@ -23,15 +24,21 @@ import {
 import { useFilters } from "../context/FilterContext";
 import { TARGET_MISTAKE_MOMENTS } from "../engine/analysisConfig";
 import {
-  analyzeCriticalMistakes,
   formatEval,
   displayCp,
+  refineRecentMistakeCandidates,
   validateMoveLocal,
   type AnalyzeProgress,
   type StudyGame,
   type ThresholdPass,
 } from "../engine/analyzeMistakes";
 import { applyUciMove } from "../engine/chessMoves";
+import { consumeCandidates } from "../engine/candidateBucket";
+import {
+  createEvalLookup,
+  periodReservoirStatus,
+  runGlobalPeriodAnalysis,
+} from "../engine/globalAnalysis";
 import { cancelStudyPrefetch } from "../engine/studyPrefetch";
 import { useStockfish } from "../engine/StockfishProvider";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
@@ -123,6 +130,7 @@ export function StudyScreen() {
   }, []);
   const [analyzeLog, setAnalyzeLog] = useState<string[]>([]);
   const [remainingGames, setRemainingGames] = useState(0);
+  const [periodComplete, setPeriodComplete] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [scanExhausted, setScanExhausted] = useState(false);
   const [showScanMore, setShowScanMore] = useState(false);
@@ -234,6 +242,22 @@ export function StudyScreen() {
     }
   }, []);
 
+  const syncMistakeReservoir = useCallback(
+    async (games: StudyGame[], pendingLen: number) => {
+      const status = await periodReservoirStatus(
+        queryFilters,
+        games,
+        "mistake",
+        { pendingCount: pendingLen }
+      );
+      setRemainingGames(status.remaining);
+      setPeriodComplete(status.complete);
+      setScanExhausted(status.exhausted);
+      return status;
+    },
+    [queryFilters]
+  );
+
   const loadMistakes = useCallback(async (force = false) => {
     if (!engineReady && !force) {
       const cached = parseMistakesCache(
@@ -256,17 +280,19 @@ export function StudyScreen() {
         setRemainingGames(cached.remaining);
         thresholdPassRef.current = cached.thresholdPass || "strict";
         baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-        setScanExhausted(
-          (cached.thresholdPass || "strict") === "baseline" &&
-            cached.remaining <= 0 &&
-            !(cached.pendingCandidates || []).length
-        );
         setShowScanMore(false);
         setMistakesError(null);
         loadedCacheKeyRef.current = mistakesCacheKey;
         setLoadingMistakes(false);
         setAnalyzeStatus(null);
         setAnalyzeProgress(null);
+        void ensureStudyGames(queryFilters, false).then((games) => {
+          studyGamesRef.current = games;
+          void syncMistakeReservoir(
+            games,
+            (cached.pendingCandidates || []).length
+          );
+        });
         return;
       }
     }
@@ -301,17 +327,19 @@ export function StudyScreen() {
         setRemainingGames(cached.remaining);
         thresholdPassRef.current = cached.thresholdPass || "strict";
         baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-        setScanExhausted(
-          (cached.thresholdPass || "strict") === "baseline" &&
-            cached.remaining <= 0 &&
-            !(cached.pendingCandidates || []).length
-        );
         setShowScanMore(false);
         setMistakesError(null);
         loadedCacheKeyRef.current = mistakesCacheKey;
         setLoadingMistakes(false);
         setAnalyzeStatus(null);
         setAnalyzeProgress(null);
+        void ensureStudyGames(queryFilters, false).then((games) => {
+          studyGamesRef.current = games;
+          void syncMistakeReservoir(
+            games,
+            (cached.pendingCandidates || []).length
+          );
+        });
         return;
       }
     }
@@ -332,87 +360,112 @@ export function StudyScreen() {
     setQuizCorrect(null);
     setRevealed(false);
     setScanExhausted(false);
+    setPeriodComplete(false);
     setShowScanMore(false);
     setAnalyzeLog([]);
     setAnalyzeProgress(null);
     setAnalyzeStatus("Loading recent games…");
     let completed = false;
     try {
-      const rows = await fetchStudyGames(queryFilters, force);
-      const games = rows.map(
-        (row): StudyGame => ({
-          id: String(row.id || ""),
-          created_at: String(row.created_at || ""),
-          speed: row.speed ? String(row.speed) : undefined,
-          user_color: String(row.user_color || "white"),
-          result: String(row.result || ""),
-          opening_name: row.opening_name ? String(row.opening_name) : undefined,
-          opening_eco: row.opening_eco ? String(row.opening_eco) : undefined,
-          opponent_name: row.opponent_name
-            ? String(row.opponent_name)
-            : undefined,
-          pgn_str: row.pgn_str ? String(row.pgn_str) : undefined,
-          moves_str: row.moves_str ? String(row.moves_str) : undefined,
-        })
-      );
+      const games = await ensureStudyGames(queryFilters, force);
       studyGamesRef.current = games;
-      const batch = await analyzeCriticalMistakes({
-        games,
+      setAnalyzeStatus("Global Stockfish scan…");
+      let delivered = false;
+      const applyBatch = async (
+        batch: Awaited<ReturnType<typeof refineRecentMistakeCandidates>>,
+        candidates: MistakeItem[]
+      ) => {
+        await consumeCandidates(queryFilters, "mistake", candidates);
+        if (signal.cancelled) return;
+        scannedIdsRef.current = batch.scannedGameIds;
+        pendingCandidatesRef.current = batch.pendingCandidates;
+        deferredCandidatesRef.current = batch.deferredCandidates;
+        setPendingCount(batch.pendingCandidates.length);
+        thresholdPassRef.current = batch.thresholdPass;
+        baselineAvailableRef.current = batch.baselineAvailable;
+        const reservoir = await syncMistakeReservoir(
+          games,
+          batch.pendingCandidates.length
+        );
+        setMistakes(batch.moments);
+        setIdx(0);
+        visibleBatchStartRef.current = 0;
+        pendingBatchRef.current = null;
+        setPendingReady(false);
+        secondPagePrefetchKeyRef.current = null;
+        loadedCacheKeyRef.current = mistakesCacheKey;
+        if (batch.moments.length) {
+          await writeCache(mistakesCacheKey, {
+            moments: batch.moments,
+            pendingCandidates: batch.pendingCandidates,
+            deferredCandidates: batch.deferredCandidates,
+            scannedGameIds: batch.scannedGameIds,
+            remaining: reservoir.remaining,
+            thresholdPass: batch.thresholdPass,
+            baselineAvailable: batch.baselineAvailable,
+          } satisfies MistakesCachePayload);
+          setMistakesError(null);
+          setLoadingMistakes(false);
+          setAnalysisComplete(true);
+          delivered = true;
+          completed = true;
+        }
+      };
+
+      await runGlobalPeriodAnalysis({
+        filters: queryFilters,
         evaluate,
         signal,
-        thresholdPass: "strict",
-        fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
-        fetchExplorer: async (fen, source) => {
-          const res = await fetchExplorer(fen, source);
-          return {
-            moves: res.moves || [],
-            topGames: res.topGames || [],
-          };
+        games,
+        earlyMistakeTarget: TARGET_MISTAKE_MOMENTS,
+        onProgress: (p) => {
+          if (delivered) return;
+          setAnalyzeStatus(p.status);
+          setAnalyzeProgress({
+            gamesScanned: p.gamesDone,
+            positionsChecked: 0,
+            found: 0,
+            candidates: 0,
+            selected: 0,
+            status: p.status,
+            phase: p.phase === "done" ? "refine" : "scan",
+            engine: p.engine,
+            currentGame: p.currentGame,
+          });
         },
-        onProgress: pushProgress,
+        onEarlyMistakesReady: async (candidates, state) => {
+          if (signal.cancelled || delivered) return false;
+          setAnalyzeStatus("Refining recent candidates…");
+          const pool = state.mistakeCandidates.length
+            ? state.mistakeCandidates
+            : candidates;
+          const batch = await refineRecentMistakeCandidates({
+            candidates: pool,
+            games,
+            evaluate,
+            signal,
+            limit: TARGET_MISTAKE_MOMENTS,
+            lookupEval: createEvalLookup(state),
+            fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
+            fetchExplorer: async (fen, source) => {
+              const res = await fetchExplorer(fen, source);
+              return {
+                moves: res.moves || [],
+                topGames: res.topGames || [],
+              };
+            },
+            onProgress: pushProgress,
+          });
+          await applyBatch(batch, batch.moments);
+          return true;
+        },
       });
       if (signal.cancelled) return;
-      scannedIdsRef.current = batch.scannedGameIds;
-      pendingCandidatesRef.current = batch.pendingCandidates;
-      deferredCandidatesRef.current = batch.deferredCandidates;
-      setPendingCount(batch.pendingCandidates.length);
-      setRemainingGames(batch.remaining);
-      thresholdPassRef.current = batch.thresholdPass;
-      baselineAvailableRef.current = batch.baselineAvailable;
-      setScanExhausted(
-        batch.thresholdPass === "baseline" &&
-          batch.remaining <= 0 &&
-          batch.pendingCandidates.length === 0
-      );
-      setMistakes(batch.moments);
-      setIdx(0);
-      visibleBatchStartRef.current = 0;
-      pendingBatchRef.current = null;
-      setPendingReady(false);
-      secondPagePrefetchKeyRef.current = null;
-      loadedCacheKeyRef.current = mistakesCacheKey;
-      if (batch.moments.length) {
-        await writeCache(mistakesCacheKey, {
-          moments: batch.moments,
-          pendingCandidates: batch.pendingCandidates,
-          deferredCandidates: batch.deferredCandidates,
-          scannedGameIds: batch.scannedGameIds,
-          remaining: batch.remaining,
-          thresholdPass: batch.thresholdPass,
-          baselineAvailable: batch.baselineAvailable,
-        } satisfies MistakesCachePayload);
-        setMistakesError(null);
-      } else {
+      if (!delivered) {
         setMistakesError("No critical swings found in recent games.");
-        if (
-          batch.remaining > 0 ||
-          batch.pendingCandidates.length > 0 ||
-          batch.baselineAvailable
-        ) {
-          setShowScanMore(true);
-        }
+        setShowScanMore(true);
+        completed = true;
       }
-      completed = true;
     } catch (e) {
       if (signal.cancelled) return;
       setMistakes([]);
@@ -433,6 +486,7 @@ export function StudyScreen() {
     queryFilters,
     mistakesCacheKey,
     pushProgress,
+    syncMistakeReservoir,
   ]);
 
   const continueScanMistakes = useCallback(async (silent = false) => {
@@ -445,25 +499,11 @@ export function StudyScreen() {
     ) {
       return;
     }
-    const canBaseline =
-      baselineAvailableRef.current ||
-      (thresholdPassRef.current === "strict" &&
-        remainingGames <= 0 &&
-        pendingCandidatesRef.current.length === 0);
-    if (
-      remainingGames <= 0 &&
-      pendingCandidatesRef.current.length === 0 &&
-      !canBaseline
-    ) {
-      return;
-    }
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
     const keptMoments = mistakesRef.current;
-    const nextPass: ThresholdPass = canBaseline ? "baseline" : "strict";
     const carriedCandidates = pendingCandidatesRef.current;
-    const carriedDeferred = deferredCandidatesRef.current;
     if (!silent) {
       setShowScanMore(false);
       setAllDone(false);
@@ -479,18 +519,11 @@ export function StudyScreen() {
         found: 0,
         candidates: 0,
         selected: 0,
-        status:
-          nextPass === "baseline"
-            ? "Baseline pass · broader threshold…"
-            : "Scanning next batch…",
+        status: "Scanning next batch…",
         phase: "scan",
         engine: "Stockfish",
       });
-      setAnalyzeStatus(
-        nextPass === "baseline"
-          ? "Baseline pass · broader threshold…"
-          : "Scanning next batch…"
-      );
+      setAnalyzeStatus("Scanning next batch…");
     }
     cancelStudyPrefetch();
     if (silent) {
@@ -503,41 +536,18 @@ export function StudyScreen() {
     try {
       let games = studyGamesRef.current;
       if (!games.length) {
-        const rows = await fetchStudyGames(queryFilters, false);
-        games = rows.map(
-          (row): StudyGame => ({
-            id: String(row.id || ""),
-            created_at: String(row.created_at || ""),
-            speed: row.speed ? String(row.speed) : undefined,
-            user_color: String(row.user_color || "white"),
-            result: String(row.result || ""),
-            opening_name: row.opening_name
-              ? String(row.opening_name)
-              : undefined,
-            opening_eco: row.opening_eco ? String(row.opening_eco) : undefined,
-            opponent_name: row.opponent_name
-              ? String(row.opponent_name)
-              : undefined,
-            pgn_str: row.pgn_str ? String(row.pgn_str) : undefined,
-            moves_str: row.moves_str ? String(row.moves_str) : undefined,
-          })
-        );
+        games = await ensureStudyGames(queryFilters, false);
         studyGamesRef.current = games;
       }
 
-      const batch = await analyzeCriticalMistakes({
+      const refineOpts = {
         games,
         evaluate,
         signal,
-        excludeGameIds: nextPass === "baseline" ? [] : scannedIdsRef.current,
+        limit: TARGET_MISTAKE_MOMENTS,
         existingMoments: keptMoments,
-        existingCandidates: carriedCandidates,
-        existingDeferred: carriedDeferred,
-        appendCount: TARGET_MISTAKE_MOMENTS,
-        stopOnStrict: nextPass === "strict",
-        thresholdPass: nextPass,
-        fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
-        fetchExplorer: async (fen, source) => {
+        fetchMastersPgn: async (gameId: string) => fetchMastersPgn(gameId),
+        fetchExplorer: async (fen: string, source: "masters" | "lichess") => {
           const res = await fetchExplorer(fen, source);
           return {
             moves: res.moves || [],
@@ -545,22 +555,85 @@ export function StudyScreen() {
           };
         },
         onProgress: silent ? undefined : pushProgress,
-      });
-      if (signal.cancelled) return;
-      scannedIdsRef.current =
-        nextPass === "baseline"
-          ? batch.scannedGameIds
-          : [...scannedIdsRef.current, ...batch.scannedGameIds];
+      };
+
+      let batch: Awaited<
+        ReturnType<typeof refineRecentMistakeCandidates>
+      > | null = null;
+      let taken: MistakeItem[] = [];
+
+      const vault = await periodReservoirStatus(
+        queryFilters,
+        games,
+        "mistake",
+        {
+          pendingCount: carriedCandidates.length,
+          batchLimit: Number.MAX_SAFE_INTEGER,
+        }
+      );
+
+      if (vault.batch.length || carriedCandidates.length) {
+        batch = await refineRecentMistakeCandidates({
+          ...refineOpts,
+          candidates: [...carriedCandidates, ...vault.batch],
+          lookupEval: createEvalLookup(vault.state),
+        });
+        taken = batch.moments.slice(keptMoments.length);
+        await consumeCandidates(queryFilters, "mistake", taken);
+      } else if (!vault.complete) {
+        const early: {
+          batch: Awaited<
+            ReturnType<typeof refineRecentMistakeCandidates>
+          > | null;
+          taken: MistakeItem[];
+        } = { batch: null, taken: [] };
+        await runGlobalPeriodAnalysis({
+          filters: queryFilters,
+          evaluate,
+          signal,
+          games,
+          earlyMistakeTarget: TARGET_MISTAKE_MOMENTS,
+          onEarlyMistakesReady: async (candidates, state) => {
+            if (signal.cancelled || early.batch) return false;
+            const pool = state.mistakeCandidates.length
+              ? state.mistakeCandidates
+              : candidates;
+            early.batch = await refineRecentMistakeCandidates({
+              ...refineOpts,
+              candidates: [...carriedCandidates, ...pool],
+              lookupEval: createEvalLookup(state),
+            });
+            early.taken = early.batch.moments.slice(keptMoments.length);
+            await consumeCandidates(queryFilters, "mistake", early.taken);
+            return true;
+          },
+        });
+        batch = early.batch;
+        taken = early.taken;
+      } else {
+        setScanExhausted(true);
+        setRemainingGames(0);
+        setPeriodComplete(true);
+        if (!silent) {
+          setShowScanMore(false);
+          setAllDone(true);
+        }
+        return;
+      }
+
+      if (signal.cancelled || !batch) return;
+      scannedIdsRef.current = [
+        ...scannedIdsRef.current,
+        ...batch.scannedGameIds,
+      ];
       pendingCandidatesRef.current = batch.pendingCandidates;
       deferredCandidatesRef.current = batch.deferredCandidates;
       setPendingCount(batch.pendingCandidates.length);
-      setRemainingGames(batch.remaining);
       thresholdPassRef.current = batch.thresholdPass;
       baselineAvailableRef.current = batch.baselineAvailable;
-      setScanExhausted(
-        batch.thresholdPass === "baseline" &&
-          batch.remaining <= 0 &&
-          batch.pendingCandidates.length === 0
+      const reservoir = await syncMistakeReservoir(
+        games,
+        batch.pendingCandidates.length
       );
 
       const hasNew = batch.moments.length > keptMoments.length;
@@ -571,7 +644,7 @@ export function StudyScreen() {
             pendingCandidates: batch.pendingCandidates,
             deferredCandidates: batch.deferredCandidates,
             scannedGameIds: scannedIdsRef.current,
-            remaining: batch.remaining,
+            remaining: reservoir.remaining,
             thresholdPass: batch.thresholdPass,
             baselineAvailable: batch.baselineAvailable,
             previousLength: keptMoments.length,
@@ -583,7 +656,7 @@ export function StudyScreen() {
           pendingCandidates: batch.pendingCandidates,
           deferredCandidates: batch.deferredCandidates,
           scannedGameIds: scannedIdsRef.current,
-          remaining: batch.remaining,
+          remaining: reservoir.remaining,
           thresholdPass: batch.thresholdPass,
           baselineAvailable: batch.baselineAvailable,
         } satisfies MistakesCachePayload);
@@ -601,17 +674,13 @@ export function StudyScreen() {
           pendingCandidates: batch.pendingCandidates,
           deferredCandidates: batch.deferredCandidates,
           scannedGameIds: scannedIdsRef.current,
-          remaining: batch.remaining,
+          remaining: reservoir.remaining,
           thresholdPass: batch.thresholdPass,
           baselineAvailable: batch.baselineAvailable,
         } satisfies MistakesCachePayload);
         if (!hasNew) {
           setMistakesError("No further critical swings found.");
-          if (
-            batch.remaining > 0 ||
-            batch.pendingCandidates.length > 0 ||
-            batch.baselineAvailable
-          ) {
+          if (!reservoir.exhausted || batch.baselineAvailable) {
             setShowScanMore(true);
           } else {
             setAllDone(true);
@@ -665,12 +734,13 @@ export function StudyScreen() {
   }, [
     engineReady,
     scanningMore,
-    remainingGames,
+    scanExhausted,
     evaluate,
     queryFilters,
     mistakesCacheKey,
     pushProgress,
     resetQuizChrome,
+    syncMistakeReservoir,
   ]);
 
   const applyPendingMistakesBatch = useCallback(() => {
@@ -720,11 +790,18 @@ export function StudyScreen() {
     ) {
       return;
     }
+    // #region agent log
+    const { DEBUG_DISABLE_BACKGROUND_JOBS } = require("../engine/debugFlags");
+    if (DEBUG_DISABLE_BACKGROUND_JOBS) {
+      console.log("[bg-off] StudyScreen second-page scan skipped");
+      return;
+    }
+    // #endregion
     const canLoadMore =
       remainingGames > 0 ||
       pendingCount > 0 ||
-      baselineAvailableRef.current ||
-      thresholdPassRef.current === "strict";
+      !periodComplete ||
+      baselineAvailableRef.current;
     if (!canLoadMore) return;
     const key = `${mistakesCacheKey}:batch:${visibleBatchStartRef.current}`;
     if (secondPagePrefetchKeyRef.current === key) return;
@@ -739,6 +816,7 @@ export function StudyScreen() {
     pendingReady,
     remainingGames,
     pendingCount,
+    periodComplete,
     mistakesCacheKey,
     continueScanMistakes,
   ]);
@@ -841,7 +919,8 @@ export function StudyScreen() {
 
   const canScanMoreMistakes =
     pendingReady ||
-    ((remainingGames > 0 || pendingCount > 0) && !scanExhausted);
+    (!scanExhausted &&
+      (remainingGames > 0 || pendingCount > 0 || !periodComplete));
 
   const nextMistake = () => {
     if (idx >= mistakes.length - 1) {
@@ -951,10 +1030,19 @@ export function StudyScreen() {
             </View>
           ) : null}
           {allDone ? (
-            <Text style={[styles.muted, { marginTop: spacing.sm }]}>
-              That&apos;s all for today — every candidate position from these
-              games has been reviewed.
-            </Text>
+            <View style={[styles.center, { marginTop: spacing.sm, gap: spacing.md }]}>
+              <Text style={styles.muted}>
+                That&apos;s all for today — every candidate position from these
+                games has been reviewed.
+              </Text>
+              <BrutalButton
+                label="Go Back"
+                onPress={() => {
+                  setAllDone(false);
+                  setShowScanMore(false);
+                }}
+              />
+            </View>
           ) : null}
 
           {current && !showScanMore && !allDone ? (

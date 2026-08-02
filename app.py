@@ -10,8 +10,20 @@ from stats import (
     calculate_endgame_stats,
     calculate_headline_stats,
     calculate_notation_stats,
+    calculate_opening_mix_stats,
     calculate_opening_stats,
+    calculate_positional_stats,
+    calculate_imbalance_mobility_stats,
     normalize_opening_eco,
+)
+from style_metrics import (
+    DEFAULT_ENGINE,
+    calculate_style_metrics,
+)
+from baselines import (
+    infer_user_band_speed,
+    load_baselines,
+    population_caption,
 )
 from eco_names import build_eco_name_map, format_eco_label
 
@@ -247,7 +259,822 @@ badges = calculate_archetype_badges(
     headline, opening, notation, endgame, conditional
 )
 
+
+st.sidebar.divider()
+page = st.sidebar.radio(
+    "📄 Page",
+    options=["Dashboard", "Opening Mix", "Positional"],
+    index=0,
+    help="Dashboard / Opening Mix / Positional structure prefs.",
+)
+
 st.divider()
+
+if page == "Positional":
+    positional = calculate_positional_stats(df)
+
+    closed = positional["closed"]
+    semi = positional["semi_closed"]
+    other = positional["other"]
+
+    st.subheader("🧱 Positional")
+    st.caption(
+        "Closed = ECO D00–D69. "
+        "Semi-closed = A40–44, A51–52, A56–79, A80–99, D70–99, E00–09, E12–99."
+    )
+
+    st.markdown("#### Opening Structure Preference")
+    p1, p2, p3 = st.columns(3)
+    with p1:
+        st.metric("Closed — Games", f"{closed['games']:,}")
+        st.metric("Closed — Win %", f"{closed['win_rate']}%")
+        st.caption(f"Share of sample: {positional['closed_share_pct']}%")
+    with p2:
+        st.metric("Semi-Closed — Games", f"{semi['games']:,}")
+        st.metric("Semi-Closed — Win %", f"{semi['win_rate']}%")
+        st.caption(f"Share of sample: {positional['semi_closed_share_pct']}%")
+    with p3:
+        st.metric("Other — Games", f"{other['games']:,}")
+        st.metric("Other — Win %", f"{other['win_rate']}%")
+        st.caption(
+            f"Open / unclassified share: "
+            f"{round(100 - positional['closed_share_pct'] - positional['semi_closed_share_pct'], 1)}%"
+        )
+
+    struct_df = pd.DataFrame(
+        [
+            {
+                "Structure": "Closed",
+                "Games": closed["games"],
+                "Win %": closed["win_rate"],
+            },
+            {
+                "Structure": "Semi-Closed",
+                "Games": semi["games"],
+                "Win %": semi["win_rate"],
+            },
+            {
+                "Structure": "Other",
+                "Games": other["games"],
+                "Win %": other["win_rate"],
+            },
+        ]
+    )
+    s1, s2 = st.columns(2)
+    with s1:
+        fig, ax = plt.subplots(figsize=(5, 3.5))
+        sns.barplot(
+            data=struct_df,
+            x="Structure",
+            y="Games",
+            ax=ax,
+            hue="Structure",
+            legend=False,
+            palette="Blues_d",
+        )
+        ax.set_title("Games by Structure", fontweight="bold")
+        st.pyplot(fig)
+        plt.close(fig)
+    with s2:
+        fig, ax = plt.subplots(figsize=(5, 3.5))
+        sns.barplot(
+            data=struct_df,
+            x="Structure",
+            y="Win %",
+            ax=ax,
+            hue="Structure",
+            legend=False,
+            palette="Greens_d",
+        )
+        ax.set_ylim(0, 100)
+        ax.set_title("Win % by Structure", fontweight="bold")
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.stop()
+
+if page == "Opening Mix":
+    mix = calculate_opening_mix_stats(df)
+    same = mix["same_openings"]
+    diff = mix["different_openings"]
+    ortho = mix["orthodox"]
+    unortho = mix["unorthodox"]
+    baselines_df = load_baselines()
+    peer_band, peer_speed = infer_user_band_speed(df, speed_filter)
+    mix_total = int(same["games"]) + int(diff["games"])
+    same_rate = (
+        round((same["games"] / mix_total) * 100, 1) if mix_total else None
+    )
+    diff_rate = (
+        round((diff["games"] / mix_total) * 100, 1) if mix_total else None
+    )
+    ortho_rate = (
+        round((ortho["games"] / mix_total) * 100, 1) if mix_total else None
+    )
+    unortho_rate = (
+        round((unortho["games"] / mix_total) * 100, 1) if mix_total else None
+    )
+
+    def _peer(metric: str, user_val, unit: str = ""):
+        return population_caption(
+            baselines_df, metric, peer_band, peer_speed, user_val, unit
+        )
+
+    st.subheader("♟️ Opening Mix")
+    st.caption(
+        "Same = games in your 4 signature openings "
+        "(top ECO for White 1.e4, White 1.d4, Black vs 1.e4, Black vs 1.d4). "
+        "Different = everything else. "
+        "Orthodox = Italian, Ruy Lopez, Sicilian, French, Caro-Kann, "
+        "Queen's Gambit, London System, King's Indian."
+    )
+    if baselines_df is not None and peer_band and peer_speed:
+        st.caption(
+            f"Population baseline: Lichess peers in **{peer_band}** · "
+            f"**{peer_speed}** (means from stratified dump sample; "
+            f"eval metrics from Lichess-analyzed subset only)."
+        )
+    elif baselines_df is None:
+        st.caption(
+            "No population baselines loaded. Run "
+            "`scripts/run_lichess_baselines_month.py --month YYYY-MM` "
+            "to generate `.cache/baselines/opening_mix_lichess_v1`."
+        )
+
+    sigs = mix.get("signature_openings") or {}
+    if sigs:
+        st.markdown("#### Signature Openings (4)")
+        sig_cols = st.columns(4)
+        for idx, key in enumerate(
+            ["white_e4", "white_d4", "black_vs_e4", "black_vs_d4"]
+        ):
+            sig = sigs.get(key) or {}
+            with sig_cols[idx]:
+                label = sig.get("label", key)
+                eco = sig.get("opening_eco")
+                name = sig.get("opening_name") or "N/A"
+                if eco:
+                    title = format_eco_label(eco, eco_map)
+                else:
+                    title = name
+                st.metric(label, title)
+                st.caption(f"{sig.get('games', 0)} games in signature")
+
+    st.markdown("#### Same vs Different Openings")
+    o1, o2 = st.columns(2)
+    with o1:
+        st.metric("Same Openings — Games", f"{same['games']:,}")
+        st.metric("Same Openings — Win %", f"{same['win_rate']}%")
+        peer = _peer("same_opening_rate", same_rate, "%")
+        if peer:
+            st.caption(peer)
+    with o2:
+        st.metric("Different Openings — Games", f"{diff['games']:,}")
+        st.metric("Different Openings — Win %", f"{diff['win_rate']}%")
+        peer = _peer("different_opening_rate", diff_rate, "%")
+        if peer:
+            st.caption(peer)
+
+    st.divider()
+    st.markdown("#### Orthodox vs Unorthodox")
+    o3, o4 = st.columns(2)
+    with o3:
+        st.metric("Orthodox — Games", f"{ortho['games']:,}")
+        st.metric("Orthodox — Win %", f"{ortho['win_rate']}%")
+        peer = _peer("orthodox_rate", ortho_rate, "%")
+        if peer:
+            st.caption(peer)
+    with o4:
+        st.metric("Unorthodox — Games", f"{unortho['games']:,}")
+        st.metric("Unorthodox — Win %", f"{unortho['win_rate']}%")
+        peer = _peer("unorthodox_rate", unortho_rate, "%")
+        if peer:
+            st.caption(peer)
+
+    chart_df = pd.DataFrame(
+        [
+            {
+                "Bucket": "Same",
+                "Games": same["games"],
+                "Win %": same["win_rate"],
+            },
+            {
+                "Bucket": "Different",
+                "Games": diff["games"],
+                "Win %": diff["win_rate"],
+            },
+            {
+                "Bucket": "Orthodox",
+                "Games": ortho["games"],
+                "Win %": ortho["win_rate"],
+            },
+            {
+                "Bucket": "Unorthodox",
+                "Games": unortho["games"],
+                "Win %": unortho["win_rate"],
+            },
+        ]
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        fig, ax = plt.subplots(figsize=(5, 3.5))
+        sns.barplot(
+            data=chart_df,
+            x="Bucket",
+            y="Games",
+            ax=ax,
+            hue="Bucket",
+            legend=False,
+            palette="Blues_d",
+        )
+        ax.set_title("Games by Bucket", fontweight="bold")
+        st.pyplot(fig)
+        plt.close(fig)
+    with c2:
+        fig, ax = plt.subplots(figsize=(5, 3.5))
+        sns.barplot(
+            data=chart_df,
+            x="Bucket",
+            y="Win %",
+            ax=ax,
+            hue="Bucket",
+            legend=False,
+            palette="Greens_d",
+        )
+        ax.set_ylim(0, 100)
+        ax.set_title("Win % by Bucket", fontweight="bold")
+        st.pyplot(fig)
+        plt.close(fig)
+
+    st.divider()
+    with st.spinner("Scanning material imbalance & pawn mobility…"):
+        texture = calculate_imbalance_mobility_stats(df)
+
+    st.markdown("#### Material Imbalance")
+    st.caption(
+        "From ply 16 onward. Pawn/piece diffs = unequal counts. "
+        "Bishop vs knight = opposite B/N skew. "
+        "Rook vs two minors = ±1 rook and ∓2 minors."
+    )
+    m1, m2, m3, m4 = st.columns(4)
+    with m1:
+        st.metric(
+            "Pawn Differential",
+            f"{texture['pawn_diff_game_rate_pct']}% games",
+        )
+        st.caption(
+            f"{texture['pawn_diff_position_rate_pct']}% positions · "
+            f"avg max |Δpawns| {texture['avg_max_pawn_diff']}"
+        )
+        peer = _peer(
+            "pawn_diff_game_rate_pct",
+            texture["pawn_diff_game_rate_pct"],
+            "%",
+        )
+        if peer:
+            st.caption(peer)
+    with m2:
+        st.metric(
+            "Piece Differential",
+            f"{texture['piece_diff_game_rate_pct']}% games",
+        )
+        st.caption(
+            f"{texture['piece_diff_position_rate_pct']}% positions · "
+            f"avg max |Δpieces| {texture['avg_max_piece_diff']}"
+        )
+        peer = _peer(
+            "piece_diff_game_rate_pct",
+            texture["piece_diff_game_rate_pct"],
+            "%",
+        )
+        if peer:
+            st.caption(peer)
+    with m3:
+        st.metric(
+            "Bishop vs Knight",
+            f"{texture['bishop_vs_knight_game_rate_pct']}% games",
+        )
+        st.caption(
+            f"{texture['bishop_vs_knight_position_rate_pct']}% positions"
+        )
+        peer = _peer(
+            "bishop_vs_knight_game_rate_pct",
+            texture["bishop_vs_knight_game_rate_pct"],
+            "%",
+        )
+        if peer:
+            st.caption(peer)
+    with m4:
+        st.metric(
+            "Rook vs Two Minors",
+            f"{texture['rook_vs_two_minors_game_rate_pct']}% games",
+        )
+        st.caption(
+            f"{texture['rook_vs_two_minors_position_rate_pct']}% positions"
+        )
+        peer = _peer(
+            "rook_vs_two_minors_game_rate_pct",
+            texture["rook_vs_two_minors_game_rate_pct"],
+            "%",
+        )
+        if peer:
+            st.caption(peer)
+
+    imb_df = pd.DataFrame(
+        [
+            {
+                "Type": "Pawn Δ",
+                "Games %": texture["pawn_diff_game_rate_pct"],
+                "Positions %": texture["pawn_diff_position_rate_pct"],
+            },
+            {
+                "Type": "Piece Δ",
+                "Games %": texture["piece_diff_game_rate_pct"],
+                "Positions %": texture["piece_diff_position_rate_pct"],
+            },
+            {
+                "Type": "B vs N",
+                "Games %": texture["bishop_vs_knight_game_rate_pct"],
+                "Positions %": texture["bishop_vs_knight_position_rate_pct"],
+            },
+            {
+                "Type": "R vs 2 minors",
+                "Games %": texture["rook_vs_two_minors_game_rate_pct"],
+                "Positions %": texture["rook_vs_two_minors_position_rate_pct"],
+            },
+        ]
+    )
+    imb_long = imb_df.melt(
+        id_vars=["Type"], var_name="Scope", value_name="Rate %"
+    )
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    sns.barplot(
+        data=imb_long,
+        x="Type",
+        y="Rate %",
+        hue="Scope",
+        ax=ax,
+        palette="Blues_d",
+    )
+    ax.set_ylim(0, 100)
+    ax.set_title("Material Imbalance Frequency", fontweight="bold")
+    st.pyplot(fig)
+    plt.close(fig)
+
+    st.markdown("#### Pawn Mobility")
+    pm1, pm2, pm3 = st.columns(3)
+    with pm1:
+        st.metric(
+            "Locked Positions",
+            f"{texture['locked_position_rate_pct']}%",
+        )
+        st.caption("≤4 legal pawn moves (both sides), ply 16+")
+        peer = _peer(
+            "locked_position_rate_pct",
+            texture["locked_position_rate_pct"],
+            "%",
+        )
+        if peer:
+            st.caption(peer)
+    with pm2:
+        st.metric(
+            "Games With Locked State",
+            f"{texture['locked_game_rate_pct']}%",
+        )
+        st.caption(f"{texture['games_scanned']:,} parseable games")
+        peer = _peer(
+            "locked_game_rate_pct", texture["locked_game_rate_pct"], "%"
+        )
+        if peer:
+            st.caption(peer)
+    with pm3:
+        st.metric(
+            "Pawn Moves / Game",
+            f"{texture['avg_pawn_moves']}",
+        )
+        st.caption(
+            f"Your pawn moves avg: {texture['avg_user_pawn_moves']}"
+        )
+        peer = _peer("avg_pawn_moves", texture["avg_pawn_moves"])
+        if peer:
+            st.caption(peer)
+
+    st.divider()
+    st.subheader("🧠 Style Split — Last 10 Games")
+    st.caption(
+        "Stockfish 18 · depth 14 · Threads 2 · Hash 32 · MultiPV 1. "
+        "Sacrifice / early trades ignore pawns & kings. "
+        "Early flank pushes only count into enemy territory "
+        "(ranks 5–8 for White, 1–4 for Black)."
+    )
+
+    style_n = 10
+    last_ids = tuple(
+        df.sort_values("created_at").tail(style_n)["id"].astype(str).tolist()
+    )
+    cache_key = ("style_metrics_v4", last_ids, 14, 2, 32)
+    run_style = st.button(
+        "Run / refresh Stockfish style analysis",
+        type="primary",
+        key="run_style_metrics",
+    )
+
+    if run_style or (
+        st.session_state.get("style_metrics_key") == cache_key
+        and "style_metrics" in st.session_state
+    ):
+        if run_style or st.session_state.get("style_metrics_key") != cache_key:
+            if not DEFAULT_ENGINE.exists():
+                st.error(
+                    f"Stockfish binary missing at `{DEFAULT_ENGINE}`. "
+                    "Download SF18 into bin/ first."
+                )
+            else:
+                progress = st.progress(0.0, text="Starting Stockfish…")
+
+                def _on_progress(i, total, game_id):
+                    progress.progress(
+                        i / max(total, 1),
+                        text=f"Analyzing game {i}/{total}: {game_id}",
+                    )
+
+                with st.spinner("Analyzing last 10 games (depth 14)…"):
+                    style = calculate_style_metrics(
+                        df,
+                        n=style_n,
+                        engine_path=DEFAULT_ENGINE,
+                        depth=14,
+                        threads=2,
+                        hash_mb=32,
+                        progress_callback=_on_progress,
+                    )
+                progress.empty()
+                st.session_state["style_metrics"] = style
+                st.session_state["style_metrics_key"] = cache_key
+
+        style = st.session_state.get("style_metrics")
+        if style and style.get("games", 0) > 0:
+            h1, h2 = st.columns(2)
+            h1.metric("Games", f"{style['games']}")
+            h2.metric("Win Rate", f"{style['win_rate']}%")
+
+            initiative = style.get("initiative") or {}
+            attacking = style.get("attacking") or {}
+
+            st.markdown("### Initiative & Maneuver")
+            i1, i2, i3 = st.columns(3)
+            with i1:
+                st.metric(
+                    "Eval Volatility",
+                    f"{initiative.get('avg_eval_volatility_cp', 0)} cp",
+                )
+                st.caption("Mean |Δeval| per ply (user POV)")
+                peer = _peer(
+                    "avg_eval_volatility_cp",
+                    initiative.get("avg_eval_volatility_cp"),
+                    " cp",
+                )
+                if peer:
+                    st.caption(peer)
+            with i2:
+                st.metric(
+                    "Sacrifice Rate",
+                    f"{initiative.get('sacrifice_rate_pct', 0)}%",
+                )
+                st.caption(
+                    f"Games with piece sac "
+                    f"(avg {initiative.get('avg_sacrifice_moves', 0)} / game)"
+                )
+                peer = _peer(
+                    "sacrifice_rate_pct",
+                    initiative.get("sacrifice_rate_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+            with i3:
+                st.metric(
+                    "Early Flank Pushes",
+                    f"{initiative.get('early_flank_rate_pct', 0)}%",
+                )
+                st.caption(
+                    f"Into enemy territory by move {12} "
+                    f"(avg {initiative.get('avg_early_flank_pushes', 0)} / game)"
+                )
+                peer = _peer(
+                    "early_flank_rate_pct",
+                    initiative.get("early_flank_rate_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+
+            i4, i5 = st.columns(2)
+            with i4:
+                conv = initiative.get("endgame_conversion_rate_pct")
+                st.metric(
+                    "Endgame Conversion",
+                    "N/A" if conv is None else f"{conv}%",
+                )
+                st.caption(
+                    f"Win % when ≥+1.5 with ≤10 pieces "
+                    f"(n={initiative.get('endgame_advantage_games', 0)})"
+                )
+                peer = _peer("endgame_conversion_rate_pct", conv, "%")
+                if peer:
+                    st.caption(peer)
+            with i5:
+                st.metric(
+                    "Early Trades",
+                    f"{initiative.get('early_trade_rate_pct', 0)}%",
+                )
+                st.caption(
+                    f"Piece trades ≤ move 12 "
+                    f"(avg {initiative.get('avg_early_trades', 0)} / game)"
+                )
+                peer = _peer(
+                    "early_trade_rate_pct",
+                    initiative.get("early_trade_rate_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+
+            st.markdown("### Attacking & Defending")
+            a1, a2, a3, a4 = st.columns(4)
+            with a1:
+                st.metric(
+                    "Higher-Value Threats",
+                    f"{attacking.get('avg_higher_value_threats', 0)}",
+                )
+                st.caption("Avg user moves/game threatening higher piece")
+            with a2:
+                st.metric(
+                    "Threat Escapes",
+                    f"{attacking.get('avg_threat_escapes', 0)}",
+                )
+                st.caption(
+                    "Avg moves/game leaving a lesser-value attack on your piece"
+                )
+                peer = _peer(
+                    "avg_threat_escapes", attacking.get("avg_threat_escapes")
+                )
+                if peer:
+                    st.caption(peer)
+            with a3:
+                st.metric(
+                    "Trades Near Enemy King",
+                    f"{attacking.get('avg_trades_near_enemy_king', 0)}",
+                )
+                st.caption("Avg piece captures within 2 of enemy king")
+            with a4:
+                st.metric(
+                    "Trades Near Your King",
+                    f"{attacking.get('avg_trades_near_user_king', 0)}",
+                )
+                st.caption("Avg piece captures within 2 of your king")
+
+            a5, a6, a7 = st.columns(3)
+            with a5:
+                st.metric(
+                    "Opp Territory",
+                    f"{attacking.get('territory_opp_pct', 0)}%",
+                )
+                peer = _peer(
+                    "territory_opp_pct",
+                    attacking.get("territory_opp_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+            with a6:
+                st.metric(
+                    "Own Territory",
+                    f"{attacking.get('territory_own_pct', 0)}%",
+                )
+            with a7:
+                st.metric(
+                    "Forward / Backward",
+                    f"{attacking.get('forward_move_pct', 0)}% / "
+                    f"{attacking.get('backward_move_pct', 0)}%",
+                )
+                st.caption(
+                    f"Lateral {attacking.get('lateral_move_pct', 0)}%"
+                )
+
+            dir_df = pd.DataFrame(
+                [
+                    {
+                        "Direction": "Forward",
+                        "Share %": attacking.get("forward_move_pct", 0),
+                    },
+                    {
+                        "Direction": "Backward",
+                        "Share %": attacking.get("backward_move_pct", 0),
+                    },
+                    {
+                        "Direction": "Lateral",
+                        "Share %": attacking.get("lateral_move_pct", 0),
+                    },
+                ]
+            )
+            terr_df = pd.DataFrame(
+                [
+                    {
+                        "Zone": "Opp Territory",
+                        "Share %": attacking.get("territory_opp_pct", 0),
+                    },
+                    {
+                        "Zone": "Own Territory",
+                        "Share %": attacking.get("territory_own_pct", 0),
+                    },
+                ]
+            )
+            g1, g2 = st.columns(2)
+            with g1:
+                fig, ax = plt.subplots(figsize=(5, 3.2))
+                sns.barplot(
+                    data=terr_df,
+                    x="Zone",
+                    y="Share %",
+                    ax=ax,
+                    hue="Zone",
+                    legend=False,
+                    palette="Blues_d",
+                )
+                ax.set_ylim(0, 100)
+                ax.set_title("Territory Dominance", fontweight="bold")
+                st.pyplot(fig)
+                plt.close(fig)
+            with g2:
+                fig, ax = plt.subplots(figsize=(5, 3.2))
+                sns.barplot(
+                    data=dir_df,
+                    x="Direction",
+                    y="Share %",
+                    ax=ax,
+                    hue="Direction",
+                    legend=False,
+                    palette="Greens_d",
+                )
+                ax.set_ylim(0, 100)
+                ax.set_title("Move Direction", fontweight="bold")
+                st.pyplot(fig)
+                plt.close(fig)
+
+            creativity = style.get("creativity") or {}
+            st.markdown("### Creativity")
+            cr1, cr2, cr3 = st.columns(3)
+            with cr1:
+                st.metric(
+                    "Drawishless",
+                    f"{creativity.get('drawishless_rate_pct', 0)}%",
+                )
+                st.caption(
+                    f"{creativity.get('drawishless_games', 0)} games with "
+                    f"win% in [45, 55] at move 40, not drawn"
+                )
+                peer = _peer(
+                    "drawishless_rate_pct",
+                    creativity.get("drawishless_rate_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+            with cr2:
+                st.metric(
+                    "Declined Recaptures",
+                    f"{creativity.get('declined_recapture_rate_pct', 0)}%",
+                )
+                st.caption(
+                    f"{creativity.get('declined_recaptures', 0)}/"
+                    f"{creativity.get('recapture_chances', 0)} chances "
+                    f"(avg {creativity.get('avg_declined_recaptures', 0)} / game)"
+                )
+                peer = _peer(
+                    "declined_recapture_rate_pct",
+                    creativity.get("declined_recapture_rate_pct"),
+                    "%",
+                )
+                if peer:
+                    st.caption(peer)
+            with cr3:
+                crit_t = creativity.get("avg_critical_time_s")
+                st.metric(
+                    "Time on Critical Positions",
+                    "N/A" if crit_t is None else f"{crit_t}s",
+                )
+                st.caption(
+                    f"Avg think on |Δwin%|≥15pp moves "
+                    f"({creativity.get('critical_positions', 0)} positions; "
+                    f"avg {creativity.get('avg_critical_positions', 0)} / game)"
+                )
+                peer = _peer("avg_critical_time_s", crit_t, "s")
+                if peer:
+                    st.caption(peer)
+
+            durability = style.get("durability") or {}
+            st.markdown("### Durability")
+            d1, d2, d3 = st.columns(3)
+            with d1:
+                rec = durability.get("recovery_rate_pct")
+                st.metric(
+                    "Recovery after −2.0",
+                    "N/A" if rec is None else f"{rec}%",
+                )
+                st.caption(
+                    f"{durability.get('recovered_games', 0)} win/draw of "
+                    f"{durability.get('disadvantage_games', 0)} games "
+                    f"that hit ≤20% win probability"
+                )
+                peer = _peer("recovery_rate_pct", rec, "%")
+                if peer:
+                    st.caption(peer)
+            with d2:
+                st.metric(
+                    "Blunders",
+                    f"{durability.get('total_blunders', 0)}",
+                )
+                st.caption(
+                    f"Rate {durability.get('blunder_rate_pct', 0)}% of moves · "
+                    f"avg {durability.get('avg_blunders', 0)} / game "
+                    f"(≥20pp win-probability drop)"
+                )
+                peer = _peer("avg_blunders", durability.get("avg_blunders"))
+                if peer:
+                    st.caption(peer)
+            with d3:
+                clk = durability.get("avg_clock_diff_s")
+                st.metric(
+                    "Clock Differential",
+                    "N/A" if clk is None else f"{clk:+.1f}s",
+                )
+                st.caption("Your avg think − opponent avg think / move")
+                peer = _peer("avg_clock_diff_s", clk, "s")
+                if peer:
+                    st.caption(peer)
+        elif run_style:
+            st.warning("No parseable games in the last-10 sample.")
+    else:
+        st.info(
+            "Click **Run / refresh Stockfish style analysis** to compute "
+            "Initiative, Attacking, Creativity, and Durability "
+            "on the last 10 games (~40s)."
+        )
+
+    st.divider()
+    st.markdown("### Time Usage")
+    avg_t = mix.get("avg_time_per_move_s")
+    style_cached = st.session_state.get("style_metrics") or {}
+    durability_cached = style_cached.get("durability") or {}
+    creativity_cached = style_cached.get("creativity") or {}
+    tu1, tu2, tu3, tu4 = st.columns(4)
+    with tu1:
+        st.metric(
+            "Avg Time / Move",
+            "N/A" if avg_t is None else f"{avg_t}s",
+        )
+        st.caption(
+            f"{mix.get('games_with_clock', 0):,} games with clock (filtered)"
+        )
+        peer = _peer("avg_time_per_move_s", avg_t, "s")
+        if peer:
+            st.caption(peer)
+    with tu2:
+        clk = durability_cached.get("avg_clock_diff_s")
+        st.metric(
+            "Clock Differential",
+            "N/A" if clk is None else f"{clk:+.1f}s",
+        )
+        st.caption("From last-10 Stockfish sample")
+        peer = _peer("avg_clock_diff_s", clk, "s")
+        if peer:
+            st.caption(peer)
+    with tu3:
+        disadv_t = durability_cached.get("avg_disadvantage_time_s")
+        st.metric(
+            "Time on Disadvantage",
+            "N/A" if disadv_t is None else f"{disadv_t}s",
+        )
+        st.caption(
+            f"Avg think when win probability ≤20% "
+            f"({durability_cached.get('disadvantage_positions', 0)} moves)"
+        )
+        peer = _peer("avg_disadvantage_time_s", disadv_t, "s")
+        if peer:
+            st.caption(peer)
+    with tu4:
+        crit_t = creativity_cached.get("avg_critical_time_s")
+        st.metric(
+            "Time on Critical",
+            "N/A" if crit_t is None else f"{crit_t}s",
+        )
+        st.caption("|Δwin%|≥15pp moves (last-10 sample)")
+        peer = _peer("avg_critical_time_s", crit_t, "s")
+        if peer:
+            st.caption(peer)
+
+    st.stop()
 
 st.subheader("🎖️ Earned Player Archetypes & Badges")
 

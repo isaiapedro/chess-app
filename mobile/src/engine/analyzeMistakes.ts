@@ -11,14 +11,17 @@ import { resolveContinuationPv } from "./resolveContinuation";
 import {
   BATCH_GAMES,
   ENGINE_LABEL,
+  GLOBAL_MULTIPV,
   MAX_MISTAKE_SCAN_GAMES,
   MIN_CONTINUATION_PLIES,
   REFINE_DEPTH,
   REFINE_MOVETIME,
+  REFINE_MULTIPV,
   SCAN_DEPTH,
   SCAN_MOVETIME,
   TARGET_MISTAKE_MOMENTS,
 } from "./analysisConfig";
+import { selectRecentPeriodCandidates } from "./candidateBucket";
 
 export type StudyGame = {
   id: string;
@@ -31,6 +34,7 @@ export type StudyGame = {
   opponent_name?: string;
   pgn_str?: string;
   moves_str?: string;
+  time_control?: string;
   user_rating?: number;
 };
 
@@ -218,6 +222,11 @@ function passesMistakeCriteria(
   );
 }
 
+type LookupEvalFn = (
+  gameId: string,
+  fen: string
+) => { cpWhite: number; bestUci: string | null } | null;
+
 export async function analyzeCriticalMistakes(options: {
   games: StudyGame[];
   evaluate: EvalFn;
@@ -233,6 +242,7 @@ export async function analyzeCriticalMistakes(options: {
   stopOnStrict?: boolean;
   appendCount?: number;
   thresholdPass?: ThresholdPass;
+  lookupEval?: LookupEvalFn;
 }): Promise<AnalyzeBatchResult> {
   const {
     games,
@@ -248,6 +258,7 @@ export async function analyzeCriticalMistakes(options: {
     batchSize = BATCH_GAMES,
     stopOnStrict = true,
     appendCount,
+    lookupEval,
     thresholdPass: initialPass = "strict",
   } = options;
   type Ranked = MistakeItem & { priority_score: number };
@@ -394,8 +405,32 @@ export async function analyzeCriticalMistakes(options: {
         let beforeRaw;
         let afterRaw;
         try {
-          beforeRaw = await evaluate(fenBefore, SCAN_DEPTH, 1, SCAN_MOVETIME);
-          afterRaw = await evaluate(fenAfter, SCAN_DEPTH, 1, SCAN_MOVETIME);
+          const cachedBefore = lookupEval?.(String(game.id), fenBefore);
+          const cachedAfter = lookupEval?.(String(game.id), fenAfter);
+          beforeRaw = cachedBefore
+            ? {
+                cpWhite: cachedBefore.cpWhite,
+                bestUci: cachedBefore.bestUci,
+                multipv: [],
+              }
+            : await evaluate(
+                fenBefore,
+                SCAN_DEPTH,
+                GLOBAL_MULTIPV,
+                SCAN_MOVETIME || undefined
+              );
+          afterRaw = cachedAfter
+            ? {
+                cpWhite: cachedAfter.cpWhite,
+                bestUci: cachedAfter.bestUci,
+                multipv: [],
+              }
+            : await evaluate(
+                fenAfter,
+                SCAN_DEPTH,
+                GLOBAL_MULTIPV,
+                SCAN_MOVETIME || undefined
+              );
         } catch {
           continue;
         }
@@ -598,13 +633,13 @@ export async function analyzeCriticalMistakes(options: {
       const beforeRaw = await evaluate(
         moment.fen,
         REFINE_DEPTH,
-        1,
+        REFINE_MULTIPV,
         REFINE_MOVETIME
       );
       const afterRaw = await evaluate(
         fenAfter,
         REFINE_DEPTH,
-        1,
+        REFINE_MULTIPV,
         REFINE_MOVETIME
       );
       const beforeCp = clampCp(toWhiteCp(moment.fen, beforeRaw.cpWhite));
@@ -814,6 +849,42 @@ export async function analyzeCriticalMistakes(options: {
     thresholdPass,
     baselineAvailable,
   };
+}
+
+export async function refineRecentMistakeCandidates(options: {
+  candidates: MistakeItem[];
+  games: StudyGame[];
+  evaluate: EvalFn;
+  fetchExplorer?: ExplorerFn;
+  fetchMastersPgn?: MastersPgnFn;
+  onProgress?: (progress: AnalyzeProgress) => void;
+  signal?: { cancelled: boolean };
+  limit?: number;
+  existingMoments?: MistakeItem[];
+  lookupEval?: LookupEvalFn;
+}): Promise<AnalyzeBatchResult> {
+  const limit = options.limit ?? TARGET_MISTAKE_MOMENTS;
+  const periodIds = options.games.map((game) => String(game.id));
+  const ordered = selectRecentPeriodCandidates({
+    candidates: options.candidates,
+    periodGameIds: periodIds,
+    limit: Number.MAX_SAFE_INTEGER,
+  });
+  return analyzeCriticalMistakes({
+    games: options.games,
+    evaluate: options.evaluate,
+    fetchExplorer: options.fetchExplorer,
+    fetchMastersPgn: options.fetchMastersPgn,
+    onProgress: options.onProgress,
+    signal: options.signal,
+    existingMoments: options.existingMoments,
+    existingCandidates: ordered,
+    excludeGameIds: periodIds,
+    appendCount: limit,
+    stopOnStrict: false,
+    thresholdPass: "baseline",
+    lookupEval: options.lookupEval,
+  });
 }
 
 export type QuizVerdict = "best" | "good" | "retry" | "illegal";

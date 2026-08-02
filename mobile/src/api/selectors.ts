@@ -327,17 +327,17 @@ export function selectRecapView(
       {
         label: "Games Played",
         value: String(headline.total_games ?? data.meta.games_count ?? 0),
-        sub: `${results.wins}W · ${results.draws}D · ${results.losses}L`,
-      },
-      {
-        label: "Win Rate",
-        value: `${results.win_rate}%`,
         sub:
           period === "day"
             ? "Filtered games"
             : headline.peak_day
               ? `Peak day ${headline.peak_day}`
               : "Filtered games",
+      },
+      {
+        label: "Win Rate",
+        value: `${results.win_rate}%`,
+        sub: `${results.wins}W · ${results.draws}D · ${results.losses}L`,
       },
       {
         label: "Time Invested",
@@ -446,77 +446,136 @@ function metric(
   };
 }
 
-export function selectMetricsCatalog(data: InsightsResponse): CatalogSection[] {
-  const style = data.style || {};
-  const clock = style.clock || {};
-  const conditional = style.conditional || {};
-  const openings = data.openings || {};
-  const middlegames = data.middlegames || {};
-  const endgames = data.endgames || {};
+export function selectMetricsCatalog(_data: InsightsResponse): CatalogSection[] {
+  const styleMetricDefs: Array<[string, string, string]> = [
+    ["Average Think Time", "s", "How long you usually spend on each move"],
+    ["Clock Difference", "s", "Your think time versus opponents"],
+    ["Time When Losing", "s", "Think time when the position is already bad"],
+    ["Time on Big Moments", "s", "Think time on sharp evaluation swings"],
+    ["Signature Openings", "%", "Games in your usual openings"],
+    ["Offbeat Openings", "%", "Games outside your usual openings"],
+    ["Mainstream Openings", "%", "Games in well-known mainstream systems"],
+    ["Side Openings", "%", "Games in less standard opening systems"],
+    ["Position Swings", "pp", "How much the evaluation jumps move to move"],
+    ["Sacrifices", "/game", "Material given up on purpose"],
+    ["Early Flank Pushes", "%", "Early wing pawn advances into enemy ground"],
+    ["Endgame Conversion", "%", "Wins from winning endgames"],
+    ["Early Piece Trades", "/game", "Early piece exchanges"],
+    ["Unequal Threats", "/game", "Attacks on higher-value pieces"],
+    ["Threat Escapes", "/game", "Escapes from cheaper-piece attacks"],
+    ["Fights Near Their King", "/game", "Captures near the enemy king"],
+    ["Fights Near Your King", "/game", "Captures near your king"],
+    ["Enemy Half Moves", "%", "Moves landing in the opponent half"],
+    ["Own Half Moves", "%", "Moves staying in your half"],
+    ["Forward Moves", "%", "Pieces advancing toward the enemy"],
+    ["Backward Moves", "%", "Pieces retreating"],
+    ["Breaking Draws", "%", "Equal late positions that still finish decisive"],
+    ["Declined Recaptures", "%", "Recapture chances you refuse"],
+    ["Comebacks", "%", "Saves after being clearly worse"],
+    ["Blunders", "/game", "Moves that tank winning chances"],
+  ];
+  const styleMetrics: CatalogMetric[] = styleMetricDefs.map(
+    ([name, unit, desc]) => ({
+      id: `style-${name}`,
+      section: "style",
+      sectionTitle: "Style of Play",
+      name,
+      value: "—",
+      unit,
+      desc,
+    })
+  );
 
-  const styleMetrics = [
-    metric("style", "Style of Play", "Baseline Win Rate", conditional.baseline_win_rate, "%", "Overall win rate in the filtered sample"),
-    metric("style", "Style of Play", "White Win Rate", conditional.white_win_rate, "%", "Win rate when playing White"),
-    metric("style", "Style of Play", "Black Win Rate", conditional.black_win_rate, "%", "Win rate when playing Black"),
-    metric("style", "Style of Play", "Underdog Win Rate", conditional.underdog_win_rate, "%", "Win rate vs opponents rated +30 or more"),
-    metric("style", "Style of Play", "First Blood Rate", style.first_blood_pct, "%", "How often you capture the first piece"),
-    metric(
-      "style",
-      "Style of Play",
-      "Avg Move Time",
-      clock.avg_time_per_move_user as string | number | undefined,
-      "s",
-      "Average think time per move"
-    ),
-  ].filter(Boolean) as CatalogMetric[];
+  const openingMetricDefs: Array<[string, string, string]> = [
+    ["Opening Accuracy", "%", "Opening-phase quality vs peers"],
+    ["Development Speed", "", "Minors developed by move 10"],
+    ["Center Control", "%", "Influence on central squares"],
+    ["King Safety", "", "Average castling fullmove"],
+    ["Uncastled Games", "%", "Games without castling"],
+    ["Tempo Balance", "%", "Wasted developing tempi"],
+  ];
+  const openingMetrics: CatalogMetric[] = openingMetricDefs.map(
+    ([name, unit, desc]) => ({
+      id: `openings-${name}`,
+      section: "openings",
+      sectionTitle: "Openings",
+      name,
+      value: "—",
+      unit,
+      desc,
+    })
+  );
 
-  const openingMetrics = ((openings.op_group || []) as Array<Record<string, unknown>>)
-    .slice(0, 8)
-    .map((row, index) =>
-      metric(
-        "openings",
-        "Openings",
-        String(row.opening_name || row.opening_eco || `Opening ${index + 1}`),
-        row.win_rate as number | undefined,
-        "%",
-        `${row.games || 0} games · ECO ${row.opening_eco || "?"}`
-      )
-    )
-    .filter(Boolean) as CatalogMetric[];
+  const midMetricDefs: Array<[string, string, string]> = [
+    ["Accuracy in Middlegame", "%", "Middlegame move quality vs peers"],
+    ["Blunder Rate", "/game", "Average middlegame blunders per game"],
+    ["Missed Opportunities", "%", "Failed chances after opponent blunders"],
+    ["Missed Tactic", "%", "Missed material tactics after opponent blunders"],
+    ["Allowed Tactics", "%", "Opponent finds tactics you blunder into"],
+    ["Attackers in King Zone", "", "Pressure on squares next to your king"],
+    ["Pawn Shield Integrity", "%", "Castled pawn shield health"],
+    ["Open File Proximity", "%", "King exposure to open files"],
+    ["Safe Legal Moves", "%", "Moves landing off enemy pawn attacks"],
+    ["Outpost Control", "", "Minors on classic outposts"],
+    ["Space Advantage", "%", "Safe central space share"],
+    ["Isolated Queen Pawn", "%", "Win rate with an IQP"],
+    ["Doubled Pawns", "%", "Games with doubled pawns"],
+    ["Backward Pawns", "%", "Games with a backward pawn"],
+    ["Pawn Islands", "", "Average pawn island count"],
+  ];
+  const midMetrics: CatalogMetric[] = midMetricDefs.map(
+    ([name, unit, desc]) => ({
+      id: `middlegame-${name}`,
+      section: "middlegame",
+      sectionTitle: "Middlegames",
+      name,
+      value: "—",
+      unit,
+      desc,
+    })
+  );
 
-  if (openings.gambit_win_rate != null) {
-    openingMetrics.unshift(
-      metric(
-        "openings",
-        "Openings",
-        "Gambit Win Rate",
-        openings.gambit_win_rate,
-        "%",
-        `${openings.total_gambits || 0} gambit games`
-      )!
-    );
-  }
+  const endMetricDefs: Array<[string, string, string]> = [
+    ["Blunder Rate on Endgames", "/game", "Average blunders per endgame"],
+    [
+      "Theoretical Endgames Saved",
+      "%",
+      "Win or draw rate defending weaker theoretical sides",
+    ],
+    ["King Centralization", "", "King closeness to the center"],
+    ["King Distance", "", "King distance to enemy pawns"],
+    ["Pawn Difference", "", "Pawn edge after the endgame starts"],
+    ["Beneficial Trades", "%", "Trades that raise winning chances"],
+    ["Simplification Trades", "%", "Trading down while already winning"],
+    ["Conversion Rate", "%", "Mate evaluations that become checkmate"],
+    ["Stalemate", "%", "Winning positions that end in stalemate"],
+    ["Mate Tempo", "s", "Think time during mate sequences"],
+    ["Pawn Endings", "%", "Win rate in pure pawn endings"],
+    ["Queen vs Pawn", "%", "Win rate with queen vs pawn"],
+    ["Rook vs Pawn", "%", "Win rate with rook vs pawn"],
+    ["Bishop + Pawn vs Knight", "%", "Win rate with bishop+pawn vs knight"],
+    [
+      "Two Pawns + Opposite Bishops",
+      "%",
+      "Win rate with two pawns in opposite bishops",
+    ],
+    ["Pawn vs Knight", "%", "Win/draw rate in pawn vs knight"],
+    ["Two Pawns vs Rook", "%", "Win/draw rate in two pawns vs rook"],
+    ["Knight + Pawn vs Bishop", "%", "Win/draw rate in knight+pawn vs bishop"],
+    ["Rook + Pawn vs Rook", "%", "Win/draw rate in rook+pawn vs rook"],
+  ];
 
-  const midMetrics = [
-    metric("middlegame", "Middlegames", "Knights Captured", middlegames.knights_captured, "", "Total knights captured across the sample"),
-    metric("middlegame", "Middlegames", "Bishops Captured", middlegames.bishops_captured, "", "Total bishops captured across the sample"),
-    metric("middlegame", "Middlegames", "Queenless Early", middlegames.queenless_pct, "%", "Games with queens traded early"),
-    metric("middlegame", "Middlegames", "Underpromotions", middlegames.underpromotions, "", "Promotions to pieces other than queen"),
-  ].filter(Boolean) as CatalogMetric[];
-
-  const endMetrics = [
-    metric("endgame", "Endgames", "Short Games", endgames.short_games_count, "", `WR ${endgames.short_win_rate ?? 0}% in games ≤30 moves`),
-    metric("endgame", "Endgames", "Short Game WR", endgames.short_win_rate, "%", "Win rate in short games"),
-    metric("endgame", "Endgames", "Marathon Games", endgames.marathon_games_count, "", `WR ${endgames.marathon_win_rate ?? 0}% in games >50 moves`),
-    metric("endgame", "Endgames", "Marathon WR", endgames.marathon_win_rate, "%", "Win rate in marathon games"),
-  ].filter(Boolean) as CatalogMetric[];
-
-  const endgameTypes = endgames.endgame_types || {};
-  Object.entries(endgameTypes).forEach(([name, count]) => {
-    endMetrics.push(
-      metric("endgame", "Endgames", name, count, "", "Games reaching this endgame type")!
-    );
-  });
+  const endMetrics: CatalogMetric[] = endMetricDefs.map(
+    ([name, unit, desc]) => ({
+      id: `endgame-${name}`,
+      section: "endgame",
+      sectionTitle: "Endgames",
+      name,
+      value: "—",
+      unit,
+      desc,
+    })
+  );
 
   return [
     {

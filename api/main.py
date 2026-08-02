@@ -4,7 +4,7 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from api.routers import games, stats, study
+from api.routers import baselines, games, stats, study
 from api.schemas import HealthResponse
 
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
@@ -26,6 +26,7 @@ app.add_middleware(
 app.include_router(games.router, prefix="/api/v1")
 app.include_router(stats.router, prefix="/api/v1")
 app.include_router(study.router, prefix="/api/v1")
+app.include_router(baselines.router, prefix="/api/v1")
 
 
 @app.get("/health", response_model=HealthResponse)

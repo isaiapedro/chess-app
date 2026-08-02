@@ -46,6 +46,7 @@ export const result = {
 export const font = {
   display: "PlayfairDisplay_700Bold",
   displayMedium: "PlayfairDisplay_600SemiBold",
+  displayLight: "Playfair_300Light",
   mono: "IBMPlexMono_400Regular",
   monoMedium: "IBMPlexMono_500Medium",
   monoBold: "IBMPlexMono_700Bold",

@@ -51,6 +51,7 @@ type Props = {
   progress?: AnalyzeProgress | null;
   logLines?: string[];
   fallback?: string;
+  message?: string | null;
   targetMoments?: number;
   complete?: boolean;
   onComplete?: () => void;
@@ -59,6 +60,7 @@ type Props = {
 export function StudyAnalyzeStatus({
   progress = null,
   fallback = "Setting up the pieces…",
+  message = null,
   targetMoments,
   complete = false,
   onComplete,
@@ -66,11 +68,12 @@ export function StudyAnalyzeStatus({
   const [phrase, setPhrase] = useState(() => pickRandomLine());
 
   useEffect(() => {
+    if (message) return;
     const timer = setInterval(() => {
       setPhrase((prev) => pickRandomLine(prev));
     }, 5000);
     return () => clearInterval(timer);
-  }, []);
+  }, [message]);
 
   const target =
     targetMoments ??
@@ -78,7 +81,7 @@ export function StudyAnalyzeStatus({
 
   return (
     <View style={styles.wrap}>
-      <Text style={styles.phrase}>{phrase || fallback}</Text>
+      <Text style={styles.phrase}>{message || phrase || fallback}</Text>
       <AnalysisLoadingBars
         selected={progress?.selected ?? 0}
         candidates={progress?.candidates ?? 0}

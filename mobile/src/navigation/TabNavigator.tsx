@@ -4,6 +4,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import PagerView from "react-native-pager-view";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useTabSwipe } from "../context/TabSwipeContext";
 import { RecapScreen } from "../screens/RecapScreen";
 import { InsightsScreen } from "../screens/InsightsScreen";
 import { StudyScreen } from "../screens/StudyScreen";
@@ -13,11 +14,21 @@ import { colors } from "../theme";
 const TAB_ORDER = ["Wrapped", "Insights", "Study", "Profile"] as const;
 const TAB_BAR_PADDING = 6;
 const TAB_GAP = 10;
-const TAB_PILL_SCALE = 0.9;
-const TAB_PILL_DELAY_MS = 80;
-const TAB_PILL_DURATION_MS = 180;
+const TAB_PILL_SCALE = 0.945;
+const TAB_PILL_HEIGHT = 43.47;
+const TAB_PILL_RADIUS = 24.57;
+const TAB_SLOT_HEIGHT = 46;
+const TAB_PILL_DELAY_MS = 36;
+const TAB_PILL_DURATION_MS = 71;
 
 type TabName = (typeof TAB_ORDER)[number];
+
+type TabFrame = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
 
 const TAB_ICONS: Record<TabName, keyof typeof Ionicons.glyphMap> = {
   Wrapped: "sync-outline",
@@ -29,32 +40,33 @@ const TAB_ICONS: Record<TabName, keyof typeof Ionicons.glyphMap> = {
 export function TabNavigator() {
   const pagerRef = useRef<PagerView>(null);
   const [activeIndex, setActiveIndex] = useState(0);
-  const [tabBarWidth, setTabBarWidth] = useState(0);
+  const [tabFrames, setTabFrames] = useState<TabFrame[]>([]);
   const pillX = useRef(new Animated.Value(0)).current;
-  const measuredWidthRef = useRef(0);
+  const readyRef = useRef(false);
   const insets = useSafeAreaInsets();
-
+  const { setActiveTabIndex, pageProgress } = useTabSwipe();
   const openPage = (index: number) => {
     setActiveIndex(index);
+    setActiveTabIndex(index);
     pagerRef.current?.setPage(index);
   };
 
-  const tabWidth =
-    tabBarWidth > 0
-      ? (tabBarWidth - TAB_BAR_PADDING * 2 - TAB_GAP * (TAB_ORDER.length - 1)) /
-        TAB_ORDER.length
-      : 0;
-  const pillWidth = tabWidth * TAB_PILL_SCALE;
+  useEffect(() => {
+    setActiveTabIndex(activeIndex);
+  }, [activeIndex, setActiveTabIndex]);
+
+  const activeFrame = tabFrames[activeIndex];
+  const pillWidth = activeFrame ? activeFrame.width * TAB_PILL_SCALE : 0;
+  const pillTop = activeFrame
+    ? activeFrame.y + (activeFrame.height - TAB_PILL_HEIGHT) / 2
+    : TAB_BAR_PADDING + (TAB_SLOT_HEIGHT - TAB_PILL_HEIGHT) / 2;
 
   useEffect(() => {
-    if (!tabBarWidth) return;
-    const target =
-      TAB_BAR_PADDING +
-      activeIndex * (tabWidth + TAB_GAP) +
-      (tabWidth - pillWidth) / 2;
+    if (!activeFrame || pillWidth <= 0) return;
+    const target = activeFrame.x + (activeFrame.width - pillWidth) / 2;
 
-    if (measuredWidthRef.current !== tabBarWidth) {
-      measuredWidthRef.current = tabBarWidth;
+    if (!readyRef.current) {
+      readyRef.current = true;
       pillX.setValue(target);
       return;
     }
@@ -70,7 +82,31 @@ export function TabNavigator() {
     ]);
     animation.start();
     return () => animation.stop();
-  }, [activeIndex, pillWidth, pillX, tabBarWidth, tabWidth]);
+  }, [activeFrame, activeIndex, pillWidth, pillX]);
+
+  const onTabLayout = (
+    index: number,
+    x: number,
+    y: number,
+    width: number,
+    height: number
+  ) => {
+    setTabFrames((prev) => {
+      const current = prev[index];
+      if (
+        current &&
+        current.x === x &&
+        current.y === y &&
+        current.width === width &&
+        current.height === height
+      ) {
+        return prev;
+      }
+      const next = prev.slice();
+      next[index] = { x, y, width, height };
+      return next;
+    });
+  };
 
   return (
     <View style={styles.container}>
@@ -79,7 +115,16 @@ export function TabNavigator() {
         style={styles.pager}
         initialPage={0}
         overdrag
-        onPageSelected={(event) => setActiveIndex(event.nativeEvent.position)}
+        scrollEnabled
+        onPageScroll={(event) => {
+          const { position, offset } = event.nativeEvent;
+          pageProgress.setValue(position + offset);
+        }}
+        onPageSelected={(event) => {
+          const position = event.nativeEvent.position;
+          setActiveIndex(position);
+          pageProgress.setValue(position);
+        }}
       >
         <View key="Wrapped" style={styles.page}>
           <RecapScreen />
@@ -108,7 +153,6 @@ export function TabNavigator() {
           tint="dark"
           experimentalBlurMethod="dimezisBlurView"
           style={styles.tabBar}
-          onLayout={(event) => setTabBarWidth(event.nativeEvent.layout.width)}
           accessibilityRole="tablist"
         >
           {pillWidth > 0 ? (
@@ -118,6 +162,7 @@ export function TabNavigator() {
                 styles.tabActive,
                 {
                   width: pillWidth,
+                  top: pillTop,
                   transform: [{ translateX: pillX }],
                 },
               ]}
@@ -129,6 +174,10 @@ export function TabNavigator() {
               <Pressable
                 key={name}
                 style={styles.tab}
+                onLayout={(event) => {
+                  const { x, y, width, height } = event.nativeEvent.layout;
+                  onTabLayout(index, x, y, width, height);
+                }}
                 onPress={() => openPage(index)}
                 accessibilityLabel={name === "Wrapped" ? "Recap" : name}
                 accessibilityRole="tab"
@@ -186,23 +235,22 @@ const styles = StyleSheet.create({
   },
   tab: {
     flex: 1,
-    height: 46,
+    height: TAB_SLOT_HEIGHT,
     alignItems: "center",
     justifyContent: "center",
   },
   tabPill: {
-    width: "90%",
-    height: 41.4,
+    width: "94.5%",
+    height: TAB_PILL_HEIGHT,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 23.4,
+    borderRadius: TAB_PILL_RADIUS,
   },
   tabActive: {
     position: "absolute",
-    top: TAB_BAR_PADDING,
     left: 0,
-    height: 41.4,
-    borderRadius: 23.4,
+    height: TAB_PILL_HEIGHT,
+    borderRadius: TAB_PILL_RADIUS,
     backgroundColor: "rgba(255,255,255,0.12)",
     borderWidth: 1,
     borderColor: "rgba(255,255,255,0.16)",

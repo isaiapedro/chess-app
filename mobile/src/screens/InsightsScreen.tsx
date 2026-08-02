@@ -1,5 +1,7 @@
-import React, { useCallback, useEffect, useState } from "react";
+import React, { useCallback, useEffect, useRef, useState } from "react";
 import {
+  Animated,
+  Easing,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -8,21 +10,23 @@ import {
 } from "react-native";
 import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
-import { fetchInsights, fetchRecap } from "../api/client";
 import { selectFactors } from "../api/selectors";
-import type {
-  FactorItem,
-  InsightsResponse,
-  Period,
-  RecapResponse,
-} from "../api/types";
+import type { FactorItem, Period } from "../api/types";
+import {
+  AnalyticsScanBanner,
+  EvalPendingWarning,
+  useAnalyticsScanReady,
+} from "../components/AnalyticsScanBanner";
 import {
   InsightsSkeleton,
   PageLoadingTransition,
 } from "../components/LoadingSkeletons";
 import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui";
+import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
+import { useInsightsNav } from "../context/InsightsNavContext";
 import { colors, font, result, spacing, withAlpha } from "../theme";
+import { agentLog } from "../debug/agentLog";
 import { CatalogScreen } from "./CatalogScreen";
 
 const FIXED_LOADER_MS = 2000;
@@ -31,63 +35,102 @@ function usesFixedLoader(period: Period): boolean {
   return period === "day" || period === "week" || period === "month";
 }
 
-function wait(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 export function InsightsScreen() {
   const { queryFilters, refreshToken, period } = useFilters();
-  const [data, setData] = useState<InsightsResponse | null>(null);
-  const [recap, setRecap] = useState<RecapResponse | null>(null);
+  const {
+    insights: data,
+    recap,
+    gamesLoading,
+    sessionKey,
+    refreshAnalytics,
+    requestVaultMetrics,
+  } = useAnalytics();
+  const metricsReady = useAnalyticsScanReady();
   const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(true);
+  const [minLoaderDone, setMinLoaderDone] = useState(!usesFixedLoader(period));
   const [refreshing, setRefreshing] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
-
-  const load = useCallback(
-    async (forceNetwork = false) => {
-      const startedAt = Date.now();
-      try {
-        setError(null);
-        const [insights, recapData] = await Promise.all([
-          fetchInsights(queryFilters, forceNetwork),
-          fetchRecap(queryFilters, forceNetwork),
-        ]);
-        setData(insights);
-        setRecap(recapData);
-      } catch (e) {
-        setError(e instanceof Error ? e.message : "Failed to load insights");
-      } finally {
-        if (!forceNetwork && usesFixedLoader(period)) {
-          await wait(Math.max(0, FIXED_LOADER_MS - (Date.now() - startedAt)));
-        }
-        setLoading(false);
-        setRefreshing(false);
-      }
-    },
-    [period, queryFilters]
-  );
+  const insightsOpacity = useRef(new Animated.Value(1)).current;
+  const { setDepth, registerPopHandler } = useInsightsNav();
 
   useEffect(() => {
-    setLoading(true);
-    void load(false);
-  }, [load, refreshToken]);
+    // #region agent log
+    agentLog("F", "InsightsScreen.tsx:mount", "request vault metrics on insights focus", {});
+    // #endregion
+    requestVaultMetrics(false);
+  }, [requestVaultMetrics, sessionKey, refreshToken]);
 
-  if (showCatalog && data) {
-    return <CatalogScreen data={data} onBack={() => setShowCatalog(false)} />;
-  }
+  useEffect(() => {
+    if (!metricsReady && showCatalog) setShowCatalog(false);
+  }, [metricsReady, showCatalog]);
 
+  useEffect(() => {
+    if (!showCatalog) {
+      setDepth(0);
+      registerPopHandler(null);
+    }
+  }, [showCatalog, setDepth, registerPopHandler]);
+
+  const openCatalog = useCallback(() => {
+    Animated.timing(insightsOpacity, {
+      toValue: 0,
+      duration: 160,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    }).start(({ finished }) => {
+      if (!finished) return;
+      setShowCatalog(true);
+    });
+  }, [insightsOpacity]);
+
+  const closeCatalog = useCallback(() => {
+    setShowCatalog(false);
+    insightsOpacity.setValue(0);
+    requestAnimationFrame(() => {
+      Animated.timing(insightsOpacity, {
+        toValue: 1,
+        duration: 240,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start();
+    });
+  }, [insightsOpacity]);
+
+  useEffect(() => {
+    setError(null);
+    setMinLoaderDone(!usesFixedLoader(period));
+    if (!usesFixedLoader(period)) return;
+    const t = setTimeout(() => setMinLoaderDone(true), FIXED_LOADER_MS);
+    return () => clearTimeout(t);
+  }, [sessionKey, refreshToken, period]);
+
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    setError(null);
+    try {
+      await refreshAnalytics(true);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load insights");
+    } finally {
+      setRefreshing(false);
+    }
+  }, [refreshAnalytics]);
+
+  const loading =
+    metricsReady && ((gamesLoading && !data) || (!data && !minLoaderDone));
   const showPieceLoader = loading && usesFixedLoader(period);
   const showSkeleton = loading && !data && !usesFixedLoader(period);
-  const contentKey = showPieceLoader
-    ? `loader:${period}:${refreshToken}`
-    : showSkeleton
-      ? `skeleton:${period}`
-      : error && !data
-        ? "error"
-        : data
-          ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
-          : "empty";
+  const contentKey = !metricsReady
+    ? `metrics:${period}:${refreshToken}`
+    : showPieceLoader
+      ? `loader:${period}:${refreshToken}`
+      : showSkeleton
+        ? `skeleton:${period}`
+        : error && !data
+          ? "error"
+          : data
+            ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
+            : "empty";
 
   const factors = data ? selectFactors(data) : null;
   const results = recap?.results || {
@@ -99,120 +142,166 @@ export function InsightsScreen() {
   const ratingSeries = (recap?.rating_series || []).slice(-12);
   const winRate = results.win_rate || factors?.baseline_win_rate || 0;
 
+  useEffect(() => {
+    // #region agent log
+    agentLog("B", "InsightsScreen.tsx:gate", "insights gate state", {
+      metricsReady,
+      hasData: !!data,
+      gamesLoading,
+      showPieceLoader,
+      contentBlocked: !metricsReady,
+    });
+    // #endregion
+  }, [metricsReady, data, gamesLoading, showPieceLoader]);
+
   return (
-    <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
-      {showSkeleton ? (
-        <InsightsSkeleton />
-      ) : error && !data ? (
-        <View style={styles.center}>
-          <Text style={styles.error}>{error}</Text>
-        </View>
-      ) : data && factors ? (
-      <ScrollView
-        style={styles.scroll}
-        contentContainerStyle={styles.content}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            tintColor={colors.red}
-            onRefresh={() => {
-              setRefreshing(true);
-              void load(true);
-            }}
-          />
-        }
-      >
-      <View style={styles.hero}>
-        <Eyebrow>Performance Analysis</Eyebrow>
-        <DisplayTitle size={34}>
-          What Moves{"\n"}the Needle
-        </DisplayTitle>
-      </View>
-
-      <EdgeCard lifted style={styles.summaryCard}>
-        <View style={styles.summaryRow}>
-          <WinRateDial value={winRate} />
-          <View style={{ flex: 1 }}>
-            <View style={styles.wdlRow}>
-              {[
-                { label: "Wins", value: results.wins, color: result.win },
-                { label: "Draws", value: results.draws, color: result.draw },
-                { label: "Losses", value: results.losses, color: result.loss },
-              ].map((item) => (
-                <View key={item.label}>
-                  <Text style={[styles.wdlValue, { color: item.color }]}>{item.value}</Text>
-                  <Text style={styles.wdlLabel}>{item.label}</Text>
-                </View>
-              ))}
-            </View>
-            {ratingSeries.length > 1 ? (
-              <LineChart
-                data={{
-                  labels: ratingSeries.map(() => ""),
-                  datasets: [{ data: ratingSeries.map((p) => p.user_rating) }],
-                }}
-                width={220}
-                height={40}
-                withDots={false}
-                withInnerLines={false}
-                withOuterLines={false}
-                withVerticalLabels={false}
-                withHorizontalLabels={false}
-                chartConfig={{
-                  backgroundGradientFrom: colors.surface,
-                  backgroundGradientTo: colors.surface,
-                  color: () => colors.blue,
-                  labelColor: () => colors.textDim,
-                  propsForBackgroundLines: { stroke: "transparent" },
-                }}
-                style={{ paddingRight: 0, marginLeft: -16 }}
-              />
-            ) : null}
+    <View style={styles.stack}>
+      <EvalPendingWarning />
+      <Animated.View style={[styles.insightsLayer, { opacity: insightsOpacity }]}>
+      {!metricsReady ? (
+        <ScrollView
+          style={styles.scroll}
+          contentContainerStyle={styles.content}
+        >
+          <View style={styles.hero}>
+            <Eyebrow>Performance Analysis</Eyebrow>
+            <DisplayTitle size={34}>
+              What Moves{"\n"}the Needle
+            </DisplayTitle>
           </View>
+          <AnalyticsScanBanner />
+        </ScrollView>
+      ) : (
+      <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
+        {showSkeleton ? (
+          <InsightsSkeleton />
+        ) : error && !data ? (
+          <View style={styles.center}>
+            <Text style={styles.error}>{error}</Text>
+          </View>
+        ) : data && factors ? (
+          <ScrollView
+            style={styles.scroll}
+            contentContainerStyle={styles.content}
+            scrollEnabled={!showCatalog}
+            refreshControl={
+              <RefreshControl
+                refreshing={refreshing}
+                tintColor={colors.red}
+                onRefresh={() => {
+                  void onRefresh();
+                }}
+              />
+            }
+          >
+            <View style={styles.hero}>
+              <Eyebrow>Performance Analysis</Eyebrow>
+              <DisplayTitle size={34}>
+                What Moves{"\n"}the Needle
+              </DisplayTitle>
+            </View>
+
+            <EdgeCard lifted style={styles.summaryCard}>
+              <View style={styles.summaryRow}>
+                <WinRateDial value={winRate} />
+                <View style={{ flex: 1 }}>
+                  <View style={styles.wdlRow}>
+                    {[
+                      { label: "Wins", value: results.wins, color: result.win },
+                      { label: "Draws", value: results.draws, color: result.draw },
+                      { label: "Losses", value: results.losses, color: result.loss },
+                    ].map((item) => (
+                      <View key={item.label}>
+                        <Text style={[styles.wdlValue, { color: item.color }]}>
+                          {item.value}
+                        </Text>
+                        <Text style={styles.wdlLabel}>{item.label}</Text>
+                      </View>
+                    ))}
+                  </View>
+                  {ratingSeries.length > 1 ? (
+                    <LineChart
+                      data={{
+                        labels: ratingSeries.map(() => ""),
+                        datasets: [
+                          { data: ratingSeries.map((p) => p.user_rating) },
+                        ],
+                      }}
+                      width={220}
+                      height={40}
+                      withDots={false}
+                      withInnerLines={false}
+                      withOuterLines={false}
+                      withVerticalLabels={false}
+                      withHorizontalLabels={false}
+                      chartConfig={{
+                        backgroundGradientFrom: colors.surface,
+                        backgroundGradientTo: colors.surface,
+                        color: () => colors.blue,
+                        labelColor: () => colors.textDim,
+                        propsForBackgroundLines: { stroke: "transparent" },
+                      }}
+                      style={{ paddingRight: 0, marginLeft: -16 }}
+                    />
+                  ) : null}
+                </View>
+              </View>
+            </EdgeCard>
+
+            <View style={styles.pad}>
+              <GroupHeading label="Driving Your Wins" accent={result.win} />
+              {factors.driving.length ? (
+                factors.driving.map((item) => (
+                  <FactorCard
+                    key={item.condition}
+                    item={item}
+                    baseline={factors.baseline_win_rate}
+                    positive
+                  />
+                ))
+              ) : (
+                <Text style={styles.empty}>
+                  No positive drivers in this sample.
+                </Text>
+              )}
+            </View>
+
+            <View style={styles.pad}>
+              <GroupHeading label="Costing You Points" accent={result.loss} />
+              {factors.costing.length ? (
+                factors.costing.map((item) => (
+                  <FactorCard
+                    key={item.condition}
+                    item={item}
+                    baseline={factors.baseline_win_rate}
+                    positive={false}
+                  />
+                ))
+              ) : (
+                <Text style={styles.empty}>
+                  No negative drivers in this sample.
+                </Text>
+              )}
+            </View>
+
+            <View style={[styles.pad, { marginTop: spacing.md }]}>
+              <BrutalButton
+                label="Explore All Metrics →"
+                onPress={openCatalog}
+              />
+            </View>
+          </ScrollView>
+        ) : null}
+      </PageLoadingTransition>
+      )}
+      </Animated.View>
+
+      {showCatalog && data && metricsReady ? (
+        <View style={styles.overlay}>
+          <CatalogScreen data={data} onBack={closeCatalog} />
         </View>
-      </EdgeCard>
-
-      <View style={styles.pad}>
-        <GroupHeading label="Driving Your Wins" accent={result.win} />
-        {factors.driving.length ? (
-          factors.driving.map((item) => (
-            <FactorCard
-              key={item.condition}
-              item={item}
-              baseline={factors.baseline_win_rate}
-              positive
-            />
-          ))
-        ) : (
-          <Text style={styles.empty}>No positive drivers in this sample.</Text>
-        )}
-      </View>
-
-      <View style={styles.pad}>
-        <GroupHeading label="Costing You Points" accent={result.loss} />
-        {factors.costing.length ? (
-          factors.costing.map((item) => (
-            <FactorCard
-              key={item.condition}
-              item={item}
-              baseline={factors.baseline_win_rate}
-              positive={false}
-            />
-          ))
-        ) : (
-          <Text style={styles.empty}>No negative drivers in this sample.</Text>
-        )}
-      </View>
-
-      <View style={[styles.pad, { marginTop: spacing.md }]}>
-        <BrutalButton
-          label="Explore All Metrics →"
-          onPress={() => setShowCatalog(true)}
-        />
-      </View>
-      </ScrollView>
       ) : null}
-    </PageLoadingTransition>
+    </View>
   );
 }
 
@@ -303,6 +392,12 @@ function FactorCard({
 }
 
 const styles = StyleSheet.create({
+  stack: { flex: 1, backgroundColor: colors.bg },
+  insightsLayer: { flex: 1 },
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: colors.bg,
+  },
   scroll: { flex: 1, backgroundColor: colors.bg },
   content: { paddingBottom: 100 },
   center: {
