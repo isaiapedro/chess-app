@@ -50,9 +50,9 @@ const GENERAL_METRICS: MetricDef[] = [
     name: "Development Speed",
     key: "opening_minors_developed_by_10",
     unit: "",
-    summary: "Knights and bishops developed by move 10 (0–4).",
+    summary: "Knights and bishops that left home by move 10 (0–4).",
     detail:
-      "After fullmove 10 we count how many of your knights and bishops have left their starting squares. Maximum is 4.",
+      "Tracks your four minor starting squares (b1/g1/c1/f1 or b8/g8/c8/f8). A piece counts once it leaves its home square, even if it is later traded off the board. Snapshot after fullmove 10. Maximum is 4.",
     format: (v) => v.toFixed(1),
     scale: { kind: "fixed", max: 4 },
   },
@@ -60,9 +60,9 @@ const GENERAL_METRICS: MetricDef[] = [
     name: "Center Control",
     key: "opening_center_control_pct",
     unit: "%",
-    summary: "Influence on d4, e4, d5, e5 across the opening phase.",
+    summary: "Share of d4/e4/d5/e5 you occupy or attack.",
     detail:
-      "On each position in the opening phase we score the four central squares you occupy or attack, then average that share across the phase (×100).",
+      "Each opening position scores the four central squares independently. A square counts only if you occupy it, or it is empty and you attack it (attacking an enemy piece on a center square does not count). Controlling all four = 100%, two = 50%. Reported value is the mean of those per-position percentages across the opening phase.",
     format: (v) => v.toFixed(1),
     scale: { kind: "fixed", max: 100 },
   },
@@ -90,11 +90,21 @@ const GENERAL_METRICS: MetricDef[] = [
     name: "Tempo Balance",
     key: "opening_tempo_waste_rate_pct",
     unit: "%",
-    summary: "Re-moves of pieces before all minors are developed.",
+    summary: "Share of non-pawn opening moves (incl. castle) that re-move a piece before development finishes.",
     detail:
-      "Among your non-pawn moves in the opening phase, the share that move a piece that already moved once while you still have undeveloped minors. Lower is cleaner development.",
+      "Counts every non-pawn move you make in the opening phase (minors, majors, king moves, and castling all count as tempo moves), up through the phase end (castling move when you castle, otherwise the opening cutoff). A re-move is leaving a square that piece already moved from while fewer than 4 of your minors have ever left home. TempoWaste% = re-moves ÷ all those non-pawn opening moves × 100. Lower means cleaner development.",
     format: (v) => v.toFixed(1),
     scale: { kind: "fixed", max: 100 },
+  },
+  {
+    name: "Pawn Moves",
+    key: "opening_pawn_moves_avg",
+    unit: "/game",
+    summary: "Average pawn moves you made during the opening phase.",
+    detail:
+      "Counts every pawn move you make while still in the opening (through castling fullmove if you castle, otherwise the opening cutoff). Averaged across games.",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "benchmark", fallback: 6 },
   },
 ];
 
@@ -165,6 +175,7 @@ const GENERAL_METRIC_KEYS = [
   "opening_castle_fullmove",
   "opening_uncastled_rate_pct",
   "opening_tempo_waste_rate_pct",
+  "opening_pawn_moves_avg",
 ] as const;
 
 export function countOpeningCatalogBanners(openingPhase: {
@@ -175,6 +186,7 @@ export function countOpeningCatalogBanners(openingPhase: {
     opening_castle_fullmove: number | null;
     opening_uncastled_rate_pct: number | null;
     opening_tempo_waste_rate_pct: number | null;
+    opening_pawn_moves_avg: number | null;
   } | null;
   sides: { white: unknown[]; black: unknown[] };
 } | null): number {
@@ -458,6 +470,7 @@ export function OpeningInsightsPanel() {
       opening_castle_fullmove: agg.opening_castle_fullmove,
       opening_uncastled_rate_pct: agg.opening_uncastled_rate_pct,
       opening_tempo_waste_rate_pct: agg.opening_tempo_waste_rate_pct,
+      opening_pawn_moves_avg: agg.opening_pawn_moves_avg,
     };
     return GENERAL_METRICS.map((def) => {
       const raw = values[def.key];

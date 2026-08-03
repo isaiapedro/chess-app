@@ -10,7 +10,10 @@ import {
 } from "react-native";
 import { Chess } from "chess.js";
 import { fetchExplorer, fetchMastersPgn, type MistakeItem } from "../api/client";
-import { ensureStudyGames } from "../storage/analyticsLoaders";
+import {
+  ensureStudyGames,
+  ensureStudyGamesUpTo,
+} from "../storage/analyticsLoaders";
 import { ChessBoard } from "../components/ChessBoard";
 import { OpeningPrepSection } from "../components/OpeningPrepSection";
 import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
@@ -22,7 +25,15 @@ import {
   Pill,
 } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
-import { TARGET_MISTAKE_MOMENTS } from "../engine/analysisConfig";
+import {
+  GLOBAL_FIRST_SCAN_MAX_GAMES,
+  GLOBAL_MAX_GAMES,
+  TARGET_MISTAKE_MOMENTS,
+} from "../engine/analysisConfig";
+import {
+  beginPuzzleBatch,
+  endPuzzleBatch,
+} from "../engine/backgroundWork";
 import {
   formatEval,
   displayCp,
@@ -36,8 +47,12 @@ import { applyUciMove } from "../engine/chessMoves";
 import { consumeCandidates } from "../engine/candidateBucket";
 import {
   createEvalLookup,
+  getActiveGlobalScan,
+  globalScanSessionKey,
+  joinActiveGlobalScanIfOwned,
   periodReservoirStatus,
   runGlobalPeriodAnalysis,
+  type GlobalAnalysisState,
 } from "../engine/globalAnalysis";
 import { cancelStudyPrefetch } from "../engine/studyPrefetch";
 import { useStockfish } from "../engine/StockfishProvider";
@@ -47,6 +62,7 @@ import {
   STUDY_ANALYSIS_TTL_MS,
   writeCache,
 } from "../storage/cache";
+import { readMistakesCacheForPeriod } from "../storage/periodCacheReuse";
 import { studyMistakesCacheKey } from "../storage/studyCacheKeys";
 import { colors, font, result, spacing } from "../theme";
 
@@ -168,6 +184,28 @@ export function StudyScreen() {
   const mistakesCacheKey = studyMistakesCacheKey(queryFilters);
 
   useEffect(() => {
+    const quizActive =
+      mode === "mistakes" &&
+      Boolean(current) &&
+      !loadingMistakes &&
+      !scanningMore &&
+      !showScanMore &&
+      !allDone;
+    if (!quizActive) return;
+    beginPuzzleBatch();
+    return () => {
+      endPuzzleBatch();
+    };
+  }, [
+    mode,
+    current,
+    loadingMistakes,
+    scanningMore,
+    showScanMore,
+    allDone,
+  ]);
+
+  useEffect(() => {
     if (retryTimerRef.current) {
       clearTimeout(retryTimerRef.current);
       retryTimerRef.current = null;
@@ -259,42 +297,44 @@ export function StudyScreen() {
   );
 
   const loadMistakes = useCallback(async (force = false) => {
-    if (!engineReady && !force) {
+    const hydrateFromCache = async () => {
+      const games = await ensureStudyGames(queryFilters, false);
+      studyGamesRef.current = games;
       const cached = parseMistakesCache(
-        await readCache<MistakesCachePayload | MistakeItem[]>(
-          mistakesCacheKey,
-          STUDY_ANALYSIS_TTL_MS
+        await readMistakesCacheForPeriod(
+          queryFilters,
+          games.map((game) => String(game.id))
         )
       );
-      if (cached?.moments.length) {
-        setMistakes(cached.moments);
-        setIdx(0);
-        visibleBatchStartRef.current = 0;
-        pendingBatchRef.current = null;
-        setPendingReady(false);
-        secondPagePrefetchKeyRef.current = null;
-        scannedIdsRef.current = cached.scannedGameIds;
-        pendingCandidatesRef.current = cached.pendingCandidates || [];
-        deferredCandidatesRef.current = cached.deferredCandidates || [];
-        setPendingCount((cached.pendingCandidates || []).length);
-        setRemainingGames(cached.remaining);
-        thresholdPassRef.current = cached.thresholdPass || "strict";
-        baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-        setShowScanMore(false);
-        setMistakesError(null);
-        loadedCacheKeyRef.current = mistakesCacheKey;
-        setLoadingMistakes(false);
-        setAnalyzeStatus(null);
-        setAnalyzeProgress(null);
-        void ensureStudyGames(queryFilters, false).then((games) => {
-          studyGamesRef.current = games;
-          void syncMistakeReservoir(
-            games,
-            (cached.pendingCandidates || []).length
-          );
-        });
-        return;
-      }
+      if (!cached?.moments.length) return false;
+      setMistakes(cached.moments);
+      setIdx(0);
+      visibleBatchStartRef.current = 0;
+      pendingBatchRef.current = null;
+      setPendingReady(false);
+      secondPagePrefetchKeyRef.current = null;
+      scannedIdsRef.current = cached.scannedGameIds;
+      pendingCandidatesRef.current = cached.pendingCandidates || [];
+      deferredCandidatesRef.current = cached.deferredCandidates || [];
+      setPendingCount((cached.pendingCandidates || []).length);
+      setRemainingGames(cached.remaining);
+      thresholdPassRef.current = cached.thresholdPass || "strict";
+      baselineAvailableRef.current = Boolean(cached.baselineAvailable);
+      setShowScanMore(false);
+      setMistakesError(null);
+      loadedCacheKeyRef.current = mistakesCacheKey;
+      setLoadingMistakes(false);
+      setAnalyzeStatus(null);
+      setAnalyzeProgress(null);
+      void syncMistakeReservoir(
+        games,
+        (cached.pendingCandidates || []).length
+      );
+      return true;
+    };
+
+    if (!engineReady && !force) {
+      if (await hydrateFromCache()) return;
     }
     if (!engineReady) {
       setMistakesError(engineError || "Waiting for on-device Stockfish…");
@@ -307,47 +347,13 @@ export function StudyScreen() {
       return;
     }
     if (!force) {
-      const cached = parseMistakesCache(
-        await readCache<MistakesCachePayload | MistakeItem[]>(
-          mistakesCacheKey,
-          STUDY_ANALYSIS_TTL_MS
-        )
-      );
-      if (cached?.moments.length) {
-        setMistakes(cached.moments);
-        setIdx(0);
-        visibleBatchStartRef.current = 0;
-        pendingBatchRef.current = null;
-        setPendingReady(false);
-        secondPagePrefetchKeyRef.current = null;
-        scannedIdsRef.current = cached.scannedGameIds;
-        pendingCandidatesRef.current = cached.pendingCandidates || [];
-        deferredCandidatesRef.current = cached.deferredCandidates || [];
-        setPendingCount((cached.pendingCandidates || []).length);
-        setRemainingGames(cached.remaining);
-        thresholdPassRef.current = cached.thresholdPass || "strict";
-        baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-        setShowScanMore(false);
-        setMistakesError(null);
-        loadedCacheKeyRef.current = mistakesCacheKey;
-        setLoadingMistakes(false);
-        setAnalyzeStatus(null);
-        setAnalyzeProgress(null);
-        void ensureStudyGames(queryFilters, false).then((games) => {
-          studyGamesRef.current = games;
-          void syncMistakeReservoir(
-            games,
-            (cached.pendingCandidates || []).length
-          );
-        });
-        return;
-      }
+      if (await hydrateFromCache()) return;
     }
 
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
-    cancelStudyPrefetch();
+    const sessionKey = globalScanSessionKey(queryFilters);
 
     secondPagePrefetchKeyRef.current = null;
     pendingBatchRef.current = null;
@@ -366,11 +372,86 @@ export function StudyScreen() {
     setAnalyzeProgress(null);
     setAnalyzeStatus("Loading recent games…");
     let completed = false;
+    let heldPuzzleSlot = false;
     try {
       const games = await ensureStudyGames(queryFilters, force);
       studyGamesRef.current = games;
+
+      if (!force) {
+        const active = getActiveGlobalScan();
+        if (
+          active &&
+          active.sessionKey === sessionKey &&
+          active.owner === "prefetch"
+        ) {
+          setAnalyzeStatus("Waiting for background scan…");
+        }
+        const joined = await joinActiveGlobalScanIfOwned({
+          sessionKey,
+          owners: ["prefetch"],
+          signal,
+          until: async () => {
+            const cached = parseMistakesCache(
+              await readCache<MistakesCachePayload | MistakeItem[]>(
+                mistakesCacheKey,
+                STUDY_ANALYSIS_TTL_MS
+              )
+            );
+            return Boolean(cached?.moments.length);
+          },
+        });
+        if (signal.cancelled) return;
+        if (joined) {
+          const afterPrefetch = parseMistakesCache(
+            await readCache<MistakesCachePayload | MistakeItem[]>(
+              mistakesCacheKey,
+              STUDY_ANALYSIS_TTL_MS
+            )
+          );
+          if (afterPrefetch?.moments.length) {
+            setMistakes(afterPrefetch.moments);
+            setIdx(0);
+            visibleBatchStartRef.current = 0;
+            pendingBatchRef.current = null;
+            setPendingReady(false);
+            secondPagePrefetchKeyRef.current = null;
+            scannedIdsRef.current = afterPrefetch.scannedGameIds;
+            pendingCandidatesRef.current = afterPrefetch.pendingCandidates || [];
+            deferredCandidatesRef.current = afterPrefetch.deferredCandidates || [];
+            setPendingCount((afterPrefetch.pendingCandidates || []).length);
+            setRemainingGames(afterPrefetch.remaining);
+            thresholdPassRef.current = afterPrefetch.thresholdPass || "strict";
+            baselineAvailableRef.current = Boolean(afterPrefetch.baselineAvailable);
+            setShowScanMore(false);
+            setMistakesError(null);
+            loadedCacheKeyRef.current = mistakesCacheKey;
+            setLoadingMistakes(false);
+            setAnalyzeStatus(null);
+            setAnalyzeProgress(null);
+            setAnalysisComplete(true);
+            completed = true;
+            void syncMistakeReservoir(
+              games,
+              (afterPrefetch.pendingCandidates || []).length
+            );
+            return;
+          }
+        }
+      }
+
+      cancelStudyPrefetch();
+      beginPuzzleBatch();
+      heldPuzzleSlot = true;
       setAnalyzeStatus("Global Stockfish scan…");
       let delivered = false;
+      const latestStateRef = {
+        current: null as GlobalAnalysisState | null,
+      };
+      const partialBatchRef = {
+        current: null as Awaited<
+          ReturnType<typeof refineRecentMistakeCandidates>
+        > | null,
+      };
       const applyBatch = async (
         batch: Awaited<ReturnType<typeof refineRecentMistakeCandidates>>,
         candidates: MistakeItem[]
@@ -409,6 +490,10 @@ export function StudyScreen() {
           setAnalysisComplete(true);
           delivered = true;
           completed = true;
+          if (heldPuzzleSlot) {
+            endPuzzleBatch();
+            heldPuzzleSlot = false;
+          }
         }
       };
 
@@ -417,7 +502,9 @@ export function StudyScreen() {
         evaluate,
         signal,
         games,
-        earlyMistakeTarget: TARGET_MISTAKE_MOMENTS,
+        owner: "study",
+        sessionKey,
+        maxGames: GLOBAL_FIRST_SCAN_MAX_GAMES,
         onProgress: (p) => {
           if (delivered) return;
           setAnalyzeStatus(p.status);
@@ -432,6 +519,9 @@ export function StudyScreen() {
             engine: p.engine,
             currentGame: p.currentGame,
           });
+        },
+        onGameScanned: (state) => {
+          latestStateRef.current = state;
         },
         onEarlyMistakesReady: async (candidates, state) => {
           if (signal.cancelled || delivered) return false;
@@ -456,11 +546,48 @@ export function StudyScreen() {
             },
             onProgress: pushProgress,
           });
-          await applyBatch(batch, batch.moments);
+          if (signal.cancelled) return false;
+          partialBatchRef.current = batch;
+          if (batch.moments.length >= TARGET_MISTAKE_MOMENTS) {
+            await applyBatch(batch, batch.moments);
+          }
           return true;
         },
       });
       if (signal.cancelled) return;
+      const partialBatch = partialBatchRef.current;
+      const latestState = latestStateRef.current;
+      if (
+        !delivered &&
+        partialBatch &&
+        partialBatch.moments.length < TARGET_MISTAKE_MOMENTS &&
+        latestState?.mistakeCandidates?.length
+      ) {
+        setAnalyzeStatus("Refining remaining candidates…");
+        const batch = await refineRecentMistakeCandidates({
+          candidates: latestState.mistakeCandidates,
+          games,
+          evaluate,
+          signal,
+          limit: TARGET_MISTAKE_MOMENTS,
+          existingMoments: partialBatch.moments,
+          lookupEval: createEvalLookup(latestState),
+          fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
+          fetchExplorer: async (fen, source) => {
+            const res = await fetchExplorer(fen, source);
+            return {
+              moves: res.moves || [],
+              topGames: res.topGames || [],
+            };
+          },
+          onProgress: pushProgress,
+        });
+        if (!signal.cancelled) partialBatchRef.current = batch;
+      }
+      const finalBatch = partialBatchRef.current;
+      if (!delivered && finalBatch?.moments.length) {
+        await applyBatch(finalBatch, finalBatch.moments);
+      }
       if (!delivered) {
         setMistakesError("No critical swings found in recent games.");
         setShowScanMore(true);
@@ -471,6 +598,7 @@ export function StudyScreen() {
       setMistakes([]);
       setMistakesError(e instanceof Error ? e.message : "Failed to analyze");
     } finally {
+      if (heldPuzzleSlot) endPuzzleBatch();
       if (!signal.cancelled) {
         if (completed) {
           setAnalysisComplete(true);
@@ -526,6 +654,7 @@ export function StudyScreen() {
       setAnalyzeStatus("Scanning next batch…");
     }
     cancelStudyPrefetch();
+    beginPuzzleBatch();
     if (silent) {
       backgroundScanningRef.current = true;
     } else {
@@ -535,8 +664,12 @@ export function StudyScreen() {
     let completed = false;
     try {
       let games = studyGamesRef.current;
-      if (!games.length) {
-        games = await ensureStudyGames(queryFilters, false);
+      if (games.length < GLOBAL_MAX_GAMES) {
+        games = await ensureStudyGamesUpTo(
+          queryFilters,
+          GLOBAL_MAX_GAMES,
+          false
+        );
         studyGamesRef.current = games;
       }
 
@@ -592,7 +725,9 @@ export function StudyScreen() {
           evaluate,
           signal,
           games,
-          earlyMistakeTarget: TARGET_MISTAKE_MOMENTS,
+          owner: "study",
+          sessionKey: globalScanSessionKey(queryFilters),
+          continueScan: true,
           onEarlyMistakesReady: async (candidates, state) => {
             if (signal.cancelled || early.batch) return false;
             const pool = state.mistakeCandidates.length
@@ -695,6 +830,7 @@ export function StudyScreen() {
         setMistakesError(e instanceof Error ? e.message : "Failed to scan more");
       }
     } finally {
+      endPuzzleBatch();
       if (silent) {
         backgroundScanningRef.current = false;
         if (revealPendingOnCompleteRef.current) {
@@ -777,49 +913,6 @@ export function StudyScreen() {
     }
     void continueScanMistakes(false);
   }, [applyPendingMistakesBatch, continueScanMistakes]);
-
-  useEffect(() => {
-    if (
-      mode !== "mistakes" ||
-      idx !== visibleBatchStartRef.current + 1 ||
-      loadingMistakes ||
-      scanningMore ||
-      scanExhausted ||
-      pendingReady ||
-      pendingBatchRef.current
-    ) {
-      return;
-    }
-    // #region agent log
-    const { DEBUG_DISABLE_BACKGROUND_JOBS } = require("../engine/debugFlags");
-    if (DEBUG_DISABLE_BACKGROUND_JOBS) {
-      console.log("[bg-off] StudyScreen second-page scan skipped");
-      return;
-    }
-    // #endregion
-    const canLoadMore =
-      remainingGames > 0 ||
-      pendingCount > 0 ||
-      !periodComplete ||
-      baselineAvailableRef.current;
-    if (!canLoadMore) return;
-    const key = `${mistakesCacheKey}:batch:${visibleBatchStartRef.current}`;
-    if (secondPagePrefetchKeyRef.current === key) return;
-    secondPagePrefetchKeyRef.current = key;
-    void continueScanMistakes(true);
-  }, [
-    mode,
-    idx,
-    loadingMistakes,
-    scanningMore,
-    scanExhausted,
-    pendingReady,
-    remainingGames,
-    pendingCount,
-    periodComplete,
-    mistakesCacheKey,
-    continueScanMistakes,
-  ]);
 
   useEffect(() => {
     const force = refreshToken !== lastRefreshRef.current;

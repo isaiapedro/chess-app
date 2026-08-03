@@ -1,11 +1,22 @@
 from dataclasses import dataclass
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+import threading
+import time
 
 import pandas as pd
 from fastapi import HTTPException
 
 from api.schemas import GameFilters
-from api.services.serialize import dataframe_to_records, to_json_safe
-from load_data import load_user_data
+from api.services.serialize import (
+    dataframe_to_records,
+    study_games_records,
+    to_json_safe,
+)
+from cache import CACHE_BASE, atomic_write_json, cache_file_lock
+from load_data import games_store_watermark, load_user_data
 from stats import (
     calculate_activity_stats,
     calculate_archetype_badges,
@@ -18,6 +29,31 @@ from stats import (
     normalize_opening_eco,
 )
 
+DEFAULT_GAMES_PAGE_LIMIT = 30
+MAX_GAMES_PAGE_LIMIT = 100
+MEMO_TTL_SEC = 24 * 60 * 60
+
+
+def _stats_disk_ttl_sec() -> int:
+    raw = os.getenv("STATS_DISK_TTL_SEC")
+    if raw is None:
+        return 24 * 60 * 60
+    try:
+        return max(24 * 60 * 60, int(raw))
+    except ValueError:
+        return 24 * 60 * 60
+
+
+STATS_DISK_TTL_SEC = _stats_disk_ttl_sec()
+STATS_CACHE_DIR = CACHE_BASE / "session_stats"
+
+_memo_lock = threading.Lock()
+_key_locks_guard = threading.Lock()
+_key_locks: dict[str, threading.Lock] = {}
+_raw_memo: dict[str, tuple[float, pd.DataFrame]] = {}
+_loaded_memo: dict[str, tuple[float, "LoadedGames"]] = {}
+_stats_memo: dict[str, tuple[float, dict]] = {}
+
 
 @dataclass
 class LoadedGames:
@@ -25,6 +61,95 @@ class LoadedGames:
     filters: GameFilters
     raw_df: pd.DataFrame
     filtered_df: pd.DataFrame
+
+
+def _day_bucket() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def raw_memo_key(username: str, platform: str, timeframe: str) -> str:
+    return f"{platform}|{username.lower()}|{timeframe}|{_day_bucket()}"
+
+
+def loaded_memo_key(username: str, filters: GameFilters) -> str:
+    eco = ",".join(filters.eco) if filters.eco else ""
+    return (
+        f"{raw_memo_key(username, filters.platform, filters.timeframe)}|"
+        f"{filters.speed or ''}|{filters.color or ''}|"
+        f"{filters.result or ''}|{eco}|"
+        f"{filters.date_from or ''}|{filters.date_to or ''}"
+    )
+
+
+def stats_memo_key(username: str, filters: GameFilters) -> str:
+    return f"stats|{loaded_memo_key(username, filters)}"
+
+
+def _stats_disk_path(key: str):
+    digest = hashlib.md5(key.encode("utf-8")).hexdigest()
+    return STATS_CACHE_DIR / f"{digest}.json"
+
+
+def _stats_disk_get(key: str, watermark: int):
+    path = _stats_disk_path(key)
+    with cache_file_lock(path):
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            return None
+    if not isinstance(payload, dict):
+        return None
+    try:
+        saved_at = float(payload.get("saved_at") or 0)
+        cached_wm = int(payload.get("watermark") or 0)
+    except (TypeError, ValueError):
+        return None
+    if time.time() - saved_at >= STATS_DISK_TTL_SEC:
+        return None
+    if cached_wm != int(watermark):
+        return None
+    stats = payload.get("stats")
+    return stats if isinstance(stats, dict) else None
+
+
+def _stats_disk_set(key: str, watermark: int, stats: dict) -> None:
+    path = _stats_disk_path(key)
+    payload = {
+        "key": key,
+        "watermark": int(watermark),
+        "saved_at": time.time(),
+        "stats": stats,
+    }
+    with cache_file_lock(path):
+        atomic_write_json(path, payload)
+
+
+def _memo_get(store: dict, key: str):
+    with _memo_lock:
+        item = store.get(key)
+        if item is None:
+            return None
+        expires_at, value = item
+        if time.monotonic() >= expires_at:
+            del store[key]
+            return None
+        return value
+
+
+def _memo_set(store: dict, key: str, value) -> None:
+    with _memo_lock:
+        store[key] = (time.monotonic() + MEMO_TTL_SEC, value)
+
+
+def _key_lock(key: str) -> threading.Lock:
+    with _key_locks_guard:
+        lock = _key_locks.get(key)
+        if lock is None:
+            lock = threading.Lock()
+            _key_locks[key] = lock
+        return lock
 
 
 def apply_filters(df: pd.DataFrame, filters: GameFilters) -> pd.DataFrame:
@@ -53,29 +178,86 @@ def apply_filters(df: pd.DataFrame, filters: GameFilters) -> pd.DataFrame:
     return out
 
 
+def load_raw_games(
+    username: str, timeframe: str, platform: str
+) -> pd.DataFrame:
+    key = raw_memo_key(username, platform, timeframe)
+    cached = _memo_get(_raw_memo, key)
+    if cached is not None:
+        return cached
+
+    with _key_lock(f"raw:{key}"):
+        cached = _memo_get(_raw_memo, key)
+        if cached is not None:
+            return cached
+
+        raw_df = load_user_data(username, timeframe, platform=platform)
+        if raw_df.empty:
+            return raw_df
+
+        raw_df = raw_df.copy()
+        raw_df["opening_eco"] = raw_df["opening_eco"].apply(normalize_opening_eco)
+        _memo_set(_raw_memo, key, raw_df)
+        return raw_df
+
+
 def load_and_filter(username: str, filters: GameFilters) -> LoadedGames:
-    raw_df = load_user_data(
-        username, filters.timeframe, platform=filters.platform
-    )
-    if raw_df.empty:
-        raise HTTPException(
-            status_code=404,
-            detail=(
-                f"No games found for user '{username}' on "
-                f"{filters.platform} in timeframe '{filters.timeframe}'."
-            ),
+    key = loaded_memo_key(username, filters)
+    cached = _memo_get(_loaded_memo, key)
+    if cached is not None:
+        return cached
+
+    with _key_lock(f"loaded:{key}"):
+        cached = _memo_get(_loaded_memo, key)
+        if cached is not None:
+            return cached
+
+        raw_df = load_raw_games(username, filters.timeframe, filters.platform)
+        if raw_df.empty:
+            raise HTTPException(
+                status_code=404,
+                detail=(
+                    f"No games found for user '{username}' on "
+                    f"{filters.platform} in timeframe '{filters.timeframe}'."
+                ),
+            )
+
+        filtered_df = apply_filters(raw_df, filters)
+        loaded = LoadedGames(
+            username=username,
+            filters=filters,
+            raw_df=raw_df,
+            filtered_df=filtered_df,
         )
+        _memo_set(_loaded_memo, key, loaded)
+        return loaded
 
-    raw_df = raw_df.copy()
-    raw_df["opening_eco"] = raw_df["opening_eco"].apply(normalize_opening_eco)
-    filtered_df = apply_filters(raw_df, filters)
 
-    return LoadedGames(
-        username=username,
-        filters=filters,
-        raw_df=raw_df,
-        filtered_df=filtered_df,
-    )
+def stats_for_loaded(loaded: LoadedGames) -> dict:
+    key = stats_memo_key(loaded.username, loaded.filters)
+    cached = _memo_get(_stats_memo, key)
+    if cached is not None:
+        return cached
+
+    with _key_lock(key):
+        cached = _memo_get(_stats_memo, key)
+        if cached is not None:
+            return cached
+
+        watermark = games_store_watermark(
+            loaded.filters.platform, loaded.username
+        )
+        disk = _stats_disk_get(key, watermark)
+        if disk is not None:
+            _memo_set(_stats_memo, key, disk)
+            return disk
+
+        stats = to_json_safe(compute_all_stats(loaded.filtered_df))
+        if not isinstance(stats, dict):
+            stats = {}
+        _memo_set(_stats_memo, key, stats)
+        _stats_disk_set(key, watermark, stats)
+        return stats
 
 
 def filters_meta(filters: GameFilters) -> dict:
@@ -225,21 +407,45 @@ def compute_all_stats(df: pd.DataFrame) -> dict:
     }
 
 
+def page_games_df(
+    df: pd.DataFrame,
+    limit: int | None = DEFAULT_GAMES_PAGE_LIMIT,
+    offset: int = 0,
+) -> tuple[pd.DataFrame, int]:
+    total = len(df)
+    if df.empty:
+        return df, total
+    work = df.sort_values("created_at", ascending=False)
+    start = max(0, int(offset or 0))
+    if limit is None:
+        return work.iloc[start:], total
+    size = max(1, min(int(limit), MAX_GAMES_PAGE_LIMIT))
+    return work.iloc[start : start + size], total
+
+
 def games_payload(
-    loaded: LoadedGames, include_pgn: bool = False
+    loaded: LoadedGames,
+    include_pgn: bool = False,
+    limit: int | None = DEFAULT_GAMES_PAGE_LIMIT,
+    offset: int = 0,
 ) -> dict:
-    drop = [] if include_pgn else ["pgn_str"]
+    page_df, total = page_games_df(loaded.filtered_df, limit=limit, offset=offset)
+    games = study_games_records(page_df, include_moves=include_pgn)
     return {
         "username": loaded.username,
         "platform": loaded.filters.platform,
         "timeframe": loaded.filters.timeframe,
-        "count": len(loaded.filtered_df),
-        "games": dataframe_to_records(loaded.filtered_df, drop_columns=drop),
+        "count": len(games),
+        "total": total,
+        "limit": None if limit is None else max(1, min(int(limit), MAX_GAMES_PAGE_LIMIT)),
+        "offset": max(0, int(offset or 0)),
+        "has_more": max(0, int(offset or 0)) + len(games) < total,
+        "games": games,
     }
 
 
 def recap_payload(loaded: LoadedGames) -> dict:
-    stats = compute_all_stats(loaded.filtered_df)
+    stats = stats_for_loaded(loaded)
     headline = to_json_safe(stats["headline"])
     activity = to_json_safe(stats["activity"]) or {}
     return {
@@ -266,7 +472,7 @@ def recap_payload(loaded: LoadedGames) -> dict:
 
 
 def insights_payload(loaded: LoadedGames) -> dict:
-    stats = compute_all_stats(loaded.filtered_df)
+    stats = stats_for_loaded(loaded)
     notation = to_json_safe(stats["notation"])
     opening = to_json_safe(stats["opening"])
     if isinstance(opening, dict):
@@ -312,3 +518,32 @@ def insights_payload(loaded: LoadedGames) -> dict:
             ),
         },
     }
+
+
+def session_payload(
+    loaded: LoadedGames,
+    include_pgn: bool = False,
+    limit: int | None = DEFAULT_GAMES_PAGE_LIMIT,
+    offset: int = 0,
+) -> dict:
+    stats_for_loaded(loaded)
+    return {
+        "games": games_payload(
+            loaded, include_pgn=include_pgn, limit=limit, offset=offset
+        ),
+        "recap": recap_payload(loaded),
+        "insights": insights_payload(loaded),
+    }
+
+
+def build_session(
+    username: str,
+    filters: GameFilters,
+    include_pgn: bool = False,
+    limit: int | None = DEFAULT_GAMES_PAGE_LIMIT,
+    offset: int = 0,
+) -> dict:
+    loaded = load_and_filter(username, filters)
+    return session_payload(
+        loaded, include_pgn=include_pgn, limit=limit, offset=offset
+    )

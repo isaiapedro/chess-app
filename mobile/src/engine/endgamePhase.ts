@@ -1,8 +1,10 @@
 import { Chess, type Color, type Move, type PieceSymbol, type Square } from "chess.js";
 import type { StudyGame } from "./analyzeMistakes";
 import { extractMoveTimesFromPgn } from "./clockFromPgn";
+import { HEURISTICS_EG_KING_EVERY } from "./analysisConfig";
 import {
   userWinProbability,
+  classifyEvalDrop,
   WP_BLUNDER_DROP,
   WP_ENDGAME_ADVANTAGE,
 } from "./winProb";
@@ -410,10 +412,12 @@ export function kingDistanceToEnemyPawns(
   return best === Infinity ? null : best;
 }
 
-function pawnDiffForUser(board: Chess, color: Color): number {
-  const user = board.findPiece({ type: "p", color }).length;
-  const opp = board.findPiece({ type: "p", color: swapColor(color) }).length;
-  return user - opp;
+export function pawnDiffDeltaForCapture(
+  isUser: boolean,
+  captured: PieceSymbol | undefined
+): number {
+  if (captured !== "p") return 0;
+  return isUser ? 1 : -1;
 }
 
 function isMateForUser(cpWhite: number, userIsWhite: boolean): boolean {
@@ -470,7 +474,8 @@ export function analyzeEndgameGame(
   let endgameStartPly: number | null = null;
   const centerScores: number[] = [];
   const kingDists: number[] = [];
-  const pawnDiffs: number[] = [];
+  let pawnDiff = 0;
+  let egKingSampleIdx = 0;
   let blunders = 0;
   let pieceTrades = 0;
   let beneficialTrades = 0;
@@ -536,11 +541,14 @@ export function analyzeEndgameGame(
     const inEndgame = endgameStartPly != null && plyIdx >= endgameStartPly;
 
     if (inEndgame) {
-      const centr = kingCentralizationScore(board, userColor);
-      if (centr != null) centerScores.push(centr);
-      const dist = kingDistanceToEnemyPawns(board, userColor);
-      if (dist != null) kingDists.push(dist);
-      pawnDiffs.push(pawnDiffForUser(board, userColor));
+      pawnDiff += pawnDiffDeltaForCapture(isUser, captured);
+      if (egKingSampleIdx % HEURISTICS_EG_KING_EVERY === 0) {
+        const centr = kingCentralizationScore(board, userColor);
+        if (centr != null) centerScores.push(centr);
+        const dist = kingDistanceToEnemyPawns(board, userColor);
+        if (dist != null) kingDists.push(dist);
+      }
+      egKingSampleIdx += 1;
 
       const te = classifyTheoretical(board, userColor);
       if (te) {
@@ -552,7 +560,7 @@ export function analyzeEndgameGame(
       }
 
       if (isUser && wpBefore != null && wpAfter != null) {
-        if (wpBefore - wpAfter >= WP_BLUNDER_DROP) blunders += 1;
+        if (classifyEvalDrop(wpBefore, wpAfter) === "blunder") blunders += 1;
       }
 
       if (
@@ -634,7 +642,7 @@ export function analyzeEndgameGame(
     blunders,
     king_centralization: mean(centerScores, 2),
     king_distance: mean(kingDists, 2),
-    pawn_diff: mean(pawnDiffs, 2),
+    pawn_diff: pawnDiff,
     piece_trades: pieceTrades,
     beneficial_trades: beneficialTrades,
     winning_trades: winningTrades,

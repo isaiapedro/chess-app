@@ -1,18 +1,26 @@
 import type { QueryFilters } from "../api/client";
 import {
-  fetchInsights,
-  fetchRecap,
-  fetchStudyGames,
+  GAMES_FIRST_PAGE_SIZE,
+  GAMES_PAGE_SIZE,
 } from "../api/client";
+import { GLOBAL_MAX_GAMES } from "../engine/analysisConfig";
 import type { InsightsResponse, RecapResponse } from "../api/types";
 import type { StudyGame } from "../engine/analyzeMistakes";
+import {
+  loadLocalGamesPage,
+  toStudyGameList,
+  type NormalizedGame,
+} from "../data/platformGames";
+import {
+  buildLocalInsights,
+  buildLocalRecap,
+} from "../engine/localRecap";
 import {
   mergeEndgameHeuristicWithBucket,
 } from "../engine/evalBucketMetrics";
 import {
   loadPermanentEvalStore,
   resolveStyleMetricsForPeriod,
-  toStudyGames,
 } from "../engine/globalAnalysis";
 import {
   analyzeHeuristicGamesBatched,
@@ -43,7 +51,12 @@ import type { StyleMetricsAggregate } from "../engine/styleMetrics";
 import {
   STUDY_ANALYSIS_TTL_MS,
   GAMES_TTL_MS,
+  INSIGHTS_TTL_MS,
+  INSIGHTS_RECENT_TTL_MS,
+  PERMANENT_CACHE_TTL_MS,
+  clearInflightByPrefix,
   readCache,
+  takeInflight,
   writeCache,
 } from "./cache";
 import {
@@ -56,28 +69,192 @@ import {
   analyticsStudyGamesCacheKey,
   analyticsVaultHeuristicsCacheKey,
   studyFiltersKey,
+  studyHeuristicsStoreCacheKey,
+  relatedPeriodFilters,
 } from "./studyCacheKeys";
 
-type InflightMap = Map<string, Promise<unknown>>;
+type HeuristicGameEntry = {
+  opening: OpeningGameRow;
+  middlegame: MiddlegameGameRow;
+  endgame: EndgameGameRow;
+};
 
-const inflight: InflightMap = new Map();
+type HeuristicStore = {
+  games: Record<string, HeuristicGameEntry>;
+};
+
+type PeriodHeuristicCache = {
+  openingRows: OpeningGameRow[];
+  middlegameRows: MiddlegameGameRow[];
+  endgameRows: EndgameGameRow[];
+  gameIds: string[];
+};
+
+function emptyHeuristicStore(): HeuristicStore {
+  return { games: {} };
+}
+
+async function loadHeuristicStore(
+  filters: Pick<QueryFilters, "username" | "platform">
+): Promise<HeuristicStore> {
+  const cached = await readCache<HeuristicStore>(
+    studyHeuristicsStoreCacheKey(filters),
+    PERMANENT_CACHE_TTL_MS
+  );
+  return cached?.games ? cached : emptyHeuristicStore();
+}
+
+async function saveHeuristicStore(
+  filters: Pick<QueryFilters, "username" | "platform">,
+  store: HeuristicStore
+): Promise<void> {
+  await writeCache(studyHeuristicsStoreCacheKey(filters), store);
+}
+
+function mergeHeuristicRowsIntoStore(
+  store: HeuristicStore,
+  openingRows: OpeningGameRow[],
+  middlegameRows: MiddlegameGameRow[],
+  endgameRows: EndgameGameRow[],
+  gameIds: string[]
+): HeuristicStore {
+  const games = { ...store.games };
+  for (let i = 0; i < gameIds.length; i += 1) {
+    const id = gameIds[i];
+    const opening = openingRows[i];
+    const middlegame = middlegameRows[i];
+    const endgame = endgameRows[i];
+    if (!id || !opening || !middlegame || !endgame) continue;
+    games[id] = { opening, middlegame, endgame };
+  }
+  return { games };
+}
+
+function sliceHeuristicStoreForPeriod(
+  store: HeuristicStore,
+  periodGames: StudyGame[]
+): PeriodHeuristicCache {
+  const openingRows: OpeningGameRow[] = [];
+  const middlegameRows: MiddlegameGameRow[] = [];
+  const endgameRows: EndgameGameRow[] = [];
+  const gameIds: string[] = [];
+  for (const game of periodGames) {
+    const id = String(game.id);
+    const entry = store.games[id];
+    if (!entry) continue;
+    openingRows.push(entry.opening);
+    middlegameRows.push(entry.middlegame);
+    endgameRows.push(entry.endgame);
+    gameIds.push(id);
+  }
+  return { openingRows, middlegameRows, endgameRows, gameIds };
+}
+
+function missingHeuristicGames(
+  store: HeuristicStore,
+  periodGames: StudyGame[]
+): StudyGame[] {
+  return periodGames.filter((game) => !store.games[String(game.id)]);
+}
 
 function filtersKey(filters: QueryFilters): string {
   return studyFiltersKey(filters);
 }
 
-function takeInflight<T>(key: string, factory: () => Promise<T>): Promise<T> {
-  const existing = inflight.get(key) as Promise<T> | undefined;
-  if (existing) return existing;
-  const promise = factory().finally(() => {
-    if (inflight.get(key) === promise) inflight.delete(key);
-  });
-  inflight.set(key, promise);
-  return promise;
+function analyticsTtlMs(filters: QueryFilters): number {
+  if (filters.timeframe === "1 month") return INSIGHTS_RECENT_TTL_MS;
+  const from = filters.dateFrom || null;
+  const to = filters.dateTo || null;
+  if (from && to && from === to) return INSIGHTS_RECENT_TTL_MS;
+  return INSIGHTS_TTL_MS;
 }
 
+export type SessionBundle = {
+  games: StudyGame[];
+  recap: RecapResponse;
+  insights: InsightsResponse;
+};
+
 export function clearAnalyticsInflight(): void {
-  inflight.clear();
+  clearInflightByPrefix("session:");
+  clearInflightByPrefix("games:");
+  clearInflightByPrefix("games-up-to:");
+  clearInflightByPrefix("local-ingest:");
+  clearInflightByPrefix("mix:");
+  clearInflightByPrefix("vault-heuristics:");
+  clearInflightByPrefix("recap:");
+  clearInflightByPrefix("insights:");
+  clearInflightByPrefix("study-games:");
+  clearInflightByPrefix("rtc:");
+  clearInflightByPrefix("baselines:");
+}
+
+async function writeSessionCaches(
+  filters: QueryFilters,
+  bundle: SessionBundle
+): Promise<void> {
+  await Promise.all([
+    writeCache(analyticsStudyGamesCacheKey(filters), bundle.games),
+    writeCache(analyticsRecapCacheKey(filters), bundle.recap),
+    writeCache(analyticsInsightsCacheKey(filters), bundle.insights),
+  ]);
+}
+
+function emptyRecap(filters: QueryFilters): RecapResponse {
+  return buildLocalRecap(filters, []);
+}
+
+function emptyInsights(filters: QueryFilters): InsightsResponse {
+  return buildLocalInsights(filters, []);
+}
+
+export async function ensureSession(
+  filters: QueryFilters,
+  forceNetwork = false
+): Promise<SessionBundle> {
+  const fk = filtersKey(filters);
+  const mode = forceNetwork ? "force" : "soft";
+  return takeInflight(`session:${fk}:${mode}`, async () => {
+    const gamesKey = analyticsStudyGamesCacheKey(filters);
+    const recapKey = analyticsRecapCacheKey(filters);
+    const insightsKey = analyticsInsightsCacheKey(filters);
+
+    if (!filters.username.trim()) {
+      const bundle: SessionBundle = {
+        games: [],
+        recap: emptyRecap(filters),
+        insights: emptyInsights(filters),
+      };
+      return bundle;
+    }
+
+    if (!forceNetwork) {
+      const analyticsTtl = analyticsTtlMs(filters);
+      const [games, recap, insights] = await Promise.all([
+        readCache<StudyGame[]>(gamesKey, GAMES_TTL_MS),
+        readCache<RecapResponse>(recapKey, analyticsTtl),
+        readCache<InsightsResponse>(insightsKey, analyticsTtl),
+      ]);
+      if (games != null && recap && insights) {
+        return { games, recap, insights };
+      }
+    }
+
+    const page = await loadLocalGamesPage(filters, {
+      force: forceNetwork,
+      limit: GAMES_FIRST_PAGE_SIZE,
+      offset: 0,
+    });
+    const allFiltered: NormalizedGame[] = page.allFiltered;
+    const periodGames = toStudyGameList(allFiltered);
+    const bundle: SessionBundle = {
+      games: periodGames,
+      recap: buildLocalRecap(filters, allFiltered),
+      insights: buildLocalInsights(filters, allFiltered),
+    };
+    await writeSessionCaches(filters, bundle);
+    return bundle;
+  });
 }
 
 export async function ensureStudyGames(
@@ -85,13 +262,40 @@ export async function ensureStudyGames(
   forceNetwork = false
 ): Promise<StudyGame[]> {
   const key = analyticsStudyGamesCacheKey(filters);
-  return takeInflight(`games:${filtersKey(filters)}:${forceNetwork}`, async () => {
+  const fk = filtersKey(filters);
+  return takeInflight(`games:${fk}`, async () => {
+    if (!filters.username.trim()) return [];
     if (!forceNetwork) {
       const cached = await readCache<StudyGame[]>(key, GAMES_TTL_MS);
       if (cached?.length) return cached;
     }
-    const rows = await fetchStudyGames(filters, forceNetwork);
-    const games = toStudyGames(rows);
+    const session = await ensureSession(filters, forceNetwork);
+    return session.games;
+  });
+}
+
+export async function ensureStudyGamesUpTo(
+  filters: QueryFilters,
+  maxGames = GLOBAL_MAX_GAMES,
+  forceNetwork = false
+): Promise<StudyGame[]> {
+  const key = analyticsStudyGamesCacheKey(filters);
+  const fk = filtersKey(filters);
+  const cap = Math.max(0, Math.min(maxGames, GAMES_PAGE_SIZE));
+  return takeInflight(`games-up-to:${fk}:${cap}:${forceNetwork}`, async () => {
+    if (!filters.username.trim()) return [];
+    if (!forceNetwork) {
+      const cached = await readCache<StudyGame[]>(key, GAMES_TTL_MS);
+      if (cached && cached.length >= cap) {
+        return cached.slice(0, cap);
+      }
+    }
+    const page = await loadLocalGamesPage(filters, {
+      force: forceNetwork,
+      limit: cap,
+      offset: 0,
+    });
+    const games = toStudyGameList(page.allFiltered.slice(0, cap));
     await writeCache(key, games);
     return games;
   });
@@ -232,6 +436,74 @@ function emptyStyle(total: number) {
   };
 }
 
+async function seedHeuristicStoreFromPeriodCache(
+  filters: QueryFilters,
+  store: HeuristicStore
+): Promise<HeuristicStore> {
+  const cached = await readCache<PeriodHeuristicCache>(
+    analyticsVaultHeuristicsCacheKey(filters),
+    STUDY_ANALYSIS_TTL_MS
+  );
+  if (
+    !cached?.gameIds?.length ||
+    !cached.openingRows?.length ||
+    cached.middlegameRows == null ||
+    cached.endgameRows == null
+  ) {
+    return store;
+  }
+  return mergeHeuristicRowsIntoStore(
+    store,
+    cached.openingRows,
+    cached.middlegameRows,
+    cached.endgameRows,
+    cached.gameIds
+  );
+}
+
+async function seedHeuristicStoreFromRelatedCaches(
+  filters: QueryFilters,
+  store: HeuristicStore
+): Promise<HeuristicStore> {
+  let next = await seedHeuristicStoreFromPeriodCache(filters, store);
+  for (const related of relatedPeriodFilters(filters)) {
+    next = await seedHeuristicStoreFromPeriodCache(related, next);
+  }
+  return next;
+}
+
+function buildVaultPayloadFromRows(
+  rows: PeriodHeuristicCache,
+  vault: Awaited<ReturnType<typeof loadPermanentEvalStore>>,
+  totalGames: number,
+  analyzedCount?: number
+): VaultMetricsPayload {
+  const scanned = analyzedCount ?? rows.gameIds.length;
+  const openingRows = mergeOpeningWithVault(
+    rows.openingRows,
+    rows.gameIds,
+    vault
+  );
+  const middlegameRows = mergeMiddlegameRowsWithVault(
+    rows.middlegameRows,
+    rows.gameIds,
+    vault
+  );
+  const endgameRows = mergeEndgameRowsWithVault(
+    rows.endgameRows,
+    rows.gameIds,
+    vault
+  );
+  const phases = buildPhasePayloads(
+    openingRows,
+    middlegameRows,
+    endgameRows,
+    scanned,
+    totalGames
+  );
+  return { ...phases, style: emptyStyle(totalGames) };
+}
+
 export async function ensureVaultMetrics(
   filters: QueryFilters,
   options?: {
@@ -246,117 +518,111 @@ export async function ensureVaultMetrics(
   return takeInflight(`vault-heuristics:${filtersKey(filters)}:${force}`, async () => {
     const games = options?.games ?? (await ensureStudyGames(filters, false));
     const vault = await loadPermanentEvalStore(filters);
+    let store = await loadHeuristicStore(filters);
+    const seeded = await seedHeuristicStoreFromRelatedCaches(filters, store);
+    if (seeded !== store) {
+      store = seeded;
+      await saveHeuristicStore(filters, store);
+    }
 
     if (!force) {
-      const cached = await readCache<{
-        openingRows: OpeningGameRow[];
-        middlegameRows: MiddlegameGameRow[];
-        endgameRows: Parameters<typeof mergeEndgameHeuristicWithBucket>[0][];
-        gameIds: string[];
-      }>(key, STUDY_ANALYSIS_TTL_MS);
+      const covered = sliceHeuristicStoreForPeriod(store, games);
       if (
-        cached?.openingRows?.length &&
-        cached.middlegameRows?.length != null &&
-        cached.gameIds?.length
+        games.length === 0 ||
+        missingHeuristicGames(store, games).length === 0
       ) {
-        const openingRows = mergeOpeningWithVault(
-          cached.openingRows,
-          cached.gameIds,
-          vault
-        );
-        const middlegameRows = mergeMiddlegameRowsWithVault(
-          cached.middlegameRows,
-          cached.gameIds,
-          vault
-        );
-        const endgameRows = mergeEndgameRowsWithVault(
-          cached.endgameRows,
-          cached.gameIds,
-          vault
-        );
-        const phases = buildPhasePayloads(
-          openingRows,
-          middlegameRows,
-          endgameRows,
-          games.length,
+        const payload = buildVaultPayloadFromRows(
+          covered,
+          vault,
           games.length
         );
-        const payload = { ...phases, style: emptyStyle(games.length) };
         options?.onPartial?.(payload);
+        await writeCache(key, covered);
+        await writeCache(analyticsOpeningPhaseCacheKey(filters), payload.opening);
+        await writeCache(
+          analyticsMiddlegamePhaseCacheKey(filters),
+          payload.middlegame
+        );
+        await writeCache(analyticsEndgamePhaseCacheKey(filters), payload.endgame);
         return payload;
       }
     }
 
+    const toAnalyze = force ? games : missingHeuristicGames(store, games);
+    const already = force
+      ? { openingRows: [], middlegameRows: [], endgameRows: [], gameIds: [] }
+      : sliceHeuristicStoreForPeriod(store, games);
+
+    options?.onPartial?.(
+      buildVaultPayloadFromRows(
+        already,
+        vault,
+        games.length,
+        already.gameIds.length
+      )
+    );
+
+    if (!toAnalyze.length) {
+      const payload = buildVaultPayloadFromRows(already, vault, games.length);
+      options?.onPartial?.(payload);
+      return payload;
+    }
+
     const {
-      openingRows: rawOpening,
-      middlegameRows: rawMiddlegame,
-      endgameRows: rawEndgame,
-      gameIds,
-    } = await analyzeHeuristicGamesBatched(games, {
+      openingRows: newOpening,
+      middlegameRows: newMiddlegame,
+      endgameRows: newEndgame,
+      gameIds: newIds,
+    } = await analyzeHeuristicGamesBatched(toAnalyze, {
       signal: options?.signal,
-      onPartial: (openingRows, middlegameRows, endgameRows, ids, scanned, total) => {
-        const mergedOpening = mergeOpeningWithVault(openingRows, ids, vault);
-        const mergedMiddlegame = mergeMiddlegameRowsWithVault(
-          middlegameRows,
-          ids,
-          vault
+      onPartial: (openingRows, middlegameRows, endgameRows, ids, scanned) => {
+        const merged: PeriodHeuristicCache = {
+          openingRows: [...already.openingRows, ...openingRows],
+          middlegameRows: [...already.middlegameRows, ...middlegameRows],
+          endgameRows: [...already.endgameRows, ...endgameRows],
+          gameIds: [...already.gameIds, ...ids],
+        };
+        options?.onPartial?.(
+          buildVaultPayloadFromRows(
+            merged,
+            vault,
+            games.length,
+            already.gameIds.length + scanned
+          )
         );
-        const mergedEndgame = mergeEndgameRowsWithVault(
-          endgameRows,
-          ids,
-          vault
-        );
-        const phases = buildPhasePayloads(
-          mergedOpening,
-          mergedMiddlegame,
-          mergedEndgame,
-          scanned,
-          total
-        );
-        options?.onPartial?.({
-          ...phases,
-          style: emptyStyle(total),
-        });
       },
     });
 
     if (options?.signal?.cancelled) {
-      return {
-        ...buildPhasePayloads([], [], [], 0, games.length),
-        style: emptyStyle(games.length),
-      };
+      const partial = sliceHeuristicStoreForPeriod(store, games);
+      return buildVaultPayloadFromRows(
+        partial,
+        vault,
+        games.length,
+        partial.gameIds.length
+      );
     }
 
-    await writeCache(key, {
-      openingRows: rawOpening,
-      middlegameRows: rawMiddlegame,
-      endgameRows: rawEndgame,
-      gameIds,
-    });
-
-    const openingRows = mergeOpeningWithVault(rawOpening, gameIds, vault);
-    const middlegameRows = mergeMiddlegameRowsWithVault(
-      rawMiddlegame,
-      gameIds,
-      vault
+    store = mergeHeuristicRowsIntoStore(
+      store,
+      newOpening,
+      newMiddlegame,
+      newEndgame,
+      newIds
     );
-    const endgameRows = mergeEndgameRowsWithVault(rawEndgame, gameIds, vault);
+    await saveHeuristicStore(filters, store);
 
-    const phases = buildPhasePayloads(
-      openingRows,
-      middlegameRows,
-      endgameRows,
-      games.length,
-      games.length
-    );
-    await writeCache(analyticsOpeningPhaseCacheKey(filters), phases.opening);
+    const rows = sliceHeuristicStoreForPeriod(store, games);
+    await writeCache(key, rows);
+
+    const payload = buildVaultPayloadFromRows(rows, vault, games.length);
+    await writeCache(analyticsOpeningPhaseCacheKey(filters), payload.opening);
     await writeCache(
       analyticsMiddlegamePhaseCacheKey(filters),
-      phases.middlegame
+      payload.middlegame
     );
-    await writeCache(analyticsEndgamePhaseCacheKey(filters), phases.endgame);
+    await writeCache(analyticsEndgamePhaseCacheKey(filters), payload.endgame);
 
-    const payload = { ...phases, style: emptyStyle(games.length) };
     options?.onPartial?.(payload);
     return payload;
   });
@@ -371,51 +637,54 @@ export async function remeshVaultFromBucket(
   endgame: EndgamePhasePayload;
 } | null> {
   const list = games ?? (await ensureStudyGames(filters, false));
-  const key = analyticsVaultHeuristicsCacheKey(filters);
-  const cached = await readCache<{
-    openingRows: OpeningGameRow[];
-    middlegameRows: MiddlegameGameRow[];
-    endgameRows: Parameters<typeof mergeEndgameHeuristicWithBucket>[0][];
-    gameIds: string[];
-  }>(key, STUDY_ANALYSIS_TTL_MS);
-  if (
-    !cached?.openingRows?.length ||
-    !cached.gameIds?.length ||
-    cached.middlegameRows == null
-  ) {
-    return null;
+  let store = await loadHeuristicStore(filters);
+  const seeded = await seedHeuristicStoreFromRelatedCaches(filters, store);
+  if (seeded !== store) {
+    store = seeded;
+    await saveHeuristicStore(filters, store);
+  }
+  const rows = sliceHeuristicStoreForPeriod(store, list);
+  if (!rows.gameIds.length) {
+    const key = analyticsVaultHeuristicsCacheKey(filters);
+    const cached = await readCache<PeriodHeuristicCache>(
+      key,
+      STUDY_ANALYSIS_TTL_MS
+    );
+    if (
+      !cached?.openingRows?.length ||
+      !cached.gameIds?.length ||
+      cached.middlegameRows == null
+    ) {
+      return null;
+    }
+    const vault = await loadPermanentEvalStore(filters);
+    const payload = buildVaultPayloadFromRows(cached, vault, list.length);
+    await writeCache(analyticsOpeningPhaseCacheKey(filters), payload.opening);
+    await writeCache(
+      analyticsMiddlegamePhaseCacheKey(filters),
+      payload.middlegame
+    );
+    await writeCache(analyticsEndgamePhaseCacheKey(filters), payload.endgame);
+    return {
+      opening: payload.opening,
+      middlegame: payload.middlegame,
+      endgame: payload.endgame,
+    };
   }
 
   const vault = await loadPermanentEvalStore(filters);
-  const openingRows = mergeOpeningWithVault(
-    cached.openingRows,
-    cached.gameIds,
-    vault
-  );
-  const middlegameRows = mergeMiddlegameRowsWithVault(
-    cached.middlegameRows,
-    cached.gameIds,
-    vault
-  );
-  const endgameRows = mergeEndgameRowsWithVault(
-    cached.endgameRows,
-    cached.gameIds,
-    vault
-  );
-  const phases = buildPhasePayloads(
-    openingRows,
-    middlegameRows,
-    endgameRows,
-    list.length,
-    list.length
-  );
-  await writeCache(analyticsOpeningPhaseCacheKey(filters), phases.opening);
+  const payload = buildVaultPayloadFromRows(rows, vault, list.length);
+  await writeCache(analyticsOpeningPhaseCacheKey(filters), payload.opening);
   await writeCache(
     analyticsMiddlegamePhaseCacheKey(filters),
-    phases.middlegame
+    payload.middlegame
   );
-  await writeCache(analyticsEndgamePhaseCacheKey(filters), phases.endgame);
-  return phases;
+  await writeCache(analyticsEndgamePhaseCacheKey(filters), payload.endgame);
+  return {
+    opening: payload.opening,
+    middlegame: payload.middlegame,
+    endgame: payload.endgame,
+  };
 }
 
 export async function ensureOpeningPhase(
@@ -506,12 +775,14 @@ export async function ensureRecap(
   const key = analyticsRecapCacheKey(filters);
   return takeInflight(`recap:${filtersKey(filters)}:${forceNetwork}`, async () => {
     if (!forceNetwork) {
-      const cached = await readCache<RecapResponse>(key, 15 * 60 * 1000);
+      const cached = await readCache<RecapResponse>(
+        key,
+        analyticsTtlMs(filters)
+      );
       if (cached) return cached;
     }
-    const data = await fetchRecap(filters, forceNetwork);
-    await writeCache(key, data);
-    return data;
+    const session = await ensureSession(filters, forceNetwork);
+    return session.recap;
   });
 }
 
@@ -524,12 +795,14 @@ export async function ensureInsights(
     `insights:${filtersKey(filters)}:${forceNetwork}`,
     async () => {
       if (!forceNetwork) {
-        const cached = await readCache<InsightsResponse>(key, 15 * 60 * 1000);
+        const cached = await readCache<InsightsResponse>(
+          key,
+          analyticsTtlMs(filters)
+        );
         if (cached) return cached;
       }
-      const data = await fetchInsights(filters, forceNetwork);
-      await writeCache(key, data);
-      return data;
+      const session = await ensureSession(filters, forceNetwork);
+      return session.insights;
     }
   );
 }

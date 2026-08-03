@@ -2,7 +2,7 @@ import React, { useEffect, useMemo, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useScanLog } from "../context/ScanLogContext";
-import { GLOBAL_MAX_GAMES } from "../engine/analysisConfig";
+import { GLOBAL_FIRST_SCAN_MAX_GAMES } from "../engine/analysisConfig";
 import { colors, font, spacing } from "../theme";
 import { AnalysisLoadingBars } from "./LoadingSkeletons";
 
@@ -66,10 +66,11 @@ function ProgressTrack({
   complete: boolean;
 }) {
   const ratio = total > 0 ? Math.min(1, done / total) : complete ? 1 : 0;
+  const doneLabel = Math.min(Math.floor(Math.max(done, 0)), total || 0);
   return (
     <View style={styles.trackBlock}>
       <Text style={styles.trackLabel}>
-        {label} ({done}/{total || 0})
+        {label} ({doneLabel}/{total || 0})
       </Text>
       <AnalysisLoadingBars
         selected={done}
@@ -126,32 +127,55 @@ export function AnalyticsScanBanner() {
 }
 
 export function EvalPendingWarning() {
-  const { phase, gamesTotal } = useScanLog();
-  const {
-    games,
-    metricsReady,
-    openingPhaseLoading,
-    middlegamePhaseLoading,
-    endgamePhaseLoading,
-  } = useAnalytics();
+  const { phase, gamesDone, gamesTotal, status, lines } = useScanLog();
+  const { games, metricsReady } = useAnalytics();
   const evalComplete = phase === "done" || phase === "error";
-  const sectionsReady =
-    metricsReady &&
-    !openingPhaseLoading &&
-    !middlegamePhaseLoading &&
-    !endgamePhaseLoading;
-  if (evalComplete && sectionsReady) return null;
-  const known = Math.max(gamesTotal, games.length);
+  if (evalComplete || !metricsReady) return null;
+  const known =
+    gamesTotal > 0
+      ? gamesTotal
+      : Math.min(games.length, GLOBAL_FIRST_SCAN_MAX_GAMES);
   const target =
-    known > 0 ? Math.min(GLOBAL_MAX_GAMES, known) : GLOBAL_MAX_GAMES;
-  const message = evalComplete
-    ? "Finishing opening, middlegame, and endgame metrics…"
-    : `Full analytics appear after Stockfish evaluates ${target} game${
-        target === 1 ? "" : "s"
-      }.`;
+    known > 0
+      ? Math.min(GLOBAL_FIRST_SCAN_MAX_GAMES, known)
+      : GLOBAL_FIRST_SCAN_MAX_GAMES;
+  const total = gamesTotal > 0 ? gamesTotal : target;
+  const doneGames = Math.min(Math.floor(Math.max(gamesDone, 0)), total || 0);
+  const recent = lines.slice(-4);
+  const progressLabel =
+    total > 0
+      ? `${status || "Buffering evals"} · ${doneGames}/${total} games`
+      : status || "Starting background Stockfish…";
+
   return (
     <View style={styles.warningWrap}>
-      <Text style={styles.warningText}>{message}</Text>
+      <Text style={styles.warningText}>
+        {`Style and eval traits fill in as Stockfish buffers up to ${target} game${
+          target === 1 ? "" : "s"
+        }. Heuristic metrics are ready.`}
+      </Text>
+      <View style={styles.evalLog}>
+        <Text style={styles.evalLogStatus} numberOfLines={2}>
+          {progressLabel}
+        </Text>
+        {total > 0 ? (
+          <ProgressTrack
+            label="Background eval"
+            done={gamesDone}
+            total={total}
+            complete={false}
+          />
+        ) : null}
+        {recent.length ? (
+          <View style={styles.evalLogLines}>
+            {recent.map((line) => (
+              <Text key={line.id} style={styles.evalLogLine} numberOfLines={1}>
+                {line.text}
+              </Text>
+            ))}
+          </View>
+        ) : null}
+      </View>
     </View>
   );
 }
@@ -195,6 +219,7 @@ const styles = StyleSheet.create({
     borderBottomWidth: 1,
     borderBottomColor: colors.borderSoft,
     backgroundColor: colors.charcoal,
+    gap: 8,
   },
   warningText: {
     color: colors.warning,
@@ -202,5 +227,27 @@ const styles = StyleSheet.create({
     fontSize: 13,
     lineHeight: 18,
     textAlign: "center",
+  },
+  evalLog: {
+    width: "100%",
+    gap: 6,
+  },
+  evalLogStatus: {
+    color: colors.textMuted,
+    fontFamily: font.mono,
+    fontSize: 11,
+    lineHeight: 15,
+    textAlign: "center",
+  },
+  evalLogLines: {
+    width: "100%",
+    gap: 2,
+  },
+  evalLogLine: {
+    color: colors.textDim,
+    fontFamily: font.mono,
+    fontSize: 10,
+    lineHeight: 14,
+    textAlign: "left",
   },
 });

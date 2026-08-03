@@ -9,8 +9,51 @@ import chess.pgn
 
 ENDGAME_NON_PAWN_MAX = 7
 MATE_CP_THRESHOLD = 50000
-WP_BLUNDER_DROP = 0.2
+WP_BLUNDER_DROP = 0.15
+WP_MISTAKE_DROP = 0.10
+WP_INACCURACY_DROP = 0.05
+WP_MISSED_OPP_DROP = WP_MISTAKE_DROP
 WP_ENDGAME_ADVANTAGE = 0.7
+WP_ENDGAME_ADVANTAGE_STICKY = 0.65
+CP_ENDGAME_ADVANTAGE_STICKY = 100.0
+EG_TRADE_WINDOW_PLIES = 3
+
+
+def wp_drop_pp(wp_before: float, wp_after: float) -> float:
+    return round((wp_before - wp_after) * 10000) / 100
+
+
+def classify_eval_drop(wp_before: float, wp_after: float) -> str | None:
+    drop_pp = wp_drop_pp(wp_before, wp_after)
+    if drop_pp > 15:
+        return "blunder"
+    if drop_pp >= 10:
+        return "mistake"
+    if drop_pp >= 5:
+        return "inaccuracy"
+    return None
+
+
+def is_mistake_or_worse(wp_before: float, wp_after: float) -> bool:
+    kind = classify_eval_drop(wp_before, wp_after)
+    return kind in ("blunder", "mistake")
+
+
+def is_blunder_swing_up(wp_before: float, wp_after: float) -> bool:
+    return wp_drop_pp(wp_before, wp_after) < -15
+
+
+def normalize_game_result(result: str | None, user_is_white: bool) -> str:
+    r = str(result or "").strip()
+    if r in ("Win", "Draw", "Loss"):
+        return r
+    if r == "1-0":
+        return "Win" if user_is_white else "Loss"
+    if r == "0-1":
+        return "Loss" if user_is_white else "Win"
+    if r in ("1/2-1/2", "½-½", "1/2") or r.lower() == "draw":
+        return "Draw"
+    return ""
 
 CENTER_SQUARES = (chess.D4, chess.E4, chess.D5, chess.E5)
 PIECE_VALUE = {
@@ -313,15 +356,8 @@ def analyze_endgame_game(
     board = game.board()
     user_is_white = str(user_color or "white").lower() == "white"
     color = chess.WHITE if user_is_white else chess.BLACK
-    game_result = result if result is not None else str(game.headers.get("Result") or "")
-    if game_result == "1-0":
-        mapped = "Win" if user_is_white else "Loss"
-    elif game_result == "0-1":
-        mapped = "Win" if not user_is_white else "Loss"
-    elif game_result in ("1/2-1/2", "1/2"):
-        mapped = "Draw"
-    else:
-        mapped = str(result or "")
+    raw_result = result if result is not None else str(game.headers.get("Result") or "")
+    mapped = normalize_game_result(raw_result, user_is_white)
 
     evals = list(evals_white_cp or [])
     eval_idx = 0
@@ -347,6 +383,8 @@ def analyze_endgame_game(
     piece_trade_pending: int | None = None
     pending_trade_is_user = False
     pending_wp_before = 0.0
+    pending_cp_before = 0.0
+    pending_user_net = 0
     pending_user_piece_val = 0
     pending_captured_val = 0
     mate_episodes = 0
@@ -356,6 +394,7 @@ def analyze_endgame_game(
     theoretical: dict[str, bool] = {}
     theoretical_saved = False
     wp_before_last: float | None = None
+    last_capture: dict | None = None
     ply_idx = -1
 
     for move in game.mainline_moves():
@@ -364,6 +403,7 @@ def analyze_endgame_game(
         moving = board.piece_at(move.from_square)
         captured_piece = board.piece_at(move.to_square)
         is_capture = board.is_capture(move)
+        to_sq = move.to_square
         cp_before = last_white_cp
         wp_before = (
             user_win_probability(cp_before, user_is_white)
@@ -395,6 +435,16 @@ def analyze_endgame_game(
 
         in_endgame = endgame_start_ply is not None and ply_idx >= endgame_start_ply
         if not in_endgame:
+            if is_capture and captured_type is not None:
+                last_capture = {
+                    "ply": ply_idx,
+                    "color": color if is_user else (not color),
+                    "piece": moving_type or 0,
+                    "captured": captured_type,
+                    "to": to_sq,
+                }
+            else:
+                last_capture = None
             continue
 
         centr = king_centralization_score(board, color)
@@ -414,44 +464,104 @@ def analyze_endgame_game(
             else:
                 theoretical_saved = True
 
-        if is_user and wp_before is not None and wp_after is not None:
-            if wp_before - wp_after >= WP_BLUNDER_DROP:
-                blunders += 1
+            if is_user and wp_before is not None and wp_after is not None:
+                if classify_eval_drop(wp_before, wp_after) == "blunder":
+                    blunders += 1
 
-        if (
-            is_capture
-            and captured_type in MINOR_MAJOR
-            and moving_type in MINOR_MAJOR
-        ):
+        if is_capture and captured_type is not None:
+            cap_val = PIECE_VALUE.get(captured_type, 0)
+            mover_val = PIECE_VALUE.get(moving_type or 0, 0)
+            piece_cap = captured_type in MINOR_MAJOR
+            user_gain = cap_val if is_user else -cap_val
             if (
                 piece_trade_pending is not None
-                and ply_idx - piece_trade_pending <= 2
+                and ply_idx - piece_trade_pending <= EG_TRADE_WINDOW_PLIES
             ):
-                piece_trades += 1
-                trade_wp_before = pending_wp_before
-                trade_wp_after = wp_after if wp_after is not None else trade_wp_before
-                if trade_wp_after > trade_wp_before:
-                    beneficial_trades += 1
-                if trade_wp_before >= WP_ENDGAME_ADVANTAGE:
-                    winning_trades += 1
-                    if pending_trade_is_user:
-                        user_gave_more = (
-                            pending_user_piece_val > pending_captured_val
+                pending_user_net += user_gain
+                if piece_cap:
+                    completer_is_piece = moving_type in MINOR_MAJOR
+                    major_involved = (
+                        cap_val >= 5
+                        or pending_captured_val >= 5
+                        or pending_user_piece_val >= 5
+                    )
+                    if completer_is_piece or major_involved:
+                        piece_trades += 1
+                        trade_wp_before = pending_wp_before
+                        trade_wp_after = (
+                            wp_after if wp_after is not None else trade_wp_before
                         )
-                    else:
-                        user_gave_more = (
-                            pending_captured_val > pending_user_piece_val
+                        tcp_before = pending_cp_before
+                        tcp_after = (
+                            (
+                                last_white_cp
+                                if user_is_white
+                                else -last_white_cp
+                            )
+                            if last_white_cp is not None
+                            else tcp_before
                         )
-                    drop = trade_wp_before - trade_wp_after
-                    if user_gave_more and drop < WP_BLUNDER_DROP:
-                        simplification_trades += 1
-                piece_trade_pending = None
-            else:
+                        if trade_wp_after > trade_wp_before or tcp_after > tcp_before:
+                            beneficial_trades += 1
+                        if pending_user_net > 0:
+                            winning_trades += 1
+                        if trade_wp_before >= WP_ENDGAME_ADVANTAGE:
+                            if pending_trade_is_user:
+                                user_gave_more = (
+                                    pending_user_piece_val > pending_captured_val
+                                )
+                            else:
+                                user_gave_more = (
+                                    pending_captured_val > pending_user_piece_val
+                                )
+                            drop = trade_wp_before - trade_wp_after
+                            if user_gave_more and drop < WP_BLUNDER_DROP:
+                                simplification_trades += 1
+                    piece_trade_pending = None
+            elif piece_cap:
+                net = user_gain
+                user_piece_val = mover_val if is_user else cap_val
+                captured_val = cap_val if is_user else mover_val
+                user_start = is_user
+                if (
+                    last_capture is not None
+                    and last_capture["ply"] == ply_idx - 1
+                    and last_capture["to"] == to_sq
+                ):
+                    last_was_user = last_capture["color"] == color
+                    last_cap_val = PIECE_VALUE.get(last_capture["captured"], 0)
+                    if last_was_user and not is_user:
+                        net = last_cap_val - cap_val
+                        user_start = True
+                        user_piece_val = PIECE_VALUE.get(last_capture["piece"], 0)
+                        captured_val = last_cap_val
+                    elif (not last_was_user) and is_user:
+                        net = cap_val - last_cap_val
+                        user_start = False
+                        user_piece_val = last_cap_val
+                        captured_val = cap_val
                 piece_trade_pending = ply_idx
-                pending_trade_is_user = is_user
+                pending_trade_is_user = user_start
                 pending_wp_before = wp_before or 0.0
-                pending_user_piece_val = PIECE_VALUE.get(moving_type or 0, 0)
-                pending_captured_val = PIECE_VALUE.get(captured_type or 0, 0)
+                pending_cp_before = (
+                    (cp_before if user_is_white else -cp_before)
+                    if cp_before is not None
+                    else 0.0
+                )
+                pending_user_net = net
+                pending_user_piece_val = user_piece_val
+                pending_captured_val = captured_val
+
+        if is_capture and captured_type is not None:
+            last_capture = {
+                "ply": ply_idx,
+                "color": color if is_user else (not color),
+                "piece": moving_type or 0,
+                "captured": captured_type,
+                "to": to_sq,
+            }
+        else:
+            last_capture = None
 
         if last_white_cp is not None:
             user_cp = last_white_cp if user_is_white else -last_white_cp

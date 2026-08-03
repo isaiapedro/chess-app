@@ -10,7 +10,10 @@ import {
 } from "react-native";
 import { Chess } from "chess.js";
 import { fetchExplorer, fetchMastersPgn, type MistakeItem } from "../api/client";
-import { ensureStudyGames } from "../storage/analyticsLoaders";
+import {
+  ensureStudyGames,
+  ensureStudyGamesUpTo,
+} from "../storage/analyticsLoaders";
 import { ChessBoard } from "../components/ChessBoard";
 import {
   OpeningChoiceSkeleton,
@@ -21,8 +24,14 @@ import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
 import { useFilters } from "../context/FilterContext";
 import {
   APPEND_MOMENTS,
+  GLOBAL_MAX_GAMES,
   MIN_CONTINUATION_PLIES,
+  TARGET_OPENING_MOMENTS,
 } from "../engine/analysisConfig";
+import {
+  beginPuzzleBatch,
+  endPuzzleBatch,
+} from "../engine/backgroundWork";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import { formatEval } from "../engine/analyzeMistakes";
 import { pvToSanLine } from "../engine/analyzeMistakes";
@@ -40,23 +49,27 @@ import {
   type OpeningProgress,
   type ThresholdPass,
 } from "../engine/analyzeOpenings";
-import { TARGET_OPENING_MOMENTS } from "../engine/analysisConfig";
 import { resolveFamilyByName } from "../engine/ecoFamilies";
 import { consumeCandidates } from "../engine/candidateBucket";
 import {
   createEvalLookup,
+  loadGlobalAnalysisState,
   periodReservoirStatus,
-  runGlobalPeriodAnalysis,
+  type GlobalAnalysisState,
 } from "../engine/globalAnalysis";
 import { useStockfish } from "../engine/StockfishProvider";
 import { applyUciMove } from "../engine/chessMoves";
-import { cancelStudyPrefetch } from "../engine/studyPrefetch";
+import {
+  getPrefetchedGlobalState,
+  isStudyPrefetchActive,
+} from "../engine/studyPrefetch";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
 import {
   readCache,
   STUDY_ANALYSIS_TTL_MS,
   writeCache,
 } from "../storage/cache";
+import { readOpeningCacheForPeriod } from "../storage/periodCacheReuse";
 import { studyOpeningCacheKey } from "../storage/studyCacheKeys";
 import { colors, font, result, spacing } from "../theme";
 
@@ -212,6 +225,16 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     },
     [queryFilters]
   );
+
+  useEffect(() => {
+    const quizActive =
+      active && phase === "quiz" && !scanningMore && moments.length > 0;
+    if (!quizActive) return;
+    beginPuzzleBatch();
+    return () => {
+      endPuzzleBatch();
+    };
+  }, [active, phase, scanningMore, moments.length]);
 
   const [quizFeedback, setQuizFeedback] = useState<string | null>(null);
   const [quizCorrect, setQuizCorrect] = useState<boolean | null>(null);
@@ -388,10 +411,13 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     setAnalyzeProgress(null);
 
     if (!force) {
+      const periodIds = allGames.map((game) => String(game.id));
       const cached = parseOpeningCache(
-        await readCache<OpeningCachePayload | OpeningMoment[]>(
-          cacheKey,
-          STUDY_ANALYSIS_TTL_MS
+        await readOpeningCacheForPeriod(
+          queryFilters,
+          color,
+          opening.key,
+          periodIds
         )
       );
       if (cached?.moments.length) {
@@ -429,7 +455,6 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       return;
     }
 
-    cancelStudyPrefetch();
     setAnalyzeStatus("Filtering games…");
 
     const filtered = filterGamesByOpening(allGames, color, opening);
@@ -444,124 +469,141 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     const rating = averageUserRating(filtered.length ? filtered : allGames);
     const openingGameIds = new Set(filtered.map((g) => String(g.id)));
     let completed = false;
+    let heldPuzzleSlot = false;
     try {
-      setAnalyzeStatus("Global Stockfish scan…");
-      let delivered = false;
-      await runGlobalPeriodAnalysis({
-        filters: queryFilters,
-        evaluate,
-        signal,
-        games: allGames,
-        earlyOpeningTarget: TARGET_OPENING_MOMENTS,
-        onProgress: (p) => {
-          if (delivered) return;
-          setAnalyzeStatus(p.status);
-          setAnalyzeProgress({
-            gamesScanned: p.gamesDone,
-            positionsChecked: 0,
-            found: 0,
-            candidates: 0,
-            selected: 0,
-            status: p.status,
-            phase: p.phase === "done" ? "refine" : "scan",
-            engine: p.engine,
-            currentGame: p.currentGame,
-          });
-        },
-        onEarlyOpeningsReady: async (_candidates, state) => {
-          if (signal.cancelled || delivered) return false;
+      setAnalyzeStatus("Loading opening candidates from eval vault…");
+
+      const waitForVault = async (): Promise<GlobalAnalysisState | null> => {
+        while (!signal.cancelled) {
+          const live = getPrefetchedGlobalState();
+          const state =
+            live ||
+            (await loadGlobalAnalysisState(queryFilters, allGames));
           const scoped = state.openingCandidates.filter((item) =>
             openingGameIds.has(String(item.game_id))
           );
-          if (scoped.length < TARGET_OPENING_MOMENTS && !state.complete) {
-            return false;
+          const scanned = state.scannedGameIds.length;
+          if (
+            scoped.length >= TARGET_OPENING_MOMENTS ||
+            state.openingCandidates.length >= TARGET_OPENING_MOMENTS ||
+            state.complete ||
+            !isStudyPrefetchActive()
+          ) {
+            return state;
           }
-          const overall = state.openingCandidates;
-          if (!scoped.length && !overall.length) return false;
-          setAnalyzeStatus("Refining recent opening candidates…");
-          const batch = await refineRecentOpeningCandidates({
-            candidates: scoped.length ? scoped : overall,
-            games: scoped.length ? filtered : allGames,
-            fallbackCandidates: scoped.length ? overall : undefined,
-            fallbackGames: scoped.length ? allGames : undefined,
-            color,
-            userRating: rating,
-            evaluate,
-            signal,
-            limit: TARGET_OPENING_MOMENTS,
-            lookupEval: createEvalLookup(state),
-            fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
-            fetchExplorer: async (fen, source, ratings) => {
-              const res = await fetchExplorer(
-                fen,
-                source,
-                undefined,
-                undefined,
-                ratings
-              );
-              return {
-                moves: res.moves || [],
-                topGames: res.topGames || [],
-                white: res.white || 0,
-                draws: res.draws || 0,
-                black: res.black || 0,
-                fallback: res.fallback,
-                opening: res.opening,
-              };
-            },
-            onProgress: (p) => {
-              setAnalyzeProgress(p);
-              setAnalyzeStatus(p.status);
-              if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
-            },
-          });
-          const taken = batch.moments.slice(0, TARGET_OPENING_MOMENTS);
-          await consumeCandidates(queryFilters, "opening", taken);
-          if (signal.cancelled) return;
-          scannedIdsRef.current = batch.scannedGameIds;
-          pendingCandidatesRef.current = batch.pendingCandidates;
-          deferredCandidatesRef.current = batch.deferredCandidates;
-          setPendingCount(batch.pendingCandidates.length);
-          thresholdPassRef.current = batch.thresholdPass;
-          baselineAvailableRef.current = batch.baselineAvailable;
-          const reservoir = await syncOpeningReservoir(
-            allGames,
-            [...openingGameIds],
-            batch.pendingCandidates.length
+          setAnalyzeStatus(
+            `Waiting for eval buffer… (${scanned} games scanned)`
           );
-          setMoments(batch.moments);
-          setIdx(0);
-          visibleBatchStartRef.current = 0;
-          pendingBatchRef.current = null;
-          setPendingReady(false);
-          secondPagePrefetchKeyRef.current = null;
-          if (!batch.moments.length) return;
-          await writeCache(cacheKey, {
-            moments: batch.moments,
-            pendingCandidates: batch.pendingCandidates,
-            deferredCandidates: batch.deferredCandidates,
-            scannedGameIds: batch.scannedGameIds,
-            remaining: reservoir.remaining,
-            thresholdPass: batch.thresholdPass,
-            baselineAvailable: batch.baselineAvailable,
-          } satisfies OpeningCachePayload);
-          delivered = true;
-          completed = true;
-          setPhase("quiz");
-          return true;
+          setAnalyzeProgress({
+            gamesScanned: scanned,
+            positionsChecked: 0,
+            found: scoped.length,
+            candidates: state.openingCandidates.length,
+            selected: 0,
+            status: "Waiting for background eval…",
+            phase: "scan",
+            engine: "Stockfish",
+          });
+          await new Promise<void>((resolve) => setTimeout(resolve, 400));
+        }
+        return null;
+      };
+
+      const state = await waitForVault();
+      if (signal.cancelled || !state) return;
+
+      const scoped = state.openingCandidates.filter((item) =>
+        openingGameIds.has(String(item.game_id))
+      );
+      const overall = state.openingCandidates;
+      if (!scoped.length && !overall.length) {
+        setError("No opening candidates in eval vault yet. Try again shortly.");
+        setPhase("opening");
+        return;
+      }
+
+      beginPuzzleBatch();
+      heldPuzzleSlot = true;
+      setAnalyzeStatus("Deep-refining opening puzzles…");
+      const batch = await refineRecentOpeningCandidates({
+        candidates: scoped.length ? scoped : overall,
+        games: scoped.length ? filtered : allGames,
+        fallbackCandidates: scoped.length ? overall : undefined,
+        fallbackGames: scoped.length ? allGames : undefined,
+        color,
+        userRating: rating,
+        evaluate,
+        signal,
+        limit: TARGET_OPENING_MOMENTS,
+        lookupEval: createEvalLookup(state),
+        fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
+        fetchExplorer: async (fen, source, ratings) => {
+          const res = await fetchExplorer(
+            fen,
+            source,
+            undefined,
+            undefined,
+            ratings
+          );
+          return {
+            moves: res.moves || [],
+            topGames: res.topGames || [],
+            white: res.white || 0,
+            draws: res.draws || 0,
+            black: res.black || 0,
+            fallback: res.fallback,
+            opening: res.opening,
+          };
+        },
+        onProgress: (p) => {
+          setAnalyzeProgress(p);
+          setAnalyzeStatus(p.status);
+          if (p.log) setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
         },
       });
       if (signal.cancelled) return;
-      if (!delivered) {
+
+      const taken = batch.moments.slice(0, TARGET_OPENING_MOMENTS);
+      await consumeCandidates(queryFilters, "opening", taken);
+      scannedIdsRef.current = batch.scannedGameIds;
+      pendingCandidatesRef.current = batch.pendingCandidates;
+      deferredCandidatesRef.current = batch.deferredCandidates;
+      setPendingCount(batch.pendingCandidates.length);
+      thresholdPassRef.current = batch.thresholdPass;
+      baselineAvailableRef.current = batch.baselineAvailable;
+      const reservoir = await syncOpeningReservoir(
+        allGames,
+        [...openingGameIds],
+        batch.pendingCandidates.length
+      );
+      if (!batch.moments.length) {
         setError("No opening improvement moments found. Try another opening.");
         setPhase("opening");
         return;
       }
+      setMoments(batch.moments);
+      setIdx(0);
+      visibleBatchStartRef.current = 0;
+      pendingBatchRef.current = null;
+      setPendingReady(false);
+      secondPagePrefetchKeyRef.current = null;
+      await writeCache(cacheKey, {
+        moments: batch.moments,
+        pendingCandidates: batch.pendingCandidates,
+        deferredCandidates: batch.deferredCandidates,
+        scannedGameIds: batch.scannedGameIds,
+        remaining: reservoir.remaining,
+        thresholdPass: batch.thresholdPass,
+        baselineAvailable: batch.baselineAvailable,
+      } satisfies OpeningCachePayload);
+      completed = true;
+      setPhase("quiz");
     } catch (e) {
       if (signal.cancelled) return;
       setError(e instanceof Error ? e.message : "Opening analysis failed");
       setPhase("opening");
     } finally {
+      if (heldPuzzleSlot) endPuzzleBatch();
       if (!signal.cancelled) {
         setAnalyzeStatus(null);
         if (completed) {
@@ -609,7 +651,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       });
       setAnalyzeStatus("Scanning next batch…");
     }
-    cancelStudyPrefetch();
+    beginPuzzleBatch();
     if (silent) {
       backgroundScanningRef.current = true;
     } else {
@@ -622,16 +664,30 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       color,
       selectedOpening.key
     );
-    const filtered =
-      filteredGamesRef.current.length > 0
-        ? filteredGamesRef.current
-        : filterGamesByOpening(allGames, color, selectedOpening);
-    filteredGamesRef.current = filtered;
-    const rating = averageUserRating(filtered.length ? filtered : allGames);
-    const openingGameIds = [...new Set(filtered.map((g) => String(g.id)))];
 
     let completed = false;
     try {
+      let gamesForScan = allGames;
+      if (gamesForScan.length < GLOBAL_MAX_GAMES) {
+        gamesForScan = await ensureStudyGamesUpTo(
+          queryFilters,
+          GLOBAL_MAX_GAMES,
+          false
+        );
+        setAllGames(gamesForScan);
+        filteredGamesRef.current = [];
+      }
+      const filtered = filterGamesByOpening(
+        gamesForScan,
+        color,
+        selectedOpening
+      );
+      filteredGamesRef.current = filtered;
+      const rating = averageUserRating(
+        filtered.length ? filtered : gamesForScan
+      );
+      const openingGameIds = [...new Set(filtered.map((g) => String(g.id)))];
+
       const explorerFn = async (
         fen: string,
         source: "masters" | "lichess",
@@ -661,7 +717,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
 
       const vault = await periodReservoirStatus(
         queryFilters,
-        allGames,
+        gamesForScan,
         "opening",
         {
           periodGameIds: openingGameIds,
@@ -671,7 +727,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       );
       const overallVault = await periodReservoirStatus(
         queryFilters,
-        allGames,
+        gamesForScan,
         "opening",
         {
           pendingCount: carriedCandidates.length,
@@ -688,7 +744,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
           candidates: [...carriedCandidates, ...vault.batch],
           games: filtered,
           fallbackCandidates: overallVault.batch,
-          fallbackGames: allGames,
+          fallbackGames: gamesForScan,
           color,
           userRating: rating,
           evaluate,
@@ -709,45 +765,54 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
         });
         const newlySelected = batch.moments.slice(keptMoments.length);
         await consumeCandidates(queryFilters, "opening", newlySelected);
-      } else if (!vault.complete) {
-        const early: {
-          batch: Awaited<
-            ReturnType<typeof refineRecentOpeningCandidates>
-          > | null;
-          taken: MistakeItem[];
-        } = { batch: null, taken: [] };
-        await runGlobalPeriodAnalysis({
-          filters: queryFilters,
-          evaluate,
-          signal,
-          games: allGames,
-          earlyOpeningTarget: APPEND_MOMENTS,
-          onEarlyOpeningsReady: async (_candidates, state) => {
-            if (signal.cancelled || early.batch) return false;
-            const openingIdSet = new Set(openingGameIds);
-            const scoped = state.openingCandidates.filter((item) =>
-              openingIdSet.has(String(item.game_id))
-            );
-            if (scoped.length < APPEND_MOMENTS && !state.complete) return false;
-            const overall = state.openingCandidates;
-            if (!scoped.length && !carriedCandidates.length && !overall.length) {
-              return false;
+      } else if (!vault.complete || isStudyPrefetchActive()) {
+        if (!silent) {
+          setAnalyzeStatus("Waiting for more eval buffer…");
+        }
+        let waited = 0;
+        while (
+          !signal.cancelled &&
+          waited < 30 &&
+          (isStudyPrefetchActive() || !vault.complete)
+        ) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          waited += 1;
+          const again = await periodReservoirStatus(
+            queryFilters,
+            gamesForScan,
+            "opening",
+            {
+              periodGameIds: openingGameIds,
+              pendingCount: carriedCandidates.length,
+              batchLimit: Number.MAX_SAFE_INTEGER,
             }
-            early.batch = await refineRecentOpeningCandidates({
-              candidates: [
-                ...carriedCandidates,
-                ...(scoped.length ? scoped : overall),
-              ],
-              games: scoped.length ? filtered : allGames,
-              fallbackCandidates: scoped.length ? overall : undefined,
-              fallbackGames: scoped.length ? allGames : undefined,
+          );
+          const overallAgain = await periodReservoirStatus(
+            queryFilters,
+            gamesForScan,
+            "opening",
+            {
+              pendingCount: carriedCandidates.length,
+              batchLimit: Number.MAX_SAFE_INTEGER,
+            }
+          );
+          if (
+            again.batch.length ||
+            carriedCandidates.length ||
+            overallAgain.batch.length
+          ) {
+            batch = await refineRecentOpeningCandidates({
+              candidates: [...carriedCandidates, ...again.batch],
+              games: filtered,
+              fallbackCandidates: overallAgain.batch,
+              fallbackGames: gamesForScan,
               color,
               userRating: rating,
               evaluate,
               signal,
               limit: APPEND_MOMENTS,
               existingMoments: keptMoments,
-              lookupEval: createEvalLookup(state),
+              lookupEval: createEvalLookup(again.state),
               fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
               fetchExplorer: explorerFn,
               onProgress: silent
@@ -759,16 +824,22 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
                       setAnalyzeLog((prev) => [...prev.slice(-59), p.log!]);
                   },
             });
-            if (!early.batch) return false;
-            early.taken = early.batch.moments.slice(
-              keptMoments.length,
-              keptMoments.length + APPEND_MOMENTS
-            );
-            await consumeCandidates(queryFilters, "opening", early.taken);
-            return true;
-          },
-        });
-        batch = early.batch;
+            const newlySelected = batch.moments.slice(keptMoments.length);
+            await consumeCandidates(queryFilters, "opening", newlySelected);
+            break;
+          }
+          if (again.complete && !isStudyPrefetchActive()) break;
+        }
+        if (!batch) {
+          setScanExhausted(true);
+          setRemainingGames(0);
+          setPeriodComplete(true);
+          if (!silent) {
+            setShowScanMore(false);
+            setAllDone(true);
+          }
+          return;
+        }
       } else {
         setScanExhausted(true);
         setRemainingGames(0);
@@ -791,7 +862,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       thresholdPassRef.current = batch.thresholdPass;
       baselineAvailableRef.current = batch.baselineAvailable;
       const reservoir = await syncOpeningReservoir(
-        allGames,
+        gamesForScan,
         openingGameIds,
         batch.pendingCandidates.length
       );
@@ -855,6 +926,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
         setError(e instanceof Error ? e.message : "Failed to scan more");
       }
     } finally {
+      endPuzzleBatch();
       if (silent) {
         backgroundScanningRef.current = false;
         if (revealPendingOnCompleteRef.current) {

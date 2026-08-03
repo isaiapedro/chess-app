@@ -3,7 +3,7 @@ import type { StudyGame } from "./analyzeMistakes";
 import { resolveEcoFamily } from "./ecoFamilies";
 import { winProbabilityFromCp } from "./winProb";
 
-export const OPENING_PHASE_MIN_FULLMOVE = 12;
+export const OPENING_PHASE_MIN_FULLMOVE = 11;
 export const OPENING_PHASE_NEVER_CASTLE_FULLMOVE = 15;
 export const DEVELOPMENT_CHECK_FULLMOVE = 10;
 
@@ -22,6 +22,7 @@ export type OpeningGameRow = {
   opening_castle_fullmove: number | null;
   uncastled: boolean;
   opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves: number;
   accuracy_moves: number;
   phase_end_fullmove: number;
   user_color?: string;
@@ -37,6 +38,7 @@ export type OpeningMetricsAggregate = {
   opening_castle_fullmove: number | null;
   opening_uncastled_rate_pct: number | null;
   opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves_avg: number | null;
   games: number;
   castled_games: number;
   accuracy_games: number;
@@ -54,6 +56,7 @@ export type OpeningSideCard = {
   opening_castle_fullmove: number | null;
   opening_uncastled_rate_pct: number | null;
   opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves_avg: number | null;
 };
 
 export function moveAccuracyPct(
@@ -91,8 +94,22 @@ function parseSans(game: StudyGame): string[] {
   }
 }
 
+export function minorHomeSquares(color: Color): Set<string> {
+  return color === "w" ? WHITE_MINOR_START : BLACK_MINOR_START;
+}
+
+export function noteMinorLeftHome(
+  developedHomes: Set<string>,
+  color: Color,
+  from: string,
+  pieceType: string
+): void {
+  if (pieceType !== "n" && pieceType !== "b") return;
+  if (minorHomeSquares(color).has(from)) developedHomes.add(from);
+}
+
 export function countMinorsDeveloped(board: Chess, color: Color): number {
-  const start = color === "w" ? WHITE_MINOR_START : BLACK_MINOR_START;
+  const start = minorHomeSquares(color);
   let developed = 0;
   const grid = board.board();
   const files = "abcdefgh";
@@ -108,6 +125,10 @@ export function countMinorsDeveloped(board: Chess, color: Color): number {
   return Math.min(4, developed);
 }
 
+export function countMinorsEverDeveloped(developedHomes: Set<string>): number {
+  return Math.min(4, developedHomes.size);
+}
+
 export function centerControlShare(board: Chess, color: Color): number {
   let controlled = 0;
   for (const sq of CENTER_SQUARES) {
@@ -116,7 +137,7 @@ export function centerControlShare(board: Chess, color: Color): number {
       controlled += 1;
       continue;
     }
-    if (board.attackers(sq, color).length > 0) controlled += 1;
+    if (!piece && board.attackers(sq, color).length > 0) controlled += 1;
   }
   return (controlled / 4) * 100;
 }
@@ -160,7 +181,9 @@ export function analyzeOpeningGame(
   const accuracySamples: number[] = [];
   let tempoMoves = 0;
   let tempoWastes = 0;
+  let pawnMoves = 0;
   const timesMoved = new Map<string, number>();
+  const developedHomes = new Set<string>();
   let minorsAt10: number | null = null;
 
   for (let plyIdx = 0; plyIdx < sans.length; plyIdx += 1) {
@@ -189,10 +212,17 @@ export function analyzeOpeningGame(
     if (isUser && moving && inPhase && moving.type !== "p") {
       tempoMoves += 1;
       const prior = timesMoved.get(move.from) || 0;
-      const developed = countMinorsDeveloped(board, color);
-      if (prior >= 1 && developed < 4) tempoWastes += 1;
+      if (prior >= 1 && developedHomes.size < 4) tempoWastes += 1;
       timesMoved.set(move.to, prior + 1);
       if (move.to !== move.from) timesMoved.set(move.from, 0);
+    }
+
+    if (isUser && moving && inPhase && moving.type === "p") {
+      pawnMoves += 1;
+    }
+
+    if (isUser && moving) {
+      noteMinorLeftHome(developedHomes, color, move.from, moving.type);
     }
 
     board.move(move);
@@ -202,7 +232,7 @@ export function analyzeOpeningGame(
       fullMove === DEVELOPMENT_CHECK_FULLMOVE &&
       board.turn() === "w"
     ) {
-      minorsAt10 = countMinorsDeveloped(board, color);
+      minorsAt10 = countMinorsEverDeveloped(developedHomes);
     }
 
     const cpAfterWhite = nextEval();
@@ -231,7 +261,7 @@ export function analyzeOpeningGame(
   }
 
   if (minorsAt10 == null) {
-    minorsAt10 = countMinorsDeveloped(board, color);
+    minorsAt10 = countMinorsEverDeveloped(developedHomes);
   }
 
   return {
@@ -244,6 +274,7 @@ export function analyzeOpeningGame(
       tempoMoves > 0
         ? Math.round((tempoWastes / tempoMoves) * 1000) / 10
         : null,
+    opening_pawn_moves: pawnMoves,
     accuracy_moves: accuracySamples.length,
     phase_end_fullmove: openingPhaseEndFullmove(castleFullmove),
     user_color: String(game.user_color || "white"),
@@ -263,6 +294,7 @@ export function aggregateOpeningMetrics(
     opening_castle_fullmove: null,
     opening_uncastled_rate_pct: null,
     opening_tempo_waste_rate_pct: null,
+    opening_pawn_moves_avg: null,
     games: 0,
     castled_games: 0,
     accuracy_games: 0,
@@ -284,6 +316,7 @@ export function aggregateOpeningMetrics(
   const tempo = rows
     .map((r) => r.opening_tempo_waste_rate_pct)
     .filter((v): v is number => v != null);
+  const pawns = rows.map((r) => r.opening_pawn_moves);
   const uncastledN = rows.filter((r) => r.uncastled).length;
   const n = rows.length;
   return {
@@ -294,6 +327,7 @@ export function aggregateOpeningMetrics(
     opening_uncastled_rate_pct:
       n > 0 ? Math.round((uncastledN / n) * 1000) / 10 : null,
     opening_tempo_waste_rate_pct: mean(tempo, 1),
+    opening_pawn_moves_avg: mean(pawns, 1),
     games: n,
     castled_games: castles.length,
     accuracy_games: accuracy.length,
@@ -350,6 +384,7 @@ export function topOpeningsBySide(
         opening_castle_fullmove: agg.opening_castle_fullmove,
         opening_uncastled_rate_pct: agg.opening_uncastled_rate_pct,
         opening_tempo_waste_rate_pct: agg.opening_tempo_waste_rate_pct,
+        opening_pawn_moves_avg: agg.opening_pawn_moves_avg,
       });
     }
     items.sort(

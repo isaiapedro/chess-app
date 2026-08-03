@@ -13,10 +13,12 @@ import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { Chess } from "chess.js";
 import {
   GLOBAL_DEPTH,
-  GLOBAL_HASH_MB,
   GLOBAL_MULTIPV,
-  GLOBAL_THREADS,
 } from "./analysisConfig";
+import { fenKey } from "./chessMoves";
+import { resolveEngineResources } from "./deviceResources";
+
+const ENGINE_RESOURCES = resolveEngineResources();
 
 type EvalResult = {
   cpWhite: number;
@@ -176,8 +178,8 @@ const ENGINE_HTML = `<!DOCTYPE html>
     }
     if (line === 'uciok' || line.indexOf('uciok') === 0) {
       send('debug', { stage: 'uciok-received' });
-      engine.postMessage('setoption name Threads value ${GLOBAL_THREADS}');
-      engine.postMessage('setoption name Hash value ${GLOBAL_HASH_MB}');
+      engine.postMessage('setoption name Threads value ${ENGINE_RESOURCES.threads}');
+      engine.postMessage('setoption name Hash value ${ENGINE_RESOURCES.hashMb}');
       engine.postMessage('setoption name MultiPV value ${GLOBAL_MULTIPV}');
       engine.postMessage('isready');
       return;
@@ -497,6 +499,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
 export function StockfishProvider({ children }: { children: React.ReactNode }) {
   const webRef = useRef<WebView>(null);
   const pending = useRef<Map<string, Pending>>(new Map());
+  const evalCache = useRef<Map<string, EvalResult>>(new Map());
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const seq = useRef(0);
@@ -625,6 +628,16 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           resolve(terminal);
           return;
         }
+        const useMovetime =
+          typeof movetimeMs === "number" && movetimeMs > 0
+            ? movetimeMs
+            : undefined;
+        const cacheKey = `${fenKey(fen)}|${depth}|${multiPv}|${useMovetime ?? 0}`;
+        const cached = evalCache.current.get(cacheKey);
+        if (cached) {
+          resolve(cached);
+          return;
+        }
         if (!ready) {
           // #region agent log
           agentLog("StockfishProvider.tsx:evaluate", "eval not-ready", {
@@ -636,10 +649,6 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           return;
         }
         const id = `e${++seq.current}`;
-        const useMovetime =
-          typeof movetimeMs === "number" && movetimeMs > 0
-            ? movetimeMs
-            : undefined;
         const timeoutMs = useMovetime
           ? useMovetime + 5000
           : depthOnlyTimeoutMs(depth);
@@ -657,6 +666,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         pending.current.set(id, {
           id,
           resolve: (value) => {
+            evalCache.current.set(cacheKey, value);
             // #region agent log
             agentLog("StockfishProvider.tsx:evaluate", "eval ok", {
               hyp: "C",

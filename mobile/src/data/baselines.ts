@@ -1,4 +1,10 @@
-import { fetchBaselines } from "../api/client";
+import { fetchBaselines, type BaselinesResponse } from "../api/client";
+import {
+  PERMANENT_CACHE_TTL_MS,
+  readCache,
+  takeInflight,
+  writeCache,
+} from "../storage/cache";
 
 export type BaselineMetricHit = {
   mean: number | null;
@@ -153,8 +159,25 @@ export const ACTIVITY_BASELINE_METRICS = [
   "avg_est_seconds_per_player_day",
 ] as const;
 
+const BASELINES_CACHE_KEY = "baselines:store:v1";
+
 let bundledRows: BaselineRow[] | null = null;
 let cachedStore: BaselineStore | null = null;
+
+function storeFromPayload(payload: BaselinesResponse): BaselineStore | null {
+  if (!payload?.meta?.available || !Array.isArray(payload.rows)) return null;
+  if (payload.by_cell && Object.keys(payload.by_cell).length) {
+    return {
+      available: true,
+      source_month: payload.meta.source_month ?? null,
+      bands: payload.bands || [],
+      speeds: payload.speeds || [],
+      rows: payload.rows as BaselineRow[],
+      by_cell: payload.by_cell as BaselineStore["by_cell"],
+    };
+  }
+  return indexRows(payload.rows as BaselineRow[]);
+}
 
 function loadBundledRows(): BaselineRow[] {
   if (bundledRows) return bundledRows;
@@ -437,29 +460,58 @@ export function baselinesFromBundledAsset(): BaselineStore {
 export async function loadBaselineStore(
   forceNetwork = false
 ): Promise<BaselineStore> {
-  if (!forceNetwork && cachedStore) return cachedStore;
-  try {
-    const payload = await fetchBaselines(forceNetwork);
-    if (payload?.meta?.available && Array.isArray(payload.rows)) {
-      if (payload.by_cell && Object.keys(payload.by_cell).length) {
-        cachedStore = {
-          available: true,
-          source_month: payload.meta.source_month ?? null,
-          bands: payload.bands || [],
-          speeds: payload.speeds || [],
-          rows: payload.rows as BaselineRow[],
-          by_cell: payload.by_cell as BaselineStore["by_cell"],
-        };
-        return cachedStore;
-      }
-      cachedStore = indexRows(payload.rows as BaselineRow[]);
+  return takeInflight(`baselines:${forceNetwork ? "force" : "soft"}`, async () => {
+    if (!forceNetwork && cachedStore) return cachedStore;
+
+    const disk = await readCache<BaselineStore>(
+      BASELINES_CACHE_KEY,
+      PERMANENT_CACHE_TTL_MS
+    );
+    if (!forceNetwork && disk) {
+      cachedStore = disk;
       return cachedStore;
     }
-  } catch {
-    // fall through to bundled asset
-  }
-  cachedStore = baselinesFromBundledAsset();
-  return cachedStore;
+
+    if (!forceNetwork) {
+      const legacy = await readCache<BaselinesResponse>(
+        "/api/v1/baselines",
+        PERMANENT_CACHE_TTL_MS
+      );
+      const migrated = legacy ? storeFromPayload(legacy) : null;
+      if (migrated) {
+        cachedStore = migrated;
+        await writeCache(BASELINES_CACHE_KEY, migrated);
+        return cachedStore;
+      }
+
+      const bundled = baselinesFromBundledAsset();
+      if (bundled.available) {
+        cachedStore = bundled;
+        await writeCache(BASELINES_CACHE_KEY, bundled);
+        return cachedStore;
+      }
+    }
+
+    try {
+      const payload = await fetchBaselines(true);
+      const store = storeFromPayload(payload);
+      if (store) {
+        cachedStore = store;
+        await writeCache(BASELINES_CACHE_KEY, store);
+        return cachedStore;
+      }
+    } catch {
+      /* fall through */
+    }
+
+    if (disk?.available) {
+      cachedStore = disk;
+      return cachedStore;
+    }
+    cachedStore = baselinesFromBundledAsset();
+    await writeCache(BASELINES_CACHE_KEY, cachedStore);
+    return cachedStore;
+  });
 }
 
 export function getCachedBaselineStore(): BaselineStore | null {

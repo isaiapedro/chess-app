@@ -18,6 +18,7 @@ from baselines import (
 )
 
 BUILD = ROOT / "scripts" / "build_lichess_baselines.py"
+MAX_GAMES_POPULATION = 10_000_000
 
 
 def main() -> int:
@@ -25,7 +26,7 @@ def main() -> int:
         description=(
             "Build population baselines for one full Lichess month across "
             "all rating bands and time formats. Writes "
-            ".cache/baselines/opening_mix_lichess_v1.{parquet,json} and "
+            ".cache/baselines/opening_mix_lichess_v1.{{parquet,json}} and "
             "syncs mobile/assets/baselines/opening_mix_lichess_v1.json."
         )
     )
@@ -49,7 +50,7 @@ def main() -> int:
         "--eval-quota",
         type=int,
         default=8000,
-        help="Reservoir size per cell for [%eval] metrics",
+        help="Reservoir size per cell for [%%eval] metrics",
     )
     parser.add_argument(
         "--seed",
@@ -60,8 +61,11 @@ def main() -> int:
     parser.add_argument(
         "--max-games",
         type=int,
-        default=None,
-        help="Debug: stop after N games",
+        default=MAX_GAMES_POPULATION,
+        help=(
+            "Stop after N games "
+            f"(default {MAX_GAMES_POPULATION} for population analysis)"
+        ),
     )
     parser.add_argument(
         "--output",

@@ -41,6 +41,7 @@ OPENING_PGN_METRIC_KEYS = (
     "opening_castle_fullmove",
     "opening_uncastled_rate_pct",
     "opening_tempo_waste_rate_pct",
+    "opening_pawn_moves_avg",
 )
 
 OPENING_EVAL_METRIC_KEYS = ("opening_accuracy_pct",)
@@ -115,6 +116,7 @@ def analyze_opening_game(
     accuracy_samples: list[float] = []
     tempo_moves = 0
     tempo_wastes = 0
+    pawn_moves = 0
     times_moved: dict[int, int] = defaultdict(int)
     minors_at_10: int | None = None
     eval_idx = 0
@@ -155,6 +157,8 @@ def analyze_opening_game(
                 times_moved[move.to_square] = prior + 1
                 if move.to_square != move.from_square:
                     times_moved[move.from_square] = 0
+            else:
+                pawn_moves += 1
 
         board.push(move)
 
@@ -217,6 +221,7 @@ def analyze_opening_game(
         ),
         "uncastled": castle_fullmove is None,
         "opening_tempo_waste_rate_pct": tempo_rate,
+        "opening_pawn_moves": float(pawn_moves),
         "accuracy_moves": len(accuracy_samples),
         "phase_end_fullmove": float(
             opening_phase_end_fullmove(castle_fullmove)
@@ -243,6 +248,7 @@ def aggregate_opening_metrics(rows: list[dict]) -> dict[str, float | None]:
         "opening_castle_fullmove": None,
         "opening_uncastled_rate_pct": None,
         "opening_tempo_waste_rate_pct": None,
+        "opening_pawn_moves_avg": None,
         "games": 0,
         "castled_games": 0,
         "accuracy_games": 0,
@@ -280,6 +286,7 @@ def aggregate_opening_metrics(rows: list[dict]) -> dict[str, float | None]:
         for r in rows
         if r.get("opening_tempo_waste_rate_pct") is not None
     ]
+    pawns = [float(r.get("opening_pawn_moves") or 0) for r in rows]
     uncastled_n = sum(1 for r in rows if r.get("uncastled"))
     n = len(rows)
     return {
@@ -291,6 +298,7 @@ def aggregate_opening_metrics(rows: list[dict]) -> dict[str, float | None]:
             round((uncastled_n / n) * 100, 1) if n else None
         ),
         "opening_tempo_waste_rate_pct": mean(tempo),
+        "opening_pawn_moves_avg": mean(pawns),
         "games": n,
         "castled_games": len(castles),
         "accuracy_games": len(accuracy),
@@ -340,6 +348,7 @@ def top_openings_by_side(
                     "opening_tempo_waste_rate_pct": agg[
                         "opening_tempo_waste_rate_pct"
                     ],
+                    "opening_pawn_moves_avg": agg["opening_pawn_moves_avg"],
                 }
             )
         items.sort(key=lambda x: (-int(x["games"]), str(x["opening_name"])))

@@ -2,12 +2,16 @@ import AsyncStorage from "@react-native-async-storage/async-storage";
 import Constants from "expo-constants";
 
 const PREFIX = "@chess-wrapped:v1:";
-const DEFAULT_TTL_MS = 15 * 60 * 1000;
+export const DAY_TTL_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_TTL_MS = DAY_TTL_MS;
 
-export const STUDY_ANALYSIS_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+export const STUDY_ANALYSIS_TTL_MS = 7 * DAY_TTL_MS;
 export const PERMANENT_CACHE_TTL_MS = Number.POSITIVE_INFINITY;
-export const STUDY_API_TTL_MS = 6 * 60 * 60 * 1000;
-export const GAMES_TTL_MS = 60 * 60 * 1000;
+export const STUDY_API_TTL_MS = DAY_TTL_MS;
+export const GAMES_TTL_MS = DAY_TTL_MS;
+export const BASELINES_TTL_MS = PERMANENT_CACHE_TTL_MS;
+export const INSIGHTS_TTL_MS = DAY_TTL_MS;
+export const INSIGHTS_RECENT_TTL_MS = DAY_TTL_MS;
 
 type CacheEntry<T> = {
   savedAt: number;
@@ -19,8 +23,31 @@ type CacheOptions = {
   ttlMs?: number;
 };
 
+type InflightMap = Map<string, Promise<unknown>>;
+
+const inflight: InflightMap = new Map();
+
 function storageKeyFor(key: string): string {
   return `${PREFIX}${key}`;
+}
+
+export function takeInflight<T>(
+  key: string,
+  factory: () => Promise<T>
+): Promise<T> {
+  const existing = inflight.get(key) as Promise<T> | undefined;
+  if (existing) return existing;
+  const promise = factory().finally(() => {
+    if (inflight.get(key) === promise) inflight.delete(key);
+  });
+  inflight.set(key, promise);
+  return promise;
+}
+
+export function clearInflightByPrefix(prefix: string): void {
+  for (const key of [...inflight.keys()]) {
+    if (key.startsWith(prefix)) inflight.delete(key);
+  }
 }
 
 function debugClearLog(message: string, data: Record<string, unknown>) {
@@ -88,34 +115,33 @@ export async function readThroughCache<T>(
   options: CacheOptions = {}
 ): Promise<T> {
   const ttlMs = options.ttlMs ?? DEFAULT_TTL_MS;
-  let cached: CacheEntry<T> | null = null;
+  const force = Boolean(options.forceNetwork);
+  return takeInflight(`rtc:${key}:${force ? "force" : "soft"}`, async () => {
+    let cached: CacheEntry<T> | null = null;
 
-  try {
-    const raw = await AsyncStorage.getItem(storageKeyFor(key));
-    cached = raw ? (JSON.parse(raw) as CacheEntry<T>) : null;
-  } catch {
-    cached = null;
-  }
+    try {
+      const raw = await AsyncStorage.getItem(storageKeyFor(key));
+      cached = raw ? (JSON.parse(raw) as CacheEntry<T>) : null;
+    } catch {
+      cached = null;
+    }
 
-  if (
-    !options.forceNetwork &&
-    cached &&
-    Date.now() - cached.savedAt < ttlMs
-  ) {
-    return cached.data;
-  }
-
-  try {
-    const data = await fetcher();
-    const entry: CacheEntry<T> = { savedAt: Date.now(), data };
-    await AsyncStorage.setItem(storageKeyFor(key), JSON.stringify(entry));
-    return data;
-  } catch (error) {
-    if (cached) {
+    if (!force && cached && Date.now() - cached.savedAt < ttlMs) {
       return cached.data;
     }
-    throw error;
-  }
+
+    try {
+      const data = await fetcher();
+      const entry: CacheEntry<T> = { savedAt: Date.now(), data };
+      await AsyncStorage.setItem(storageKeyFor(key), JSON.stringify(entry));
+      return data;
+    } catch (error) {
+      if (cached) {
+        return cached.data;
+      }
+      throw error;
+    }
+  });
 }
 
 export async function getCacheAge(key: string): Promise<number | null> {

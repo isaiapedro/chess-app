@@ -1,6 +1,15 @@
 # Chess Wrapped Analytics
 
-Streamlit desktop dashboard, FastAPI backend, and Expo mobile client.
+Expo mobile client (on-device ingest + metrics) and a thin FastAPI VPC for opening explorer / masters / peer baselines.
+
+## Architecture
+
+| Layer | Owns |
+|-------|------|
+| **Mobile** | Auth (Lichess OAuth PKCE or Chess.com username+email), user-game ingest from Chess.com/Lichess, Recap + Insights factors, Study Stockfish vault |
+| **API (VPC)** | Opening explorer, masters PGN, peer baselines — not user games / session / recap / insights on the happy path |
+
+Scripts and legacy routes under `/api/v1/games`, `/session`, `/stats/*` may still exist for offline tooling; the Expo app does not call them.
 
 ## Setup
 
@@ -10,51 +19,54 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-## Streamlit (desktop)
-
-```bash
-streamlit run app.py
-```
-
-## FastAPI (Phase 1 backend)
+## FastAPI (thin VPC)
 
 Run from the repository root (not from `mobile/`), otherwise `api` is not importable:
 
 ```bash
 cd /path/to/chess
+# Dev (auto-reload, single process)
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
+
+# Prod-ish on a small VPC (1–2 workers; no Redis)
+UVICORN_WORKERS=2 ./scripts/run_api.sh
 ```
 
 OpenAPI docs: http://localhost:8000/docs
 
-### Endpoints
+### Production knobs
+
+Copy `.env.example` → `.env`. Useful env vars (process-local only; no Redis):
+
+| Variable | Default | Role |
+|----------|---------|------|
+| `LICHESS_TOKEN` | _(empty)_ | Opening explorer reliability |
+| `API_SEM_STUDY` | `6` | Cap concurrent explorer / masters work |
+| `API_SEM_CHEAP` | `32` | Cap cheap endpoints (health, baselines, …) |
+| `GAMES_FETCH_TTL_SEC` | `86400` | Only for optional/legacy server-side game stores (min 24h) |
+| `STATS_DISK_TTL_SEC` | `86400` | Only for optional/legacy server-side stats (min 24h) |
+
+### Endpoints (mobile happy path)
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| GET | `/api/v1/games/{username}` | Parsed games JSON |
-| GET | `/api/v1/stats/recap` | Headline, badges, comparisons, rating series |
-| GET | `/api/v1/stats/insights` | Style / openings / middlegames / endgames |
-| GET | `/api/v1/study/eval` | Lichess cloud-eval for a FEN |
-| GET | `/api/v1/study/explorer` | Lichess/masters/player explorer |
-| GET | `/api/v1/study/mistakes` | Critical mistakes from recent losses |
-| POST | `/api/v1/study/quiz/validate` | Validate quiz move vs engine best |
+| GET | `/api/v1/baselines` | Peer baseline bands (cached permanently on device) |
+| GET | `/api/v1/study/explorer` | Lichess/masters/player opening explorer |
+| GET | `/api/v1/study/masters-pgn/{game_id}` | Masters game PGN by id |
 
-Shared query params: `platform` (`chesscom`\|`lichess`), `timeframe` (`1 month`\|`6 months`\|`1 year`), `speed`, `color`, `result`, `eco`, `date_from`, `date_to`.
-
-Recap/insights also require `username`. Games supports `include_pgn=true`.
+Legacy (scripts / optional): `/api/v1/games/{username}`, `/api/v1/session/{username}`, `/api/v1/stats/recap`, `/api/v1/stats/insights`.
 
 ### Examples
 
 ```bash
 curl "http://localhost:8000/health"
-curl "http://localhost:8000/api/v1/games/pedroisaia?platform=chesscom&timeframe=1%20month"
-curl "http://localhost:8000/api/v1/stats/recap?username=pedroisaia&platform=chesscom&timeframe=1%20month"
-curl "http://localhost:8000/api/v1/stats/insights?username=pedroisaia&platform=chesscom&timeframe=1%20month"
-curl "http://localhost:8000/api/v1/study/eval?fen=rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201"
+curl "http://localhost:8000/api/v1/baselines"
+curl "http://localhost:8000/api/v1/study/explorer?fen=rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201&source=lichess"
 ```
 
-Optional for full opening explorer DB: set `LICHESS_TOKEN` (see `.env.example`). Without it, repertoire falls back to cloud-eval lines.
+Optional for opening explorer: set `LICHESS_TOKEN` (see `.env.example`). Without it, explorer requests may return empty move lists.
+
 ## Mobile (Expo SDK 54)
 
 API port `8000` may be blocked on LAN by the host firewall while Metro `8081` stays reachable.
@@ -69,15 +81,22 @@ cd mobile
 npx expo start -c
 ```
 
-Leave `EXPO_PUBLIC_API_URL` unset: the app derives its base URL from Expo `hostUri`, so it
-follows Metro even when the machine's LAN IP changes. Only set it to override, and always
-use Metro's port `8081` (never `:8000`, which is blocked on LAN by the host firewall).
+Leave `EXPO_PUBLIC_API_URL` unset: the app derives its base URL from Expo `hostUri` for explorer/baselines only.
 
-Optional: open firewall instead — `sudo ufw allow 8000/tcp` — then you can hit `:8000` directly.
+### Auth
 
-- Tabs: Recap | Insights | Study (mistakes quiz + repertoire explorer).
-- Sticky filter header: username, platform, timeframe, date presets (Year/Month/Week/Day/Custom), speed, color.
-- Study board uses `chess.js` + custom squares (Expo Go friendly; no Skia).
-- AsyncStorage caches parsed games for one hour and analytics for 15 minutes, with stale-cache fallback when offline.
-- Pull-to-refresh bypasses cache and refreshes local data from the API.
-- Recap includes an animated Elo progression line; Insights includes animated donut charts and deep-dive panels.
+- **Chess.com:** Profile screen collects username + contact email (SecureStore). Email is used in the Chess.com `User-Agent`.
+- **Lichess:** OAuth PKCE (`email:read`, `study:write`), client id `chess-wrapped-mobile`,
+  redirect `com.chesswrapped.app://oauth` (reverse-domain custom scheme).
+  Register that exact URI with Lichess. Expo Go may use a different linking URI — prefer a
+  development build with the app scheme for OAuth.
+- After login, the phone ingests games incrementally into AsyncStorage and computes Recap/Insights locally.
+
+### App surface
+
+- Tabs: Recap | Insights | Study (mistakes quiz + repertoire explorer) | Profile.
+- Sticky filter header: period, speed (username/platform come from auth).
+- Study board uses `chess.js` + custom squares.
+- Peer baselines load once from the API and stay in permanent device cache.
+- Pull-to-refresh verifies the active period/speed filters match loaded data; mismatched filters load the correct cached slice. Games ingest only on cold first login and warm when a filter discovers new unregistered IDs.
+- Mistake quizzes and opening prep run on-device; background Stockfish waits until heuristic metrics finish (Scan more temporarily owns the engine).

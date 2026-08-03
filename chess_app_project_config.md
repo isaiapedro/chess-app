@@ -17,7 +17,7 @@ This document serves as the master configuration and execution blueprint for tra
 
 ## 🏗️ 1. System Architecture
 
-The project shifts from a monolithic Streamlit application to a **Client-Server Architecture**. 
+The project uses a **Client-Server Architecture**.
 
 * **Backend (Python / FastAPI):** Reuses the existing `load_data.py`, `stats.py`, and `cache.py` logic. It will act as a REST API that fetches, processes, and serves JSON data to the mobile client.
 * **Frontend (Mobile App):** A React Native or Flutter application responsible for rendering the UI, navigating between tabs, providing date-picker filters, and hosting the interactive chessboard.
@@ -96,7 +96,7 @@ The project shifts from a monolithic Streamlit application to a **Client-Server 
 When moving from the current `requirements.txt` to the mobile stack:
 
 **Keep in Python Backend:**
-* `fastapi`, `uvicorn` (Replacing Streamlit)
+* `fastapi`, `uvicorn`
 * `python-chess` (For PGN/board parsing)
 * `pandas` (For statistical aggregations)
 * `requests` (For external API fetching)

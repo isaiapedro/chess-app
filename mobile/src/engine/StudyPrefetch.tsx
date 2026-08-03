@@ -1,6 +1,7 @@
 import Constants from "expo-constants";
 import React, { useEffect } from "react";
 import { InteractionManager } from "react-native";
+import { useAuth } from "../context/AuthContext";
 import { useFilters } from "../context/FilterContext";
 import { useScanLog } from "../context/ScanLogContext";
 import { agentLog } from "../debug/agentLog";
@@ -39,6 +40,7 @@ function debugLog(
 }
 
 export function StudyPrefetch() {
+  const auth = useAuth();
   const { queryFilters, refreshToken } = useFilters();
   const { ready, evaluate } = useStockfish();
   const { setScanProgress, clearLog, appendLog } = useScanLog();
@@ -53,6 +55,9 @@ export function StudyPrefetch() {
       runId: "bg-off",
     });
     // #endregion
+    if (!auth.ready || !auth.isLoggedIn || !queryFilters.username.trim()) {
+      return;
+    }
     if (DEBUG_DISABLE_BACKGROUND_JOBS) {
       console.log("[bg-off] StudyPrefetch skipped");
       clearLog();
@@ -66,12 +71,6 @@ export function StudyPrefetch() {
       });
       return;
     }
-    // #region agent log
-    agentLog("G", "StudyPrefetch.tsx:effect", "stockfish ready gate", {
-      ready,
-      disabled: DEBUG_DISABLE_BACKGROUND_JOBS,
-    });
-    // #endregion
     if (!ready) return;
 
     cancelStudyPrefetch();
@@ -88,53 +87,59 @@ export function StudyPrefetch() {
 
     const task = InteractionManager.runAfterInteractions(() => {
       if (signal.cancelled) return;
-      // #region agent log
-      agentLog("G", "StudyPrefetch.tsx:start", "prefetch started", {
-        user: queryFilters.username,
-      });
-      // #endregion
-      debugLog("StudyPrefetch.tsx:start", "prefetch started", "H-bg", {
-        user: queryFilters.username,
-        runId: "bg-off",
-      });
+      void (async () => {
+        // #region agent log
+        agentLog("G", "StudyPrefetch.tsx:start", "prefetch started", {
+          user: queryFilters.username,
+        });
+        // #endregion
+        debugLog("StudyPrefetch.tsx:start", "prefetch started", "H-bg", {
+          user: queryFilters.username,
+          runId: "bg-off",
+        });
 
-      void prefetchStudyContent({
-        filters: queryFilters,
-        evaluate,
-        signal,
-        onProgress: (progress) => {
-          if (
-            progress.gamesDone <= 1 ||
-            progress.phase === "done" ||
-            progress.phase === "style"
-          ) {
-            // #region agent log
-            agentLog("G", "StudyPrefetch.tsx:progress", "prefetch progress", {
-              status: progress.status,
-              phase: progress.phase,
-              done: progress.gamesDone,
-              total: progress.gamesTotal,
-            });
-            // #endregion
-            debugLog("StudyPrefetch.tsx:progress", "prefetch progress", "H-bg", {
-              status: progress.status,
-              phase: progress.phase,
-              done: progress.gamesDone,
-              total: progress.gamesTotal,
-              runId: "bg-off",
-            });
-          }
-          setScanProgress({
-            status: progress.status,
-            phase: progress.phase,
-            gamesDone: progress.gamesDone,
-            gamesTotal: progress.gamesTotal,
-            running: progress.phase !== "done",
-            log: true,
+        try {
+          await prefetchStudyContent({
+            filters: queryFilters,
+            evaluate,
+            signal,
+            onProgress: (progress) => {
+              if (
+                progress.gamesDone <= 1 ||
+                progress.phase === "done" ||
+                progress.phase === "style"
+              ) {
+                // #region agent log
+                agentLog("G", "StudyPrefetch.tsx:progress", "prefetch progress", {
+                  status: progress.status,
+                  phase: progress.phase,
+                  done: progress.gamesDone,
+                  total: progress.gamesTotal,
+                });
+                // #endregion
+                debugLog(
+                  "StudyPrefetch.tsx:progress",
+                  "prefetch progress",
+                  "H-bg",
+                  {
+                    status: progress.status,
+                    phase: progress.phase,
+                    done: progress.gamesDone,
+                    total: progress.gamesTotal,
+                    runId: "bg-off",
+                  }
+                );
+              }
+              setScanProgress({
+                status: progress.status,
+                phase: progress.phase,
+                gamesDone: progress.gamesDone,
+                gamesTotal: progress.gamesTotal,
+                running: progress.phase !== "done",
+                log: progress.gamesDone % 1 === 0 || progress.phase === "done",
+              });
+            },
           });
-        },
-      })
-        .then(() => {
           if (signal.cancelled) return;
           debugLog("StudyPrefetch.tsx:done", "prefetch finished", "H-bg", {
             runId: "bg-off",
@@ -145,8 +150,7 @@ export function StudyPrefetch() {
             phase: "done",
             running: false,
           });
-        })
-        .catch((err) => {
+        } catch (err) {
           if (signal.cancelled) return;
           const message =
             err instanceof Error ? err.message : "Background scan failed";
@@ -160,7 +164,8 @@ export function StudyPrefetch() {
             phase: "error",
             running: false,
           });
-        });
+        }
+      })();
     });
 
     return () => {
@@ -169,6 +174,8 @@ export function StudyPrefetch() {
       task.cancel?.();
     };
   }, [
+    auth.ready,
+    auth.isLoggedIn,
     ready,
     evaluate,
     queryFilters,

@@ -1,7 +1,10 @@
 import { Chess, type Move } from "chess.js";
 import Constants from "expo-constants";
 import type { MistakeItem, QueryFilters } from "../api/client";
-import { fetchStudyGames } from "../api/client";
+import {
+  loadLocalGamesPage,
+  toStudyGameList,
+} from "../data/platformGames";
 import {
   readCache,
   writeCache,
@@ -13,12 +16,16 @@ import {
 } from "../storage/studyCacheKeys";
 import {
   ENGINE_LABEL,
-  GLOBAL_DEPTH,
+  EVAL_VAULT_SAVE_EVERY,
+  GLOBAL_FIRST_SCAN_MAX_GAMES,
   GLOBAL_MAX_GAMES,
   GLOBAL_MULTIPV,
+  resolveScanGameLimit,
+  SCAN_DEPTH,
   TARGET_MISTAKE_MOMENTS,
   TARGET_OPENING_MOMENTS,
 } from "./analysisConfig";
+import { yieldForUi } from "./backgroundWork";
 import { DEBUG_DISABLE_STYLE_METRICS } from "./debugFlags";
 
 function debugScanLog(
@@ -216,6 +223,18 @@ function toStudyGames(
         : row.user_rating
           ? Number(row.user_rating)
           : undefined,
+    opp_rating:
+      typeof row.opp_rating === "number"
+        ? row.opp_rating
+        : row.opp_rating
+          ? Number(row.opp_rating)
+          : undefined,
+    move_count:
+      typeof row.move_count === "number"
+        ? row.move_count
+        : row.move_count
+          ? Number(row.move_count)
+          : undefined,
   }));
 }
 
@@ -254,7 +273,25 @@ async function savePermanentEvalStore(
   filters: Pick<QueryFilters, "username" | "platform">,
   vault: PermanentEvalStore
 ): Promise<void> {
-  await writeCache(studyGameEvalsCacheKey(filters), vault);
+  const disk = await loadPermanentEvalStore(filters);
+  const mergedMistakes = [
+    ...new Set([
+      ...(disk.consumedMistakeKeys || []),
+      ...(vault.consumedMistakeKeys || []),
+    ]),
+  ];
+  const mergedOpenings = [
+    ...new Set([
+      ...(disk.consumedOpeningKeys || []),
+      ...(vault.consumedOpeningKeys || []),
+    ]),
+  ];
+  await writeCache(studyGameEvalsCacheKey(filters), {
+    ...vault,
+    games: { ...disk.games, ...vault.games },
+    consumedMistakeKeys: mergedMistakes,
+    consumedOpeningKeys: mergedOpenings,
+  } satisfies PermanentEvalStore);
 }
 
 function buildPeriodState(
@@ -352,11 +389,12 @@ export function styleFromVaultRecords(
     if (record.style) styleRows.push(record.style);
   }
   const style = styleRows.length ? aggregateStyleMetrics(styleRows) : null;
+  const firstWave = Math.min(total, GLOBAL_FIRST_SCAN_MAX_GAMES);
   return {
     style,
     scanned,
     total,
-    periodComplete: total > 0 && scanned >= total,
+    periodComplete: firstWave > 0 && scanned >= firstWave,
   };
 }
 
@@ -415,7 +453,8 @@ export function createEvalLookup(state: GlobalAnalysisState) {
 async function scanOneGame(
   game: StudyGame,
   evaluate: EvalFn,
-  signal?: { cancelled: boolean }
+  signal?: { cancelled: boolean },
+  onPly?: (ply: number, totalPlies: number) => void | Promise<void>
 ): Promise<GlobalGameRecord | null> {
   const tScan = Date.now();
   const sans = parseMoves(game);
@@ -456,9 +495,9 @@ async function scanOneGame(
     }
     evalCalls += 1;
     if (evalCalls % 8 === 0) {
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await yieldForUi({ heavy: true });
     }
-    const raw = await evaluate(fen, GLOBAL_DEPTH, GLOBAL_MULTIPV, 0);
+    const raw = await evaluate(fen, SCAN_DEPTH, GLOBAL_MULTIPV, 0);
     const bestUci = raw.bestUci ? canonicalUci(fen, raw.bestUci) : null;
     const stored = { cpWhite: raw.cpWhite, bestUci };
     positions[key] = stored;
@@ -471,6 +510,7 @@ async function scanOneGame(
   let before = await storeEval(chess.fen());
   evalsWhiteCp.push(before.whiteCp);
   if (styleSession) styleScanConsumeRoot(styleSession, before.whiteCp);
+  await onPly?.(0, sans.length);
 
   for (let ply = 0; ply < sans.length; ply += 1) {
     if (signal?.cancelled) return null;
@@ -494,6 +534,10 @@ async function scanOneGame(
         after.whiteCp,
         ply
       );
+    }
+
+    if (ply === 0 || (ply + 1) % 4 === 0 || ply + 1 === sans.length) {
+      await onPly?.(ply + 1, sans.length);
     }
 
     if (isUserTurn && !chess.isCheckmate()) {
@@ -655,7 +699,126 @@ export async function periodReservoirStatus(
   };
 }
 
-let activeGlobalScanSignal: { cancelled: boolean } | null = null;
+export type GlobalScanOwner = "prefetch" | "study" | "opening";
+
+type ActiveGlobalScan = {
+  owner: GlobalScanOwner;
+  sessionKey: string;
+  signal: { cancelled: boolean };
+  waiters: Array<() => void>;
+};
+
+let activeGlobalScan: ActiveGlobalScan | null = null;
+
+export function globalScanSessionKey(
+  filters: Pick<
+    QueryFilters,
+    "username" | "platform" | "timeframe" | "speed" | "dateFrom" | "dateTo"
+  >
+): string {
+  return [
+    String(filters.username || "").toLowerCase(),
+    String(filters.platform || ""),
+    String(filters.timeframe || ""),
+    String(filters.speed || ""),
+    String(filters.dateFrom || ""),
+    String(filters.dateTo || ""),
+  ].join("|");
+}
+
+export function getActiveGlobalScan(): {
+  owner: GlobalScanOwner;
+  sessionKey: string;
+  signal: { cancelled: boolean };
+} | null {
+  if (!activeGlobalScan || activeGlobalScan.signal.cancelled) return null;
+  return {
+    owner: activeGlobalScan.owner,
+    sessionKey: activeGlobalScan.sessionKey,
+    signal: activeGlobalScan.signal,
+  };
+}
+
+export function isGlobalScanActiveFor(sessionKey: string): boolean {
+  const active = getActiveGlobalScan();
+  return Boolean(active && active.sessionKey === sessionKey);
+}
+
+function notifyScanWaiters(scan: ActiveGlobalScan): void {
+  const waiters = scan.waiters.splice(0);
+  for (const waiter of waiters) waiter();
+}
+
+export function waitForActiveGlobalScan(options: {
+  sessionKey: string;
+  signal?: { cancelled: boolean };
+}): Promise<"done" | "cancelled" | "absent"> {
+  const active = activeGlobalScan;
+  if (
+    !active ||
+    active.sessionKey !== options.sessionKey ||
+    active.signal.cancelled
+  ) {
+    return Promise.resolve(
+      active && active.sessionKey === options.sessionKey ? "done" : "absent"
+    );
+  }
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (result: "done" | "cancelled") => {
+      if (settled) return;
+      settled = true;
+      resolve(result);
+    };
+    active.waiters.push(() => finish("done"));
+    const poll = () => {
+      if (settled) return;
+      if (options.signal?.cancelled) {
+        finish("cancelled");
+        return;
+      }
+      if (!activeGlobalScan || activeGlobalScan !== active) {
+        finish("done");
+        return;
+      }
+      setTimeout(poll, 100);
+    };
+    setTimeout(poll, 100);
+  });
+}
+
+export async function joinActiveGlobalScanIfOwned(options: {
+  sessionKey: string;
+  owners: GlobalScanOwner[];
+  signal?: { cancelled: boolean };
+  until?: () => boolean | Promise<boolean>;
+}): Promise<boolean> {
+  const active = getActiveGlobalScan();
+  if (
+    !active ||
+    active.sessionKey !== options.sessionKey ||
+    !options.owners.includes(active.owner)
+  ) {
+    return false;
+  }
+  if (options.until) {
+    while (!options.signal?.cancelled) {
+      if (await options.until()) return true;
+      const current = getActiveGlobalScan();
+      if (
+        !current ||
+        current.sessionKey !== options.sessionKey ||
+        !options.owners.includes(current.owner)
+      ) {
+        return Boolean(await options.until());
+      }
+      await new Promise<void>((resolve) => setTimeout(resolve, 150));
+    }
+    return false;
+  }
+  const result = await waitForActiveGlobalScan(options);
+  return result === "done";
+}
 
 export async function runGlobalPeriodAnalysis(options: {
   filters: QueryFilters;
@@ -674,6 +837,10 @@ export async function runGlobalPeriodAnalysis(options: {
     state: GlobalAnalysisState
   ) => boolean | void | Promise<boolean | void>;
   games?: StudyGame[];
+  owner?: GlobalScanOwner;
+  sessionKey?: string;
+  continueScan?: boolean;
+  maxGames?: number;
 }): Promise<GlobalAnalysisState> {
   const {
     filters,
@@ -683,34 +850,62 @@ export async function runGlobalPeriodAnalysis(options: {
     onEarlyMistakesReady,
     onEarlyOpeningsReady,
   } = options;
-  if (activeGlobalScanSignal && activeGlobalScanSignal !== options.signal) {
-    activeGlobalScanSignal.cancelled = true;
-  }
+  const owner = options.owner || "study";
+  const sessionKey = options.sessionKey || globalScanSessionKey(filters);
   const signal = options.signal || { cancelled: false };
-  activeGlobalScanSignal = signal;
+  if (activeGlobalScan && activeGlobalScan.signal !== signal) {
+    activeGlobalScan.signal.cancelled = true;
+    const previous = activeGlobalScan;
+    activeGlobalScan = null;
+    notifyScanWaiters(previous);
+  }
+  activeGlobalScan = { owner, sessionKey, signal, waiters: [] };
   try {
     const earlyMistakeTarget =
       options.earlyMistakeTarget ?? TARGET_MISTAKE_MOMENTS;
     const earlyOpeningTarget =
       options.earlyOpeningTarget ?? TARGET_OPENING_MOMENTS;
 
-    const rows = options.games ? null : await fetchStudyGames(filters, false);
+    let sourceGames = options.games;
+    if (options.continueScan) {
+      const page = await loadLocalGamesPage(filters, {
+        limit: GLOBAL_MAX_GAMES,
+        offset: 0,
+      });
+      sourceGames = toStudyGameList(page.allFiltered.slice(0, GLOBAL_MAX_GAMES));
+    } else if (!sourceGames) {
+      const page = await loadLocalGamesPage(filters, {
+        limit: GLOBAL_FIRST_SCAN_MAX_GAMES,
+        offset: 0,
+      });
+      sourceGames = page.games;
+    }
     if (signal.cancelled) return emptyState();
-    const games = [...(options.games || toStudyGames(rows || []))]
+    const sortedGames = [...sourceGames]
       .sort((a, b) =>
         String(b.created_at).localeCompare(String(a.created_at))
       )
       .slice(0, GLOBAL_MAX_GAMES);
+    let vault = await loadPermanentEvalStore(filters);
+    const periodCachedCount = sortedGames.filter(
+      (g) => vault.games[String(g.id)]
+    ).length;
+    const scanLimit = resolveScanGameLimit({
+      periodCachedCount,
+      continueScan: options.continueScan,
+      maxGames: options.maxGames,
+    });
+    const games = sortedGames.slice(0, scanLimit);
     const total = games.length;
     const periodIds = games.map((g) => String(g.id));
-
-    let vault = await loadPermanentEvalStore(filters);
     const cachedCount = games.filter((g) => vault.games[String(g.id)]).length;
     // #region agent log
     debugScanLog("global analysis start", "H1", {
       total,
       cachedCount,
-      max: GLOBAL_MAX_GAMES,
+      max: scanLimit,
+      firstSession: periodCachedCount <= 0 && !options.continueScan,
+      owner,
       user: filters.username,
     });
     // #endregion
@@ -733,8 +928,50 @@ export async function runGlobalPeriodAnalysis(options: {
 
     let mistakesReady = false;
     let openingsReady = false;
+    let unsavedMutations = 0;
+    const persistVault = async (force = false) => {
+      if (unsavedMutations <= 0 && !force) return;
+      await savePermanentEvalStore(filters, vault);
+      unsavedMutations = 0;
+    };
+    const noteVaultDirty = async () => {
+      unsavedMutations += 1;
+      if (unsavedMutations >= EVAL_VAULT_SAVE_EVERY) {
+        await persistVault(true);
+      }
+    };
+    const mergeVaultConsumed = async () => {
+      const disk = await loadPermanentEvalStore(filters);
+      vault = {
+        ...vault,
+        consumedMistakeKeys: [
+          ...new Set([
+            ...(vault.consumedMistakeKeys || []),
+            ...(disk.consumedMistakeKeys || []),
+          ]),
+        ],
+        consumedOpeningKeys: [
+          ...new Set([
+            ...(vault.consumedOpeningKeys || []),
+            ...(disk.consumedOpeningKeys || []),
+          ]),
+        ],
+      };
+    };
 
     const emitState = async (partialDone: number) => {
+      const state = buildPeriodState(games, vault, null);
+      await onGameScanned?.(state);
+      report(
+        mistakesReady || openingsReady
+          ? "Puzzle batches ready · filling eval buffer"
+          : "Scanning period games",
+        "scan",
+        partialDone
+      );
+    };
+
+    const runDeferredEarlyRefines = async () => {
       const state = buildPeriodState(games, vault, null);
       await onGameScanned?.(state);
       if (!mistakesReady && onEarlyMistakesReady) {
@@ -744,61 +981,68 @@ export async function runGlobalPeriodAnalysis(options: {
           consumedKeys: vault.consumedMistakeKeys,
           limit: earlyMistakeTarget,
         });
-        if (picks.length >= earlyMistakeTarget || state.complete) {
-          if (picks.length) {
-            const accepted = await onEarlyMistakesReady(picks, state);
-            if (accepted !== false) {
-              mistakesReady = true;
-              vault = await loadPermanentEvalStore(filters);
-            }
-          } else if (state.complete) {
+        if (picks.length) {
+          report("Refining mistake puzzles…", "style", state.scannedGameIds.length);
+          const accepted = await onEarlyMistakesReady(picks, state);
+          if (accepted !== false) {
             mistakesReady = true;
+            await mergeVaultConsumed();
+            await persistVault(true);
           }
+        } else {
+          mistakesReady = true;
         }
       }
-      if (!openingsReady && onEarlyOpeningsReady) {
+      if (
+        (mistakesReady || !onEarlyMistakesReady) &&
+        !openingsReady &&
+        onEarlyOpeningsReady
+      ) {
         const picks = selectRecentPeriodCandidates({
           candidates: state.openingCandidates,
           periodGameIds: periodIds,
           consumedKeys: vault.consumedOpeningKeys,
           limit: earlyOpeningTarget,
         });
-        if (picks.length >= earlyOpeningTarget || state.complete) {
-          if (picks.length) {
-            const accepted = await onEarlyOpeningsReady(picks, state);
-            if (accepted !== false) {
-              openingsReady = true;
-              vault = await loadPermanentEvalStore(filters);
-            }
-          } else if (state.complete) {
+        if (picks.length) {
+          report("Refining opening puzzles…", "style", state.scannedGameIds.length);
+          const accepted = await onEarlyOpeningsReady(picks, state);
+          if (accepted !== false) {
             openingsReady = true;
+            await mergeVaultConsumed();
+            await persistVault(true);
           }
+        } else {
+          openingsReady = true;
         }
       }
-      report(
-        mistakesReady || openingsReady
-          ? "Candidates ready · scanning continues"
-          : "Scanning period games",
-        "scan",
-        partialDone
-      );
     };
 
     await emitState(cachedCount);
 
-    if (cachedCount < total) {
-      report(
-        cachedCount
-          ? `Scanning ${total - cachedCount} new game${total - cachedCount === 1 ? "" : "s"}`
-          : "Starting global Stockfish scan",
-        "scan",
-        cachedCount
+    if (cachedCount >= total && total > 0) {
+      await runDeferredEarlyRefines();
+      report("Period games already evaluated", "done", total);
+      return buildPeriodState(
+        games,
+        await loadPermanentEvalStore(filters),
+        null
       );
     }
 
+    report(
+      cachedCount
+        ? `Scanning ${total - cachedCount} new game${total - cachedCount === 1 ? "" : "s"}`
+        : "Starting global Stockfish scan",
+      "scan",
+      cachedCount
+    );
+
     let done = cachedCount;
+
     for (const game of games) {
       if (signal.cancelled) {
+        await persistVault(true);
         return buildPeriodState(games, vault, null);
       }
       const id = String(game.id);
@@ -825,7 +1069,7 @@ export async function runGlobalPeriodAnalysis(options: {
             },
           },
         };
-        await savePermanentEvalStore(filters, vault);
+        await noteVaultDirty();
         continue;
       }
       if (existing) continue;
@@ -834,8 +1078,19 @@ export async function runGlobalPeriodAnalysis(options: {
         opponentName(game) || game.opening_name || id.slice(0, 8);
       report(`Scanning ${label}`, "scan", done, { currentGame: label });
 
-      const record = await scanOneGame(game, evaluate, signal);
+      const record = await scanOneGame(game, evaluate, signal, async (ply, totalPlies) => {
+        if (signal.cancelled) return;
+        const frac = totalPlies > 0 ? ply / totalPlies : 0;
+        const moveNo = Math.max(1, Math.ceil(ply / 2) || 1);
+        report(
+          `Scanning ${label} · move ${moveNo}`,
+          "scan",
+          done + frac,
+          { currentGame: label }
+        );
+      });
       if (!record) {
+        await persistVault(true);
         return buildPeriodState(games, vault, null);
       }
 
@@ -844,42 +1099,32 @@ export async function runGlobalPeriodAnalysis(options: {
         games: { ...vault.games, [id]: record },
       };
       done += 1;
-      await savePermanentEvalStore(filters, vault);
+      await noteVaultDirty();
       report(`Scanned ${label}`, "scan", done, { currentGame: label });
       await emitState(done);
-      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      await yieldForUi({ heavy: true });
     }
 
     if (signal.cancelled) {
+      await persistVault(true);
       return buildPeriodState(games, vault, null);
     }
 
-    const state = buildPeriodState(games, vault, null);
+    await persistVault(true);
+    await runDeferredEarlyRefines();
 
-    if (!mistakesReady && onEarlyMistakesReady) {
-      const picks = selectRecentPeriodCandidates({
-        candidates: state.mistakeCandidates,
-        periodGameIds: periodIds,
-        consumedKeys: vault.consumedMistakeKeys,
-        limit: earlyMistakeTarget,
-      });
-      if (picks.length) await onEarlyMistakesReady(picks, state);
-    }
-    if (!openingsReady && onEarlyOpeningsReady) {
-      const picks = selectRecentPeriodCandidates({
-        candidates: state.openingCandidates,
-        periodGameIds: periodIds,
-        consumedKeys: vault.consumedOpeningKeys,
-        limit: earlyOpeningTarget,
-      });
-      if (picks.length) await onEarlyOpeningsReady(picks, state);
-    }
-
-    report("Global analysis complete", "done", state.scannedGameIds.length);
-    return buildPeriodState(games, await loadPermanentEvalStore(filters), null);
+    report(
+      "Global analysis complete",
+      "done",
+      buildPeriodState(games, vault, null).scannedGameIds.length
+    );
+    await persistVault(true);
+    return buildPeriodState(games, vault, null);
   } finally {
-    if (activeGlobalScanSignal === signal) {
-      activeGlobalScanSignal = null;
+    if (activeGlobalScan?.signal === signal) {
+      const done = activeGlobalScan;
+      activeGlobalScan = null;
+      notifyScanWaiters(done);
     }
   }
 }

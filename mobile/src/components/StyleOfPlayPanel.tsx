@@ -102,7 +102,7 @@ const METRIC_SCALE: Record<string, MetricScale> = {
   "Mainstream Openings": { kind: "fixed", max: 100 },
   "Side Openings": { kind: "fixed", max: 100 },
   "Position Swings": { kind: "fixed", max: 40 },
-  Sacrifices: { kind: "benchmark", fallback: 2.5 },
+  Sacrifices: { kind: "fixed", max: 5 },
   "Early Flank Pushes": { kind: "fixed", max: 100 },
   "Endgame Conversion": { kind: "fixed", max: 100 },
   "Early Piece Trades": { kind: "benchmark", fallback: 4 },
@@ -354,7 +354,7 @@ function buildSections(
           summary:
             "How long you think when a move sharply changes the evaluation.",
           detail:
-            "A move is critical when your win probability swings by 15 percentage points or more after it. We take your clock time on those moves and average them across all critical moments in the period.",
+            "A move is critical when your win probability swings by ≥10 percentage points and the raw eval also moves by at least 1cp. Critical position count does not need clock data. Avg critical time uses your clock on those moves when clocks exist.",
           occurred:
             hasNumber(creativity.avg_critical_time_s) &&
             hasPositive(creativity.critical_positions),
@@ -416,12 +416,12 @@ function buildSections(
         },
         {
           name: "Sacrifices",
-          value: fmt(initiative.avg_sacrifice_moves),
-          unit: "/game",
-          summary: "How often you give up material on purpose.",
+          value: fmt(initiative.sacrifice_rate_pct),
+          unit: "% moves",
+          summary: "Share of your moves that give up material without a trade.",
           detail:
-            "On your moves we compare material balance and hanging pieces before/after. A sacrifice is counted when you offer at least a minor piece’s worth of material and the engine evaluation does not collapse accordingly (eval drop bounded by the offer, or remaining roughly playable). Reported as the average count per game.",
-          occurred: hasPositive(initiative.avg_sacrifice_moves),
+            "A sacrifice counts only when you leave a minor/major hanging (or capture while giving up ≥ a minor more than you take), the opponent takes that piece, and you do not immediately get the material back (same-square recapture or capturing a piece of similar value next move). Declined offers and trades do not count. Aggregated as sacrifices ÷ your moves across the period.",
+          occurred: hasPositive(initiative.sacrifice_rate_pct),
         },
         {
           name: "Early Flank Pushes",
@@ -429,7 +429,7 @@ function buildSections(
           unit: "%",
           summary: "How often you push wing pawns early into enemy ground.",
           detail:
-            "Counts games where, in the first 12 full moves, you advance a pawn onto a flank file (a–c or f–h) into the opponent’s half of the board. Value is the percentage of games with at least one such push.",
+            "Counts games where, in the first 12 full moves, you advance a flank pawn (a, b, g, or h file) at least to the 4th rank as White or the 5th rank as Black. Value is the percentage of games with at least one such push.",
           occurred: hasPositive(initiative.early_flank_rate_pct),
         },
         {
@@ -438,7 +438,7 @@ function buildSections(
           unit: "%",
           summary: "How often you turn a winning endgame into a win.",
           detail:
-            "An endgame advantage is any position with 10 or fewer non-king pieces where your win probability is at least 70%. Conversion is the share of those games you actually won.",
+            "An endgame advantage sticks once your eval reaches ~+100cp (win prob ≥ 65%) after the endgame has started; it never resets. Conversion is the share of those games you actually won (PGN Result Win / 1-0 / 0-1 for you). Unfinished games (Result *) do not count as converted.",
           occurred: hasPositive(initiative.endgame_advantage_games),
         },
         {
@@ -461,34 +461,34 @@ function buildSections(
           unit: "/game",
           summary: "How often you attack pieces worth more than the attacker.",
           detail:
-            "After each of your moves we inspect attacks from the piece you just moved. A threat counts when a non-king piece attacks a higher-value enemy piece (excluding pawns and kings). Averaged per game.",
+            "Full game. After each of your moves (including pawns), count when that piece attacks an enemy minor/major of strictly higher value, or captures a higher-value piece. Equal exchanges do not count. Averaged per game.",
           occurred: hasPositive(attacking.avg_higher_value_threats),
         },
         {
           name: "Threat Escapes",
           value: fmt(attacking.avg_threat_escapes),
           unit: "/game",
-          summary: "How often you slip away when a cheaper piece attacks yours.",
+          summary: "How often a threatened piece slips to safety.",
           detail:
-            "Before your move, if the piece you move is attacked by a lesser-value enemy piece and undefended in that sense, and after the move it is no longer under that lesser attack, we count an escape. Averaged per game.",
+            "Counts only non-pawn, non-king moves. Before the move the piece must be under enemy attack (any or lesser-value); after the move it is no longer attacked that way. Pawn recaptures and king moves are ignored. Averaged per game.",
           occurred: hasPositive(attacking.avg_threat_escapes),
         },
         {
           name: "Fights Near Their King",
           value: fmt(attacking.avg_trades_near_enemy_king),
           unit: "/game",
-          summary: "How often pieces are captured close to the enemy king.",
+          summary: "How often piece trades happen next to the enemy king.",
           detail:
-            "Whenever a minor or major piece is captured within Chebyshev distance 2 of the enemy king, we count it. Includes captures by either side. Averaged per game.",
+            "Early piece trades (minor/major only — not pawns or kings) whose capture square is within Chebyshev distance 2 of the enemy king. Averaged per game.",
           occurred: hasPositive(attacking.avg_trades_near_enemy_king),
         },
         {
           name: "Fights Near Your King",
           value: fmt(attacking.avg_trades_near_user_king),
           unit: "/game",
-          summary: "How often pieces are captured close to your king.",
+          summary: "How often piece trades happen next to your king.",
           detail:
-            "Same rule as fights near their king, but measured around your king: minor/major captures within distance 2. Averaged per game.",
+            "Same as fights near their king: minor/major trades only, capture square within distance 2 of your king. Averaged per game.",
           occurred: hasPositive(attacking.avg_trades_near_user_king),
         },
       ],
@@ -574,9 +574,9 @@ function buildSections(
           name: "Blunders",
           value: fmt(durability.avg_blunders),
           unit: "/game",
-          summary: "How often a single move tanks your winning chances.",
+          summary: "How often a single move tanks your winning chances after the opening.",
           detail:
-            "A blunder is your move that drops your win probability by 20 percentage points or more versus the position before the move, using engine evaluations. Reported as the average number of such moves per game.",
+            "Post-opening only (middlegame + endgame). A blunder drops win probability by more than 15pp. Opening blunders excluded so this aligns with phase metrics. Average count per game.",
           occurred: hasPositive(durability.total_blunders),
         },
       ],
@@ -642,8 +642,8 @@ function attachPeerMeta(
       userNum: initiative.avg_eval_volatility_cp,
     },
     Sacrifices: {
-      baselineKey: "avg_sacrifice_moves",
-      userNum: initiative.avg_sacrifice_moves,
+      baselineKey: "sacrifice_rate_pct",
+      userNum: initiative.sacrifice_rate_pct,
     },
     "Early Flank Pushes": {
       baselineKey: "early_flank_rate_pct",

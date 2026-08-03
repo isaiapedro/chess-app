@@ -532,6 +532,9 @@ def build_baseline_rows(
     return pd.DataFrame.from_records(records)
 
 
+MAX_GAMES_POPULATION = 10_000_000
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=(
@@ -568,8 +571,11 @@ def main() -> int:
     parser.add_argument(
         "--max-games",
         type=int,
-        default=None,
-        help="Stop after scanning this many games (debug)",
+        default=MAX_GAMES_POPULATION,
+        help=(
+            "Stop after scanning this many games "
+            f"(default {MAX_GAMES_POPULATION} for population analysis)"
+        ),
     )
     parser.add_argument(
         "--output",

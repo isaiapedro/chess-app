@@ -15,17 +15,41 @@ import {
 } from "./openingPhase";
 import {
   DRAWISH_MIN_FULLMOVE,
+  normalizeGameResult,
   userWinProbability,
+  classifyEvalDrop,
+  isMistakeOrWorse,
+  isBlunderSwingUp,
+  wpDropPp,
   WP_BLUNDER_DROP,
+  CP_ENDGAME_ADVANTAGE_STICKY,
+  WP_CRITICAL_CP,
   WP_CRITICAL_DELTA,
   WP_DISADVANTAGE,
   WP_DRAWISH_HI,
   WP_DRAWISH_LO,
   WP_ENDGAME_ADVANTAGE,
+  WP_ENDGAME_ADVANTAGE_STICKY,
+  WP_INACCURACY_DROP,
 } from "./winProb";
+
+const EVAL_CLAMP = 1000;
+
+function clampCp(value: number): number {
+  const abs = Math.abs(value);
+  if (abs >= MATE_CP_THRESHOLD) {
+    return value > 0 ? EVAL_CLAMP + 50 : -(EVAL_CLAMP + 50);
+  }
+  return Math.max(-EVAL_CLAMP, Math.min(EVAL_CLAMP, value));
+}
 
 export type EndgameEvalBucket = {
   blunders: number;
+  mistakes: number;
+  inaccuracies: number;
+  tactics_made: number;
+  missed_opportunity_chances: number;
+  missed_opportunities: number;
   piece_trades: number;
   beneficial_trades: number;
   winning_trades: number;
@@ -47,7 +71,10 @@ export type EvalBucketExtras = {
 
 export const ENDGAME_NON_KING_MAX = 10;
 export const EARLY_MOVE_MAX = 12;
+export const EARLY_FLANK_FULLMOVE_MAX = 12;
+export const EG_TRADE_WINDOW_PLIES = 3;
 export const KING_TRADE_DIST = 2;
+export const SACRIFICE_MIN_OFFER = 3;
 
 export const STYLE_PIECE_VALUE: Record<PieceSymbol, number> = {
   p: 1,
@@ -95,6 +122,7 @@ export type StyleGameRow = {
   critical_move_times: number[];
   avg_critical_time_s: number | null;
   critical_positions: number;
+  endgame_advantage_start_ply: number | null;
   had_disadvantage: boolean;
   recovered_from_disadvantage: boolean;
   blunders: number;
@@ -173,7 +201,17 @@ export function chebyshev(a: Square, b: Square): number {
 }
 
 export function isFlankFile(fileIdx: number): boolean {
-  return fileIdx <= 2 || fileIdx >= 5;
+  return fileIdx <= 1 || fileIdx >= 6;
+}
+
+export function isEarlyFlankPush(
+  color: Color,
+  toFile: number,
+  toRank: number
+): boolean {
+  if (!isFlankFile(toFile)) return false;
+  if (color === "w") return toRank >= 3;
+  return toRank <= 4;
 }
 
 export function swapColor(color: Color): Color {
@@ -252,23 +290,43 @@ export function threatensHigherValue(board: Chess, move: Move, color: Color): bo
   });
   if (!applied) return false;
   try {
-    const attacks = board.moves({
-      square: move.to,
-      verbose: true,
-    }) as Move[];
-    for (const attack of attacks) {
-      if (!attack.isCapture() || !attack.captured) continue;
-      if (attack.captured === "k" || attack.captured === "p") continue;
-      const vVal = PIECE_VALUE[attack.captured] ?? 0;
-      const atk = board.get(attack.from);
-      if (!atk || atk.color !== color || atk.type === "k") continue;
-      const aVal = PIECE_VALUE[atk.type] ?? 0;
-      if (aVal < vVal) return true;
-    }
-    return false;
+    return threatensHigherValueAfter(board, move, color);
   } finally {
     board.undo();
   }
+}
+
+export function threatensHigherValueAfter(
+  boardAfter: Chess,
+  move: Move,
+  color: Color
+): boolean {
+  if (move.piece === "k") return false;
+  const aVal = PIECE_VALUE[move.piece] ?? 0;
+  if (
+    move.isCapture() &&
+    move.captured &&
+    move.captured !== "k" &&
+    move.captured !== "p" &&
+    aVal < (PIECE_VALUE[move.captured] ?? 0)
+  ) {
+    return true;
+  }
+  const opp = swapColor(color);
+  for (const pt of MINOR_MAJOR) {
+    const vVal = PIECE_VALUE[pt] ?? 0;
+    if (aVal >= vVal) continue;
+    for (const sq of boardAfter.findPiece({ type: pt, color: opp })) {
+      if (boardAfter.attackers(sq, color).includes(move.to)) return true;
+    }
+  }
+  return false;
+}
+
+export function isUnderEnemyAttack(board: Chess, sq: Square, color: Color): boolean {
+  const piece = board.get(sq);
+  if (!piece || piece.color !== color || piece.type === "k") return false;
+  return board.attackers(sq, swapColor(color)).length > 0;
 }
 
 export function isUnderLesserAttack(board: Chess, sq: Square, color: Color): boolean {
@@ -286,11 +344,41 @@ export function isUnderLesserAttack(board: Chess, sq: Square, color: Color): boo
 }
 
 export function canRecapture(board: Chess, captureToSq: Square): boolean {
-  const moves = board.moves({ verbose: true }) as Move[];
-  for (const m of moves) {
-    if (m.to === captureToSq && m.isCapture()) return true;
+  return board.attackers(captureToSq, board.turn()).length > 0;
+}
+
+export function sacrificeOfferAfterMove(
+  boardAfter: Chess,
+  move: Move,
+  color: Color
+): number {
+  const opp = swapColor(color);
+  const moverVal = PIECE_VALUE[move.piece] ?? 0;
+  const capturedVal = move.captured ? PIECE_VALUE[move.captured] ?? 0 : 0;
+  const destAttacked = boardAfter.isAttacked(move.to, opp);
+  const destDefended = boardAfter.isAttacked(move.to, color);
+  if (move.isCapture() && destAttacked) {
+    const tradeLoss = moverVal - capturedVal;
+    return tradeLoss >= SACRIFICE_MIN_OFFER ? tradeLoss : 0;
   }
-  return false;
+  if (
+    destAttacked &&
+    !destDefended &&
+    moverVal >= SACRIFICE_MIN_OFFER
+  ) {
+    return Math.max(0, moverVal - capturedVal);
+  }
+  return 0;
+}
+
+function isImmediateRecapture(
+  move: Move,
+  pendingSq: Square | null,
+  isCapture: boolean
+): boolean {
+  return (
+    pendingSq != null && isCapture && move.to === pendingSq
+  );
 }
 
 export function nextCp(
@@ -356,6 +444,9 @@ export type StyleScanSession = {
   accuracySamples: number[];
   mgAccuracySamples: number[];
   mgBlunders: number;
+  mgMistakes: number;
+  mgInaccuracies: number;
+  mgTacticsMade: number;
   mgPendingOppBlunder: boolean;
   mgPendingOppTactic: boolean;
   mgPendingOppWp: number | null;
@@ -368,6 +459,13 @@ export type StyleScanSession = {
   mgAllowedFound: number;
   endgameStartPly: number | null;
   egBlunders: number;
+  egMistakes: number;
+  egInaccuracies: number;
+  egTacticsMade: number;
+  egMissedOppChances: number;
+  egMissedOpps: number;
+  egPendingOppBlunder: boolean;
+  egPendingOppWp: number | null;
   egPieceTrades: number;
   egBeneficialTrades: number;
   egWinningTrades: number;
@@ -375,8 +473,22 @@ export type StyleScanSession = {
   egTradePending: number | null;
   egPendingUserStart: boolean;
   egPendingWpBefore: number;
+  egPendingCpBefore: number;
+  egPendingUserNet: number;
   egPendingUserPieceVal: number;
   egPendingCapturedVal: number;
+  egPendingPieceSeen: boolean;
+  pendingSacrificeSq: Square | null;
+  pendingSacrificeOk: boolean;
+  pendingSacrificeAccepted: boolean;
+  pendingSacrificeOfferVal: number;
+  lastCapture: {
+    ply: number;
+    color: Color;
+    piece: PieceSymbol;
+    captured: PieceSymbol;
+    to: Square;
+  } | null;
   mateEpisodes: number;
   mateConverted: number;
   inMateEpisode: boolean;
@@ -384,6 +496,9 @@ export type StyleScanSession = {
   mateMoveTimes: number[];
   wpBeforeLastMove: number | null;
   userTimes: number[];
+  userJustCaptured: boolean;
+  endgameAdvantageStartPly: number | null;
+  criticalPositions: number;
   clock: ReturnType<typeof extractMoveTimesFromPgn>;
   alive: boolean;
 };
@@ -403,7 +518,7 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     board: new Chess(),
     userIsWhite,
     userColor: userIsWhite ? "w" : "b",
-    result: game.result || "",
+    result: normalizeGameResult(game.result, userIsWhite),
     evalsWhite: [],
     userWps: [],
     territoryOwn: 0,
@@ -433,6 +548,9 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     accuracySamples: [],
     mgAccuracySamples: [],
     mgBlunders: 0,
+    mgMistakes: 0,
+    mgInaccuracies: 0,
+    mgTacticsMade: 0,
     mgPendingOppBlunder: false,
     mgPendingOppTactic: false,
     mgPendingOppWp: null,
@@ -445,6 +563,13 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     mgAllowedFound: 0,
     endgameStartPly: null,
     egBlunders: 0,
+    egMistakes: 0,
+    egInaccuracies: 0,
+    egTacticsMade: 0,
+    egMissedOppChances: 0,
+    egMissedOpps: 0,
+    egPendingOppBlunder: false,
+    egPendingOppWp: null,
     egPieceTrades: 0,
     egBeneficialTrades: 0,
     egWinningTrades: 0,
@@ -452,8 +577,16 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     egTradePending: null,
     egPendingUserStart: false,
     egPendingWpBefore: 0,
+    egPendingCpBefore: 0,
+    egPendingUserNet: 0,
     egPendingUserPieceVal: 0,
     egPendingCapturedVal: 0,
+    egPendingPieceSeen: false,
+    pendingSacrificeSq: null,
+    pendingSacrificeOk: false,
+    pendingSacrificeAccepted: false,
+    pendingSacrificeOfferVal: 0,
+    lastCapture: null,
     mateEpisodes: 0,
     mateConverted: 0,
     inMateEpisode: false,
@@ -461,14 +594,18 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     mateMoveTimes: [],
     wpBeforeLastMove: null,
     userTimes: clock?.user_times || [],
+    userJustCaptured: false,
+    endgameAdvantageStartPly: null,
+    criticalPositions: 0,
     clock,
     alive: true,
   };
 }
 
 export function styleScanConsumeRoot(session: StyleScanSession, cpWhite: number): void {
-  session.evalsWhite.push(cpWhite);
-  session.userWps.push(userWinProbability(cpWhite, session.userIsWhite));
+  const cp = clampCp(cpWhite);
+  session.evalsWhite.push(cp);
+  session.userWps.push(userWinProbability(cp, session.userIsWhite));
 }
 
 export function styleScanProcessPly(
@@ -482,6 +619,25 @@ export function styleScanProcessPly(
   const board = session.board;
   const userColor = session.userColor;
   const userIsWhite = session.userIsWhite;
+  const isUser = board.turn() === userColor;
+  const balBefore = pieceMaterialBalance(board, userColor);
+  const enemyKing = kingSquare(board, swapColor(userColor));
+  const userKing = kingSquare(board, userColor);
+  const beforeCp = evalBefore != null ? clampCp(evalBefore) : null;
+  const wpBeforeMove =
+    beforeCp != null ? userWinProbability(beforeCp, userIsWhite) : null;
+  session.wpBeforeLastMove = wpBeforeMove;
+
+  let hadTacticBefore = false;
+  let pendingCanRecapture = false;
+  const pendingRecaptureSq = session.pendingRecaptureSq;
+  if (isUser) {
+    hadTacticBefore = hasMaterialWinTactic(board, userColor);
+    if (pendingRecaptureSq != null) {
+      pendingCanRecapture = canRecapture(board, pendingRecaptureSq);
+    }
+  }
+
   let move: Move | null = null;
   try {
     move = board.move(san) as Move;
@@ -492,10 +648,8 @@ export function styleScanProcessPly(
     session.alive = false;
     return false;
   }
-  board.undo();
 
   const fullMove = Math.floor(plyIdx / 2) + 1;
-  const isUser = board.turn() === userColor;
   const fromSq = move.from;
   const toSq = move.to;
   const fromRank = squareRank(fromSq);
@@ -504,22 +658,38 @@ export function styleScanProcessPly(
   const isCapture = move.isCapture();
   const captured = move.captured;
   const movingPiece = move.piece;
-  const balBefore = pieceMaterialBalance(board, userColor);
-  const enemyKing = kingSquare(board, swapColor(userColor));
-  const userKing = kingSquare(board, userColor);
   const isCastle = move.isKingsideCastle() || move.isQueensideCastle();
   if (isUser && isCastle && session.castleFullmove == null) {
     session.castleFullmove = fullMove;
     session.phaseEnd = openingPhaseEndFullmove(session.castleFullmove);
   }
   const inOpening = fullMove <= session.phaseEnd;
-  const wpBeforeMove =
-    evalBefore != null ? userWinProbability(evalBefore, userIsWhite) : null;
-  session.wpBeforeLastMove = wpBeforeMove;
+  let userBalDelta = 0;
 
   if (isUser) {
     const userMoveIdx = session.userMoves;
     session.userMoves += 1;
+
+    if (
+      session.pendingSacrificeAccepted &&
+      session.pendingSacrificeSq != null
+    ) {
+      const recovered =
+        isCapture &&
+        captured != null &&
+        (PIECE_VALUE[captured] || 0) >=
+          Math.max(3, session.pendingSacrificeOfferVal - 1);
+      if (
+        !recovered &&
+        !isImmediateRecapture(move, session.pendingSacrificeSq, isCapture)
+      ) {
+        session.sacrificeMoves += 1;
+      }
+      session.pendingSacrificeSq = null;
+      session.pendingSacrificeOk = false;
+      session.pendingSacrificeAccepted = false;
+      session.pendingSacrificeOfferVal = 0;
+    }
 
     if (session.userWps.length) {
       const wpBeforeStyle = session.userWps[session.userWps.length - 1];
@@ -531,15 +701,10 @@ export function styleScanProcessPly(
       }
     }
 
-    let escaping = false;
-    if (isUnderLesserAttack(board, fromSq, userColor)) {
-      escaping = true;
-    }
-
-    if (session.pendingRecaptureSq != null) {
-      if (canRecapture(board, session.pendingRecaptureSq)) {
+    if (pendingRecaptureSq != null) {
+      if (pendingCanRecapture) {
         session.recaptureChances += 1;
-        if (!(isCapture && toSq === session.pendingRecaptureSq)) {
+        if (!(isCapture && toSq === pendingRecaptureSq)) {
           session.declinedRecaptures += 1;
         }
       }
@@ -565,71 +730,84 @@ export function styleScanProcessPly(
 
     if (
       movingPiece === "p" &&
-      fullMove <= EARLY_MOVE_MAX &&
-      isFlankFile(toFile) &&
-      inOpp
+      fullMove <= EARLY_FLANK_FULLMOVE_MAX &&
+      isEarlyFlankPush(userColor, toFile, toRank)
     ) {
       session.earlyFlankPushes += 1;
     }
 
-    if (threatensHigherValue(board, move, userColor)) {
+    if (threatensHigherValueAfter(board, move, userColor)) {
       session.higherThreats += 1;
     }
 
-    board.move(san);
+    session.userJustCaptured = isCapture;
 
-    if (escaping && !isUnderLesserAttack(board, toSq, userColor)) {
-      session.threatEscapes += 1;
+    if (movingPiece !== "p" && movingPiece !== "k") {
+      const opp = swapColor(userColor);
+      const fromThreatened = board.isAttacked(fromSq, opp);
+      if (
+        fromThreatened &&
+        !isUnderEnemyAttack(board, toSq, userColor) &&
+        !isUnderLesserAttack(board, toSq, userColor)
+      ) {
+        session.threatEscapes += 1;
+      }
     }
 
-    const cp = evalAfter;
+    const cpRaw = evalAfter;
+    const cp = cpRaw != null ? clampCp(cpRaw) : null;
     if (cp != null) {
       session.evalsWhite.push(cp);
       session.userWps.push(userWinProbability(cp, userIsWhite));
     }
 
-    if (evalBefore != null && cp != null) {
+    if (beforeCp != null && cp != null) {
       const balAfter = pieceMaterialBalance(board, userColor);
-      const balDelta = balAfter - balBefore;
-      const hang = maxUndefendedHangingPieces(board, userColor);
-      const evalBeforeUser = userIsWhite ? evalBefore : -evalBefore;
+      userBalDelta = balAfter - balBefore;
+      const offered = sacrificeOfferAfterMove(board, move, userColor);
+      const evalBeforeUser = userIsWhite ? beforeCp : -beforeCp;
       const evalAfterUser = userIsWhite ? cp : -cp;
       const evalDelta = evalAfterUser - evalBeforeUser;
-      const offered = Math.max(-balDelta, hang);
-      if (offered >= 3 && evalDelta >= -(offered * 100) + 50) {
-        session.sacrificeMoves += 1;
-      } else if (offered >= 3 && evalAfterUser >= -75) {
-        session.sacrificeMoves += 1;
-      }
-
-      const wpBefore = userWinProbability(evalBefore, userIsWhite);
-      const wpAfter = userWinProbability(cp, userIsWhite);
-      if (wpBefore - wpAfter >= WP_BLUNDER_DROP) session.blunders += 1;
-
+      const wpBefore = userWinProbability(beforeCp, userIsWhite);
+      const wpAfterLocal = userWinProbability(cp, userIsWhite);
+      const wpDrop = wpBefore - wpAfterLocal;
       if (
-        Math.abs(wpAfter - wpBefore) >= WP_CRITICAL_DELTA &&
-        userMoveIdx < session.userTimes.length
+        offered >= SACRIFICE_MIN_OFFER &&
+        evalDelta >= -50 &&
+        wpAfterLocal >= wpBefore - 0.03 &&
+        wpDrop < WP_INACCURACY_DROP
       ) {
-        session.criticalTimes.push(session.userTimes[userMoveIdx]);
+        session.pendingSacrificeSq = toSq;
+        session.pendingSacrificeOk = true;
+        session.pendingSacrificeAccepted = false;
+        session.pendingSacrificeOfferVal = offered;
       }
 
-      if (wpAfter <= WP_DISADVANTAGE) {
+      const dropKind = classifyEvalDrop(wpBefore, wpAfterLocal);
+      if (!inOpening && dropKind === "blunder") session.blunders += 1;
+
+      const cpSwing = Math.abs(evalAfterUser - evalBeforeUser);
+      if (
+        Math.abs(wpAfterLocal - wpBefore) >= WP_CRITICAL_DELTA &&
+        cpSwing >= WP_CRITICAL_CP
+      ) {
+        session.criticalPositions += 1;
+        if (userMoveIdx < session.userTimes.length) {
+          session.criticalTimes.push(session.userTimes[userMoveIdx]);
+        }
+      }
+
+      if (wpAfterLocal <= WP_DISADVANTAGE) {
         session.hadDisadvantage = true;
       }
 
       if (inOpening) {
         session.accuracySamples.push(
-          moveAccuracyPct(wpBefore * 100, wpAfter * 100)
+          moveAccuracyPct(wpBefore * 100, wpAfterLocal * 100)
         );
       }
     }
 
-    if (cp != null && nonKingCount(board) <= ENDGAME_NON_KING_MAX) {
-      if (userWinProbability(cp, userIsWhite) >= WP_ENDGAME_ADVANTAGE) {
-        session.hadEndgameAdvantage = true;
-      }
-    }
-
     if (isCapture && captured && MINOR_MAJOR.includes(captured)) {
       if (fullMove <= EARLY_MOVE_MAX) {
         if (
@@ -637,21 +815,40 @@ export function styleScanProcessPly(
           plyIdx - session.pieceTradePending <= 2
         ) {
           session.earlyTrades += 1;
+          if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
+            session.tradesNearEnemyKing += 1;
+          }
+          if (userKing != null && chebyshev(toSq, userKing) <= KING_TRADE_DIST) {
+            session.tradesNearUserKing += 1;
+          }
           session.pieceTradePending = null;
         } else {
           session.pieceTradePending = plyIdx;
         }
-      }
-      if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
-        session.tradesNearEnemyKing += 1;
-      }
-      if (userKing != null && chebyshev(toSq, userKing) <= KING_TRADE_DIST) {
-        session.tradesNearUserKing += 1;
       }
     }
   } else {
-    if (isCapture) session.pendingRecaptureSq = toSq;
-    else session.pendingRecaptureSq = null;
+    if (
+      session.pendingSacrificeOk &&
+      session.pendingSacrificeSq != null &&
+      !session.pendingSacrificeAccepted
+    ) {
+      if (isImmediateRecapture(move, session.pendingSacrificeSq, isCapture)) {
+        session.pendingSacrificeAccepted = true;
+      } else {
+        session.pendingSacrificeSq = null;
+        session.pendingSacrificeOk = false;
+        session.pendingSacrificeAccepted = false;
+        session.pendingSacrificeOfferVal = 0;
+      }
+    }
+
+    if (isCapture && !session.userJustCaptured) {
+      session.pendingRecaptureSq = toSq;
+    } else {
+      session.pendingRecaptureSq = null;
+    }
+    session.userJustCaptured = false;
 
     if (isCapture && captured && MINOR_MAJOR.includes(captured)) {
       if (fullMove <= EARLY_MOVE_MAX) {
@@ -660,22 +857,20 @@ export function styleScanProcessPly(
           plyIdx - session.pieceTradePending <= 2
         ) {
           session.earlyTrades += 1;
+          if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
+            session.tradesNearEnemyKing += 1;
+          }
+          if (userKing != null && chebyshev(toSq, userKing) <= KING_TRADE_DIST) {
+            session.tradesNearUserKing += 1;
+          }
           session.pieceTradePending = null;
         } else {
           session.pieceTradePending = plyIdx;
         }
       }
-      if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
-        session.tradesNearEnemyKing += 1;
-      }
-      if (userKing != null && chebyshev(toSq, userKing) <= KING_TRADE_DIST) {
-        session.tradesNearUserKing += 1;
-      }
     }
 
-    board.move(san);
-
-    const cp = evalAfter;
+    const cp = evalAfter != null ? clampCp(evalAfter) : null;
     if (cp != null) {
       session.evalsWhite.push(cp);
       const wp = userWinProbability(cp, userIsWhite);
@@ -684,15 +879,9 @@ export function styleScanProcessPly(
         session.hadDisadvantage = true;
       }
     }
-
-    if (cp != null && nonKingCount(board) <= ENDGAME_NON_KING_MAX) {
-      if (userWinProbability(cp, userIsWhite) >= WP_ENDGAME_ADVANTAGE) {
-        session.hadEndgameAdvantage = true;
-      }
-    }
   }
 
-  const cpAfter = evalAfter;
+  const cpAfter = evalAfter != null ? clampCp(evalAfter) : null;
   const wpAfter =
     cpAfter != null ? userWinProbability(cpAfter, userIsWhite) : null;
 
@@ -705,6 +894,23 @@ export function styleScanProcessPly(
     if (np <= ENDGAME_NON_PAWN_MAX) session.endgameStartPly = plyIdx;
   }
 
+  if (
+    !session.hadEndgameAdvantage &&
+    session.endgameStartPly != null &&
+    plyIdx >= session.endgameStartPly &&
+    cpAfter != null
+  ) {
+    const userCp = userIsWhite ? cpAfter : -cpAfter;
+    const wp = userWinProbability(cpAfter, userIsWhite);
+    if (
+      wp >= WP_ENDGAME_ADVANTAGE_STICKY ||
+      userCp >= CP_ENDGAME_ADVANTAGE_STICKY
+    ) {
+      session.hadEndgameAdvantage = true;
+      session.endgameAdvantageStartPly = plyIdx;
+    }
+  }
+
   const inMg = inMiddlegamePly(
     plyIdx,
     session.phaseEnd,
@@ -715,7 +921,13 @@ export function styleScanProcessPly(
       session.mgAccuracySamples.push(
         moveAccuracyPct(wpBeforeMove * 100, wpAfter * 100)
       );
-      if (wpBeforeMove - wpAfter >= WP_BLUNDER_DROP) session.mgBlunders += 1;
+      const kind = classifyEvalDrop(wpBeforeMove, wpAfter);
+      if (kind === "blunder") session.mgBlunders += 1;
+      else if (kind === "mistake") session.mgMistakes += 1;
+      else if (kind === "inaccuracy") session.mgInaccuracies += 1;
+      if (hadTacticBefore && isCapture && userBalDelta >= 2) {
+        session.mgTacticsMade += 1;
+      }
     }
 
     if (isUser && session.mgPendingOppBlunder) {
@@ -724,9 +936,9 @@ export function styleScanProcessPly(
       const missed =
         wpBeforeMove != null &&
         wpAfter != null &&
-        (wpBeforeMove - wpAfter >= WP_BLUNDER_DROP ||
+        (isMistakeOrWorse(wpBeforeMove, wpAfter) ||
           (session.mgPendingOppWp != null &&
-            session.mgPendingOppWp - wpAfter >= WP_BLUNDER_DROP));
+            wpDropPp(session.mgPendingOppWp, wpAfter) >= 10));
       if (missed) {
         session.mgMissedOpps += 1;
         if (session.mgPendingOppTactic) session.mgMissedTactics += 1;
@@ -740,14 +952,14 @@ export function styleScanProcessPly(
       const found =
         (wpBeforeMove != null &&
           wpAfter != null &&
-          wpBeforeMove - wpAfter >= WP_BLUNDER_DROP * 0.5) ||
+          wpDropPp(wpBeforeMove, wpAfter) >= 7.5) ||
         isCapture;
       if (found) session.mgAllowedFound += 1;
       session.mgPendingAllowed = false;
     }
 
     if (!isUser && wpBeforeMove != null && wpAfter != null) {
-      if (wpAfter - wpBeforeMove >= WP_BLUNDER_DROP) {
+      if (isBlunderSwingUp(wpBeforeMove, wpAfter)) {
         session.mgPendingOppBlunder = true;
         session.mgPendingOppWp = wpAfter;
         session.mgPendingOppTactic = hasMaterialWinTactic(board, userColor);
@@ -756,7 +968,7 @@ export function styleScanProcessPly(
 
     if (isUser && wpBeforeMove != null && wpAfter != null) {
       if (
-        wpBeforeMove - wpAfter >= WP_BLUNDER_DROP &&
+        classifyEvalDrop(wpBeforeMove, wpAfter) === "blunder" &&
         hasMaterialWinTactic(board, swapColor(userColor))
       ) {
         session.mgAllowedChances += 1;
@@ -774,46 +986,129 @@ export function styleScanProcessPly(
 
   if (session.endgameStartPly != null && plyIdx >= session.endgameStartPly) {
     if (isUser && wpBeforeMove != null && wpAfter != null) {
-      if (wpBeforeMove - wpAfter >= WP_BLUNDER_DROP) session.egBlunders += 1;
+      const kind = classifyEvalDrop(wpBeforeMove, wpAfter);
+      if (kind === "blunder") session.egBlunders += 1;
+      else if (kind === "mistake") session.egMistakes += 1;
+      else if (kind === "inaccuracy") session.egInaccuracies += 1;
+      if (hadTacticBefore && isCapture && userBalDelta >= 2) {
+        session.egTacticsMade += 1;
+      }
     }
-    if (
-      isCapture &&
-      captured &&
-      ENDGAME_MINOR_MAJOR.includes(captured) &&
-      ENDGAME_MINOR_MAJOR.includes(movingPiece)
-    ) {
+
+    if (isUser && session.egPendingOppBlunder) {
+      session.egMissedOppChances += 1;
+      const missed =
+        wpBeforeMove != null &&
+        wpAfter != null &&
+        (isMistakeOrWorse(wpBeforeMove, wpAfter) ||
+          (session.egPendingOppWp != null &&
+            wpDropPp(session.egPendingOppWp, wpAfter) >= 10));
+      if (missed) session.egMissedOpps += 1;
+      session.egPendingOppBlunder = false;
+      session.egPendingOppWp = null;
+    }
+
+    if (!isUser && wpBeforeMove != null && wpAfter != null) {
+      if (isBlunderSwingUp(wpBeforeMove, wpAfter)) {
+        session.egPendingOppBlunder = true;
+        session.egPendingOppWp = wpAfter;
+      }
+    }
+
+    if (isCapture && captured) {
+      const capVal = ENDGAME_PIECE_VALUE[captured] || 0;
+      const moverVal = ENDGAME_PIECE_VALUE[movingPiece] || 0;
+      const pieceCap = ENDGAME_MINOR_MAJOR.includes(captured);
+      const userGain = isUser ? capVal : -capVal;
+      const last = session.lastCapture;
+
       if (
         session.egTradePending != null &&
-        plyIdx - session.egTradePending <= 2
+        plyIdx - session.egTradePending <= EG_TRADE_WINDOW_PLIES
       ) {
-        session.egPieceTrades += 1;
-        const tradeWpBefore = session.egPendingWpBefore;
-        const tradeWpAfter = wpAfter ?? tradeWpBefore;
-        if (tradeWpAfter > tradeWpBefore) session.egBeneficialTrades += 1;
-        if (tradeWpBefore >= WP_ENDGAME_ADVANTAGE) {
-          session.egWinningTrades += 1;
-          const userGaveMore = session.egPendingUserStart
-            ? session.egPendingUserPieceVal > session.egPendingCapturedVal
-            : session.egPendingCapturedVal > session.egPendingUserPieceVal;
-          if (
-            userGaveMore &&
-            tradeWpBefore - tradeWpAfter < WP_BLUNDER_DROP
-          ) {
-            session.egSimplificationTrades += 1;
+        session.egPendingUserNet += userGain;
+        if (pieceCap) {
+          const completerIsPiece = ENDGAME_MINOR_MAJOR.includes(movingPiece);
+          const majorInvolved =
+            capVal >= 5 ||
+            session.egPendingCapturedVal >= 5 ||
+            session.egPendingUserPieceVal >= 5;
+          if (completerIsPiece || majorInvolved) {
+            session.egPieceTrades += 1;
+            const tradeWpBefore = session.egPendingWpBefore;
+            const tradeWpAfter = wpAfter ?? tradeWpBefore;
+            const tradeCpBefore = session.egPendingCpBefore;
+            const tradeCpAfter =
+              cpAfter != null
+                ? userIsWhite
+                  ? cpAfter
+                  : -cpAfter
+                : tradeCpBefore;
+            if (
+              tradeWpAfter > tradeWpBefore ||
+              tradeCpAfter > tradeCpBefore
+            ) {
+              session.egBeneficialTrades += 1;
+            }
+            if (session.egPendingUserNet > 0) {
+              session.egWinningTrades += 1;
+            }
+            if (tradeWpBefore >= WP_ENDGAME_ADVANTAGE) {
+              const userGaveMore = session.egPendingUserStart
+                ? session.egPendingUserPieceVal >
+                  session.egPendingCapturedVal
+                : session.egPendingCapturedVal >
+                  session.egPendingUserPieceVal;
+              if (
+                userGaveMore &&
+                tradeWpBefore - tradeWpAfter < WP_BLUNDER_DROP
+              ) {
+                session.egSimplificationTrades += 1;
+              }
+            }
+          }
+          session.egTradePending = null;
+        }
+      } else if (pieceCap) {
+        let net = userGain;
+        let userPieceVal = isUser ? moverVal : capVal;
+        let capturedVal = isUser ? capVal : moverVal;
+        let userStart = isUser;
+        if (last && last.ply === plyIdx - 1 && last.to === toSq) {
+          const lastWasUser = last.color === userColor;
+          const lastCapVal = ENDGAME_PIECE_VALUE[last.captured] || 0;
+          if (lastWasUser && !isUser) {
+            net = lastCapVal - capVal;
+            userStart = true;
+            userPieceVal = ENDGAME_PIECE_VALUE[last.piece] || 0;
+            capturedVal = lastCapVal;
+          } else if (!lastWasUser && isUser) {
+            net = capVal - lastCapVal;
+            userStart = false;
+            userPieceVal = lastCapVal;
+            capturedVal = capVal;
           }
         }
-        session.egTradePending = null;
-      } else {
         session.egTradePending = plyIdx;
-        session.egPendingUserStart = isUser;
+        session.egPendingUserStart = userStart;
         session.egPendingWpBefore = wpBeforeMove ?? 0;
-        session.egPendingUserPieceVal = ENDGAME_PIECE_VALUE[movingPiece] || 0;
-        session.egPendingCapturedVal = ENDGAME_PIECE_VALUE[captured] || 0;
+        session.egPendingCpBefore =
+          beforeCp != null
+            ? userIsWhite
+              ? beforeCp
+              : -beforeCp
+            : 0;
+        session.egPendingUserNet = net;
+        session.egPendingUserPieceVal = userPieceVal;
+        session.egPendingCapturedVal = capturedVal;
+        session.egPendingPieceSeen = true;
       }
     }
     if (cpAfter != null) {
-      const userCp = userIsWhite ? cpAfter : -cpAfter;
-      const mateNow = userCp >= MATE_CP_THRESHOLD;
+      const rawAfter = evalAfter ?? cpAfter;
+      const userCpRaw = userIsWhite ? rawAfter : -rawAfter;
+      const mateNow =
+        Math.abs(rawAfter) >= 9000 || userCpRaw >= MATE_CP_THRESHOLD;
       if (mateNow && !session.inMateEpisode) {
         session.inMateEpisode = true;
         session.mateEpisodeClean = true;
@@ -830,6 +1125,18 @@ export function styleScanProcessPly(
       }
     }
   }
+
+  if (isCapture && captured) {
+    session.lastCapture = {
+      ply: plyIdx,
+      color: isUser ? userColor : swapColor(userColor),
+      piece: movingPiece,
+      captured,
+      to: toSq,
+    };
+  } else {
+    session.lastCapture = null;
+  }
   return true;
 }
 
@@ -842,6 +1149,18 @@ export function styleScanFinalize(
   const result = session.result;
   const clock = session.clock;
   const userWps = session.userWps;
+
+  if (session.pendingSacrificeAccepted) {
+    session.sacrificeMoves += 1;
+    session.pendingSacrificeSq = null;
+    session.pendingSacrificeOk = false;
+    session.pendingSacrificeAccepted = false;
+    session.pendingSacrificeOfferVal = 0;
+  } else if (session.pendingSacrificeOk) {
+    session.pendingSacrificeSq = null;
+    session.pendingSacrificeOk = false;
+    session.pendingSacrificeOfferVal = 0;
+  }
 
   if (session.inMateEpisode && session.mateEpisodeClean && board.isCheckmate()) {
     const winnerIsWhite = board.turn() === "b";
@@ -871,6 +1190,8 @@ export function styleScanFinalize(
     const reachedMg =
       session.mgAccuracySamples.length > 0 ||
       session.mgBlunders > 0 ||
+      session.mgMistakes > 0 ||
+      session.mgInaccuracies > 0 ||
       session.mgMissedOppChances > 0 ||
       session.mgAllowedChances > 0 ||
       (session.endgameStartPly == null
@@ -887,6 +1208,9 @@ export function styleScanFinalize(
             : null,
           accuracy_moves: session.mgAccuracySamples.length,
           blunders: session.mgBlunders,
+          mistakes: session.mgMistakes,
+          inaccuracies: session.mgInaccuracies,
+          tactics_made: session.mgTacticsMade,
           missed_opportunity_chances: session.mgMissedOppChances,
           missed_opportunities: session.mgMissedOpps,
           missed_tactic_chances: session.mgMissedTacticChances,
@@ -900,6 +1224,11 @@ export function styleScanFinalize(
         ? null
         : {
             blunders: session.egBlunders,
+            mistakes: session.egMistakes,
+            inaccuracies: session.egInaccuracies,
+            tactics_made: session.egTacticsMade,
+            missed_opportunity_chances: session.egMissedOppChances,
+            missed_opportunities: session.egMissedOpps,
             piece_trades: session.egPieceTrades,
             beneficial_trades: session.egBeneficialTrades,
             winning_trades: session.egWinningTrades,
@@ -967,6 +1296,7 @@ export function styleScanFinalize(
     had_early_flank: session.earlyFlankPushes > 0,
     had_endgame_advantage: session.hadEndgameAdvantage,
     converted_endgame: session.hadEndgameAdvantage && result === "Win",
+    endgame_advantage_start_ply: session.endgameAdvantageStartPly,
     territory_own: session.territoryOwn,
     territory_opp: session.territoryOpp,
     territory_opp_pct: terrTotal
@@ -996,7 +1326,7 @@ export function styleScanFinalize(
             10
         ) / 10
       : null,
-    critical_positions: session.criticalTimes.length,
+    critical_positions: session.criticalPositions,
     had_disadvantage: session.hadDisadvantage,
     recovered_from_disadvantage: recovered,
     blunders: session.blunders,
@@ -1094,8 +1424,12 @@ export function aggregateStyleMetrics(rows: StyleGameRow[]): StyleMetricsAggrega
     games_with_clock: times.length,
     initiative: {
       avg_eval_volatility_cp: mean(rows.map((r) => r.volatility_cp)),
-      sacrifice_rate_pct:
-        Math.round((rows.filter((r) => r.had_sacrifice).length / n) * 1000) / 10,
+      sacrifice_rate_pct: totalUserMoves
+        ? Math.round(
+            (rows.reduce((s, r) => s + r.sacrifice_moves, 0) / totalUserMoves) *
+              1000
+          ) / 10
+        : 0.0,
       avg_sacrifice_moves: mean(rows.map((r) => r.sacrifice_moves)),
       early_flank_rate_pct:
         Math.round((rows.filter((r) => r.had_early_flank).length / n) * 1000) / 10,

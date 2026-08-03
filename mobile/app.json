@@ -3,6 +3,7 @@
     "name": "Chess Wrapped",
     "slug": "chess-wrapped",
     "version": "1.0.0",
+    "scheme": "com.chesswrapped.app",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "userInterfaceStyle": "dark",
@@ -24,7 +25,9 @@
     },
     "plugins": [
       "@react-native-community/datetimepicker",
-      "expo-font"
+      "expo-font",
+      "expo-secure-store",
+      "expo-web-browser"
     ]
   }
 }

@@ -27,6 +27,8 @@ MIDDLEGAME_PGN_METRIC_KEYS = (
 MIDDLEGAME_EVAL_METRIC_KEYS = (
     "middlegame_accuracy_pct",
     "middlegame_blunder_avg",
+    "middlegame_mistake_avg",
+    "middlegame_inaccuracy_avg",
     "middlegame_missed_opportunity_pct",
     "middlegame_missed_tactic_pct",
     "middlegame_allowed_tactic_pct",
@@ -71,20 +73,37 @@ def king_zone_squares(king: chess.Square) -> list[chess.Square]:
     return out
 
 
+KING_ATTACKER_POWER_MAX = (
+    PIECE_POWER.get(chess.QUEEN, 9)
+    + PIECE_POWER.get(chess.ROOK, 5) * 2
+    + PIECE_POWER.get(chess.BISHOP, 3) * 2
+    + PIECE_POWER.get(chess.KNIGHT, 3) * 2
+)
+KING_ATTACKERS_SCORE_MAX = KING_ATTACKER_POWER_MAX * KING_ATTACKER_POWER_MAX
+
+
 def king_attackers_score(board: chess.Board, user_color: chess.Color) -> float:
     king_sqs = board.pieces(chess.KING, user_color)
     if not king_sqs:
         return 0.0
     king = next(iter(king_sqs))
     opp = not user_color
+    seen: set[int] = set()
     weight = 0
     for zone_sq in king_zone_squares(king):
         for atk in board.attackers(opp, zone_sq):
+            if atk in seen:
+                continue
+            seen.add(atk)
             piece = board.piece_at(atk)
             if piece is None or piece.piece_type == chess.KING:
                 continue
             weight += PIECE_POWER.get(piece.piece_type, 0)
-    return float(weight * weight)
+    raw = float(weight * weight)
+    return (
+        round(min(raw, KING_ATTACKERS_SCORE_MAX) / KING_ATTACKERS_SCORE_MAX * 1000)
+        / 10
+    )
 
 
 def _shield_squares(
@@ -161,7 +180,7 @@ def _file_openness(
             theirs += 1
     if mine == 0 and theirs == 0:
         return "open"
-    if mine == 0 and theirs > 0:
+    if mine == 0 or theirs == 0:
         return "semi"
     return "closed"
 
@@ -175,7 +194,7 @@ def _openness_score(kind: str) -> float:
 
 
 def open_file_proximity_pct(
-    board: chess.Board, user_color: chess.Color
+    board: chess.Board, user_color: chess.Color, *, castled: bool = False
 ) -> float:
     king_sqs = board.pieces(chess.KING, user_color)
     if not king_sqs:
@@ -189,7 +208,7 @@ def open_file_proximity_pct(
             if base > 0:
                 best = max(best, round(base * 0.5))
     home = 0 if user_color == chess.WHITE else 7
-    if chess.square_rank(king) == home:
+    if castled and chess.square_rank(king) == home:
         rook_file = 7 if kf >= 5 else 0 if kf <= 2 else None
         if rook_file is not None:
             base = _openness_score(
@@ -449,6 +468,8 @@ def empty_middlegame_row(result: str) -> dict:
         "middlegame_accuracy_pct": None,
         "middlegame_accuracy_moves": 0,
         "middlegame_blunders": 0,
+        "middlegame_mistakes": 0,
+        "middlegame_inaccuracies": 0,
         "middlegame_missed_opportunity_pct": None,
         "middlegame_missed_tactic_pct": None,
         "middlegame_allowed_tactic_pct": None,
@@ -482,6 +503,8 @@ def build_middlegame_row(
     had_backward: bool,
     accuracy_samples: list[float],
     blunders: int,
+    mistakes: int = 0,
+    inaccuracies: int = 0,
     missed_opp_chances: int,
     missed_opps: int,
     missed_tactic_chances: int,
@@ -496,6 +519,8 @@ def build_middlegame_row(
         "middlegame_accuracy_pct": _mean(accuracy_samples, 1),
         "middlegame_accuracy_moves": len(accuracy_samples),
         "middlegame_blunders": blunders,
+        "middlegame_mistakes": mistakes,
+        "middlegame_inaccuracies": inaccuracies,
         "middlegame_missed_opportunity_pct": (
             round((missed_opps / missed_opp_chances) * 100, 1)
             if missed_opp_chances
@@ -533,6 +558,8 @@ def aggregate_middlegame_metrics(rows: list[dict]) -> dict:
         "middlegame_accuracy_pct": None,
         "middlegame_accuracy_games": 0,
         "middlegame_blunder_avg": None,
+        "middlegame_mistake_avg": None,
+        "middlegame_inaccuracy_avg": None,
         "middlegame_missed_opportunity_pct": None,
         "middlegame_missed_tactic_pct": None,
         "middlegame_allowed_tactic_pct": None,
@@ -570,6 +597,12 @@ def aggregate_middlegame_metrics(rows: list[dict]) -> dict:
         "middlegame_accuracy_games": len(accuracy),
         "middlegame_blunder_avg": _mean(
             [float(r.get("middlegame_blunders") or 0) for r in mg], 2
+        ),
+        "middlegame_mistake_avg": _mean(
+            [float(r.get("middlegame_mistakes") or 0) for r in mg], 2
+        ),
+        "middlegame_inaccuracy_avg": _mean(
+            [float(r.get("middlegame_inaccuracies") or 0) for r in mg], 2
         ),
         "middlegame_missed_opportunity_pct": mean_key(
             "middlegame_missed_opportunity_pct"

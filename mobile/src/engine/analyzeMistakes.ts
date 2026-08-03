@@ -36,6 +36,8 @@ export type StudyGame = {
   moves_str?: string;
   time_control?: string;
   user_rating?: number;
+  opp_rating?: number;
+  move_count?: number;
 };
 
 export type AnalyzeProgress = {

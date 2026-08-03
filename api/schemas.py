@@ -65,4 +65,8 @@ class GamesResponse(BaseModel):
     platform: str
     timeframe: str
     count: int
+    total: int = 0
+    limit: Optional[int] = None
+    offset: int = 0
+    has_more: bool = False
     games: list[dict] = Field(default_factory=list)

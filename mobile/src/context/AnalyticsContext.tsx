@@ -12,14 +12,12 @@ import type { InsightsResponse, RecapResponse } from "../api/types";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import type { OpeningMixStats } from "../engine/openingMix";
 import type { StyleMetricsAggregate } from "../engine/styleMetrics";
+import { useAuth } from "./AuthContext";
 import { useFilters } from "./FilterContext";
 import { useScanLog } from "./ScanLogContext";
 import {
-  clearAnalyticsInflight,
-  ensureInsights,
   ensureOpeningMix,
-  ensureRecap,
-  ensureStudyGames,
+  ensureSession,
   ensureStyleMetrics,
   ensureVaultMetrics,
   remeshVaultFromBucket,
@@ -27,15 +25,36 @@ import {
   type MiddlegamePhasePayload,
   type OpeningPhasePayload,
 } from "../storage/analyticsLoaders";
-import { GLOBAL_MAX_GAMES } from "../engine/analysisConfig";
+import {
+  GLOBAL_FIRST_SCAN_MAX_GAMES,
+  GLOBAL_MAX_GAMES,
+} from "../engine/analysisConfig";
+import {
+  markHeuristicsComplete,
+  resetBackgroundWork,
+} from "../engine/backgroundWork";
 import { agentLog } from "../debug/agentLog";
 import { loadBaselineStore, type BaselineStore } from "../data/baselines";
 import { studyFiltersKey } from "../storage/studyCacheKeys";
+import { HEURISTICS_FIRST_WAVE_GAMES } from "../engine/analysisConfig";
 
 function sortRecentGames(games: StudyGame[]): StudyGame[] {
   return [...games].sort((a, b) =>
     String(b.created_at).localeCompare(String(a.created_at))
   );
+}
+
+function gameInDateRange(
+  createdAt: string,
+  dateFrom: string | null | undefined,
+  dateTo: string | null | undefined
+): boolean {
+  if (!dateFrom && !dateTo) return true;
+  const day = String(createdAt || "").slice(0, 10);
+  if (!day) return false;
+  if (dateFrom && day < dateFrom) return false;
+  if (dateTo && day > dateTo) return false;
+  return true;
 }
 
 type AnalyticsState = {
@@ -66,8 +85,9 @@ type AnalyticsState = {
 const AnalyticsContext = createContext<AnalyticsState | null>(null);
 
 export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
+  const auth = useAuth();
   const { queryFilters, refreshToken } = useFilters();
-  const { phase, gamesTotal: evalGamesTotal, setScanProgress } = useScanLog();
+  const { phase } = useScanLog();
   const scanReady = phase === "done" || phase === "error";
   const [games, setGames] = useState<StudyGame[]>([]);
   const [gamesLoading, setGamesLoading] = useState(true);
@@ -95,46 +115,16 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
   const recapSignalRef = useRef({ cancelled: false });
   const vaultSignalRef = useRef({ cancelled: false });
   const sessionKeyRef = useRef<string | null>(null);
+  const hydratedKeyRef = useRef<string | null>(null);
   const lastStyleRefreshKey = useRef<string | null>(null);
   const vaultRequestedRef = useRef(false);
   const vaultRunningRef = useRef(false);
   const vaultRunIdRef = useRef(0);
   const metricsRunIdRef = useRef(0);
-  const evalGamesTotalRef = useRef(evalGamesTotal);
-  evalGamesTotalRef.current = evalGamesTotal;
-
-  const refreshRecap = useCallback(
-    async (forceNetwork = false) => {
-      recapSignalRef.current.cancelled = true;
-      recapSignalRef.current = { cancelled: false };
-      const signal = recapSignalRef.current;
-      const key = studyFiltersKey(queryFilters);
-      const sessionChanged =
-        sessionKeyRef.current !== null && sessionKeyRef.current !== key;
-      sessionKeyRef.current = key;
-      setSessionKey(key);
-      if (forceNetwork || sessionChanged) {
-        setRecap(null);
-      }
-
-      try {
-        const [recapData, peerStore] = await Promise.all([
-          ensureRecap(queryFilters, forceNetwork),
-          loadBaselineStore(forceNetwork),
-        ]);
-        if (signal.cancelled) return;
-        setRecap(recapData);
-        setBaselines(peerStore);
-      } catch {
-        /* keep prior recap on soft failure */
-      }
-    },
-    [queryFilters]
-  );
 
   const refreshStyleFromBucket = useCallback(
     async (loadedGames: StudyGame[]) => {
-      const scoped = sortRecentGames(loadedGames);
+      const scoped = sortRecentGames(loadedGames).slice(0, GLOBAL_MAX_GAMES);
       const resolved = await ensureStyleMetrics(queryFilters, {
         games: scoped,
       });
@@ -223,6 +213,13 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
             setOpeningPhaseLoading(!openingDone);
             setMiddlegamePhaseLoading(!middlegameDone);
             setEndgamePhaseLoading(!endgameDone);
+            const waveTarget = Math.min(
+              HEURISTICS_FIRST_WAVE_GAMES,
+              partial.opening.totalGames || HEURISTICS_FIRST_WAVE_GAMES
+            );
+            if (partial.opening.analyzedCount >= waveTarget) {
+              markHeuristicsComplete();
+            }
             // #region agent log
             if (
               partial.opening.analyzedCount <= 3 ||
@@ -245,6 +242,7 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setMiddlegamePhaseLoading(false);
         setEndgamePhase(payload.endgame);
         setEndgamePhaseLoading(false);
+        markHeuristicsComplete();
         // #region agent log
         agentLog("C", "AnalyticsContext.tsx:heuristicsDone", "single-pass heuristics done", {
           opening: payload.opening.analyzedCount,
@@ -279,29 +277,64 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
     [refreshVaultMetrics]
   );
 
-  const refreshMetrics = useCallback(
-    async (forceNetwork = false) => {
+  const refreshAnalytics = useCallback(
+    async (_forceNetwork = false) => {
       const runId = ++metricsRunIdRef.current;
+      recapSignalRef.current.cancelled = true;
+      recapSignalRef.current = { cancelled: false };
+      const recapSignal = recapSignalRef.current;
+      const key = studyFiltersKey(queryFilters);
+      const prevKey = sessionKeyRef.current;
+      const sessionChanged = prevKey !== null && prevKey !== key;
+
+      if (hydratedKeyRef.current === key) {
+        return;
+      }
+
       // #region agent log
-      agentLog("E", "AnalyticsContext.tsx:refreshMetrics", "refreshMetrics start", {
-        forceNetwork,
+      agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "session refresh start", {
+        sessionChanged,
+        key,
       });
       // #endregion
-      const key = studyFiltersKey(queryFilters);
-      const sessionChanged =
-        sessionKeyRef.current !== null && sessionKeyRef.current !== key;
+
       sessionKeyRef.current = key;
       setSessionKey(key);
       setGamesLoading(true);
       setOpeningPhaseLoading(true);
       setMiddlegamePhaseLoading(true);
       setEndgamePhaseLoading(true);
-      if (forceNetwork) clearAnalyticsInflight();
       lastStyleRefreshKey.current = null;
-      if (forceNetwork || sessionChanged) {
+      if (sessionChanged) {
+        hydratedKeyRef.current = null;
+        resetBackgroundWork();
         vaultSignalRef.current.cancelled = true;
         vaultSignalRef.current = { cancelled: false };
-        setGames([]);
+        const sameIdentity =
+          prevKey != null &&
+          prevKey.split("|").slice(0, 4).join("|") ===
+            key.split("|").slice(0, 4).join("|");
+        const prevGames = gamesRef.current;
+        const filteredPrev =
+          sameIdentity &&
+          prevGames.length &&
+          (queryFilters.dateFrom || queryFilters.dateTo)
+            ? sortRecentGames(
+                prevGames.filter((game) =>
+                  gameInDateRange(
+                    String(game.created_at || ""),
+                    queryFilters.dateFrom,
+                    queryFilters.dateTo
+                  )
+                )
+              )
+            : [];
+        if (filteredPrev.length) {
+          gamesRef.current = filteredPrev;
+          setGames(filteredPrev);
+        } else {
+          setGames([]);
+        }
         setMix(null);
         setStyle(null);
         setStyleScanned(0);
@@ -310,6 +343,7 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setOpeningPhase(null);
         setMiddlegamePhase(null);
         setEndgamePhase(null);
+        setRecap(null);
         setInsights(null);
         vaultRequestedRef.current = false;
       }
@@ -319,47 +353,47 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
           InteractionManager.runAfterInteractions(() => resolve());
         });
         if (metricsRunIdRef.current !== runId) return;
-        const [loadedGames, peerStore, insightsData] = await Promise.all([
-          ensureStudyGames(queryFilters, forceNetwork),
-          loadBaselineStore(forceNetwork),
-          ensureInsights(queryFilters, forceNetwork),
+        const [session, peerStore] = await Promise.all([
+          ensureSession(queryFilters, false),
+          loadBaselineStore(false),
         ]);
-        if (metricsRunIdRef.current !== runId) return;
+        if (metricsRunIdRef.current !== runId || recapSignal.cancelled) return;
 
-        const scoped = sortRecentGames(loadedGames);
-        gamesRef.current = scoped;
-        setGames(scoped);
-        setBaselines(peerStore);
-        setInsights(insightsData);
+        const periodGames = sortRecentGames(session.games);
+        gamesRef.current = periodGames;
+        setGames(periodGames);
+        setRecap(session.recap);
+        setInsights(session.insights);
+        if (peerStore) setBaselines(peerStore);
         setGamesLoading(false);
-        setStyleTotal(scoped.length);
-        const evalQueue = Math.min(scoped.length, GLOBAL_MAX_GAMES);
-        if (evalGamesTotalRef.current <= 0 && evalQueue > 0) {
-          setScanProgress({
-            status: `Queued evaluation of ${evalQueue} games`,
-            phase: "boot",
-            gamesDone: 0,
-            gamesTotal: evalQueue,
-            running: true,
-            log: false,
-          });
+        if (!periodGames.length) {
+          markHeuristicsComplete();
+          setOpeningPhaseLoading(false);
+          setMiddlegamePhaseLoading(false);
+          setEndgamePhaseLoading(false);
         }
+        setStyleTotal(Math.min(periodGames.length, GLOBAL_MAX_GAMES));
+        const evalQueue = Math.min(
+          periodGames.length,
+          GLOBAL_FIRST_SCAN_MAX_GAMES
+        );
 
         const mixData = await ensureOpeningMix(
           queryFilters,
-          scoped,
-          forceNetwork
+          periodGames,
+          false
         );
         if (metricsRunIdRef.current !== runId) return;
         setMix(mixData);
+        hydratedKeyRef.current = key;
 
         // #region agent log
         agentLog(
           "F",
-          "AnalyticsContext.tsx:refreshMetrics",
-          "lite metrics done, starting vault",
+          "AnalyticsContext.tsx:refreshAnalytics",
+          "session bundle done, starting vault",
           {
-            games: scoped.length,
+            periodGames: periodGames.length,
             evalQueue,
             vaultRequested: vaultRequestedRef.current,
           }
@@ -367,9 +401,7 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         // #endregion
 
         vaultRequestedRef.current = true;
-        void refreshVaultMetrics(scoped, {
-          force: forceNetwork || sessionChanged,
-        });
+        void refreshVaultMetrics(periodGames, { force: false });
       } catch {
         if (metricsRunIdRef.current !== runId) return;
         setGamesLoading(false);
@@ -378,29 +410,16 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setEndgamePhaseLoading(false);
       }
     },
-    [queryFilters, refreshVaultMetrics, setScanProgress]
-  );
-
-  const refreshAnalytics = useCallback(
-    async (forceNetwork = false) => {
-      await Promise.all([
-        refreshRecap(forceNetwork),
-        refreshMetrics(forceNetwork),
-      ]);
-    },
-    [refreshRecap, refreshMetrics]
+    [queryFilters, refreshVaultMetrics]
   );
 
   useEffect(() => {
-    void refreshRecap(false);
+    if (!auth.ready) return;
+    void refreshAnalytics(false);
     return () => {
       recapSignalRef.current.cancelled = true;
     };
-  }, [refreshRecap, refreshToken]);
-
-  useEffect(() => {
-    void refreshMetrics(false);
-  }, [refreshMetrics, refreshToken]);
+  }, [auth.ready, refreshAnalytics, refreshToken]);
 
   useEffect(() => {
     if (!scanReady || !sessionKey || gamesLoading) return;

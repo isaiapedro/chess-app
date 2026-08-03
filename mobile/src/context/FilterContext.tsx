@@ -2,11 +2,13 @@ import React, {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
 } from "react";
 import type { Period, Platform, Timeframe } from "../api/types";
 import type { QueryFilters } from "../api/client";
+import { useAuth } from "./AuthContext";
 
 function isoDate(d: Date): string {
   const year = d.getFullYear();
@@ -16,7 +18,7 @@ function isoDate(d: Date): string {
 }
 
 const PERIOD_TIMEFRAME: Record<Period, Timeframe> = {
-  all: "1 year",
+  all: "all",
   year: "1 year",
   month: "1 month",
   week: "1 month",
@@ -108,7 +110,8 @@ type FilterContextValue = {
 const FilterContext = createContext<FilterContextValue | null>(null);
 
 export function FilterProvider({ children }: { children: React.ReactNode }) {
-  const [username, setUsername] = useState("pedroisaia");
+  const auth = useAuth();
+  const [username, setUsername] = useState("");
   const [platform, setPlatform] = useState<Platform>("chesscom");
   const [period, setPeriod] = useState<Period>("month");
   const [selectedDay, setSelectedDay] = useState<Date>(new Date());
@@ -116,6 +119,16 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
   const [dayCalendarOpen, setDayCalendarOpen] = useState(false);
   const [filterChromeBottom, setFilterChromeBottom] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
+
+  useEffect(() => {
+    if (!auth.ready) return;
+    if (auth.isLoggedIn) {
+      setUsername(auth.username);
+      if (auth.platform) setPlatform(auth.platform);
+    } else {
+      setUsername("");
+    }
+  }, [auth.ready, auth.isLoggedIn, auth.username, auth.platform]);
 
   const refresh = useCallback(() => {
     setRefreshToken((n) => n + 1);
@@ -129,7 +142,7 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
   const queryFilters = useMemo<QueryFilters>(() => {
     const range = resolveDateRange(period, selectedDay);
     return {
-      username: username.trim() || "pedroisaia",
+      username: username.trim(),
       platform,
       timeframe: PERIOD_TIMEFRAME[period],
       speed,

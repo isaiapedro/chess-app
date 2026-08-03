@@ -1,10 +1,10 @@
 import {
   fetchExplorer,
   fetchMastersPgn,
-  fetchStudyGames,
   type MistakeItem,
   type QueryFilters,
 } from "../api/client";
+import { ensureStudyGames } from "../storage/analyticsLoaders";
 import {
   refineRecentMistakeCandidates,
   type StudyGame,
@@ -18,7 +18,7 @@ import {
 } from "./analyzeOpenings";
 import {
   ENGINE_LABEL,
-  GLOBAL_MAX_GAMES,
+  GLOBAL_FIRST_SCAN_MAX_GAMES,
   TARGET_MISTAKE_MOMENTS,
   TARGET_OPENING_MOMENTS,
 } from "./analysisConfig";
@@ -26,13 +26,18 @@ import { consumeCandidates } from "./candidateBucket";
 import { DEBUG_DISABLE_BACKGROUND_JOBS } from "./debugFlags";
 import {
   createEvalLookup,
+  globalScanSessionKey,
+  getActiveGlobalScan,
   periodReservoirStatus,
   runGlobalPeriodAnalysis,
-  toStudyGames,
   type GlobalAnalysisProgress,
   type GlobalAnalysisState,
 } from "./globalAnalysis";
-import { readCache, writeCache, STUDY_ANALYSIS_TTL_MS } from "../storage/cache";
+import { writeCache } from "../storage/cache";
+import {
+  readMistakesCacheForPeriod,
+  readOpeningCacheForPeriod,
+} from "../storage/periodCacheReuse";
 import {
   studyMistakesCacheKey,
   studyOpeningCacheKey,
@@ -48,6 +53,14 @@ export function cancelStudyPrefetch() {
     activePrefetchSignal.cancelled = true;
     activePrefetchSignal = null;
   }
+}
+
+export function isStudyPrefetchActive(sessionKey?: string): boolean {
+  if (!activePrefetchSignal || activePrefetchSignal.cancelled) return false;
+  const active = getActiveGlobalScan();
+  if (!active || active.owner !== "prefetch") return false;
+  if (sessionKey && active.sessionKey !== sessionKey) return false;
+  return true;
 }
 
 export function getPrefetchedGlobalState(): GlobalAnalysisState | null {
@@ -94,10 +107,13 @@ type OpeningCachePayload = {
   baselineAvailable?: boolean;
 };
 
-async function hasMistakesCache(filters: QueryFilters): Promise<boolean> {
-  const cached = await readCache<MistakesCachePayload>(
-    studyMistakesCacheKey(filters),
-    STUDY_ANALYSIS_TTL_MS
+async function hasMistakesCache(
+  filters: QueryFilters,
+  periodGames: StudyGame[]
+): Promise<boolean> {
+  const cached = await readMistakesCacheForPeriod(
+    filters,
+    periodGames.map((game) => String(game.id))
   );
   return Boolean(cached?.moments?.length);
 }
@@ -105,11 +121,14 @@ async function hasMistakesCache(filters: QueryFilters): Promise<boolean> {
 async function hasOpeningCache(
   filters: QueryFilters,
   color: "white" | "black",
-  openingKey: string
+  openingKey: string,
+  periodGames: StudyGame[]
 ): Promise<boolean> {
-  const cached = await readCache<OpeningCachePayload>(
-    studyOpeningCacheKey(filters, color, openingKey),
-    STUDY_ANALYSIS_TTL_MS
+  const cached = await readOpeningCacheForPeriod(
+    filters,
+    color,
+    openingKey,
+    periodGames.map((game) => String(game.id))
   );
   return Boolean(cached?.moments?.length);
 }
@@ -134,11 +153,11 @@ export async function prefetchStudyContent(options: {
   if (signal.cancelled) return;
   activePrefetchSignal = signal;
 
-  const rows = await fetchStudyGames(filters, false);
+  const loaded = await ensureStudyGames(filters, false);
   if (signal.cancelled) return;
-  const games = [...toStudyGames(rows)]
+  const games = [...loaded]
     .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))
-    .slice(0, GLOBAL_MAX_GAMES);
+    .slice(0, GLOBAL_FIRST_SCAN_MAX_GAMES);
   if (!games.length) {
     onProgress?.({
       status: "No games to scan",
@@ -182,7 +201,7 @@ export async function prefetchStudyContent(options: {
   };
 
   const mastersPgn = async (gameId: string) => fetchMastersPgn(gameId);
-  let mistakesDone = await hasMistakesCache(filters);
+  let mistakesDone = await hasMistakesCache(filters, games);
   const openingDone = new Set<string>();
 
   const openingPlans: Array<{
@@ -193,7 +212,7 @@ export async function prefetchStudyContent(options: {
   for (const color of ["white", "black"] as const) {
     const top = topOpeningsForColor(games, color, PREFETCH_TOP_OPENINGS);
     for (const opening of top) {
-      if (await hasOpeningCache(filters, color, opening.key)) {
+      if (await hasOpeningCache(filters, color, opening.key, games)) {
         openingDone.add(`${color}:${opening.key}`);
         continue;
       }
@@ -210,9 +229,10 @@ export async function prefetchStudyContent(options: {
       evaluate,
       signal,
       games,
+      owner: "prefetch",
+      sessionKey: globalScanSessionKey(filters),
+      maxGames: GLOBAL_FIRST_SCAN_MAX_GAMES,
       onProgress,
-      earlyMistakeTarget: TARGET_MISTAKE_MOMENTS,
-      earlyOpeningTarget: TARGET_OPENING_MOMENTS,
       onGameScanned: (state) => {
         latestGlobalState = state;
       },
@@ -231,9 +251,8 @@ export async function prefetchStudyContent(options: {
           fetchMastersPgn: mastersPgn,
           fetchExplorer: explorer,
         });
-        await consumeCandidates(filters, "mistake", batch.moments);
         if (signal.cancelled || !batch.moments.length) return false;
-        mistakesDone = true;
+        await consumeCandidates(filters, "mistake", batch.moments);
         const reservoir = await periodReservoirStatus(
           filters,
           games,
@@ -249,10 +268,11 @@ export async function prefetchStudyContent(options: {
           thresholdPass: batch.thresholdPass,
           baselineAvailable: batch.baselineAvailable,
         } satisfies MistakesCachePayload);
+        mistakesDone = true;
         return true;
       },
       onEarlyOpeningsReady: async (_candidates, state) => {
-        if (signal.cancelled) return false;
+        if (signal.cancelled || !openingPlans.length) return false;
         let anyAccepted = false;
         for (const plan of openingPlans) {
           const planKey = `${plan.color}:${plan.opening.key}`;
@@ -261,9 +281,6 @@ export async function prefetchStudyContent(options: {
           const scoped = state.openingCandidates.filter((item) =>
             periodIds.has(String(item.game_id))
           );
-          if (scoped.length < TARGET_OPENING_MOMENTS && !state.complete) {
-            continue;
-          }
           const overall = state.openingCandidates;
           if (!scoped.length && !overall.length) continue;
           const batch = await refineRecentOpeningCandidates({
@@ -306,9 +323,7 @@ export async function prefetchStudyContent(options: {
             } satisfies OpeningCachePayload
           );
         }
-        return anyAccepted || (state.complete && openingPlans.every((plan) =>
-          openingDone.has(`${plan.color}:${plan.opening.key}`)
-        ));
+        return anyAccepted;
       },
     });
     if (signal.cancelled) return;

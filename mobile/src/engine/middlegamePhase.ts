@@ -1,5 +1,13 @@
 import { Chess, type Color, type PieceSymbol, type Square } from "chess.js";
 import type { StudyGame } from "./analyzeMistakes";
+import {
+  HEURISTICS_DOUBLED_PERSIST_PLIES,
+  HEURISTICS_MG_ATTACKERS_EVERY,
+  HEURISTICS_MG_ISLANDS_EVERY,
+  HEURISTICS_MG_SAFE_EVERY,
+  HEURISTICS_MG_SAMPLE_EVERY,
+  HEURISTICS_MG_SPACE_EVERY,
+} from "./analysisConfig";
 import { ENDGAME_NON_PAWN_MAX, nonPawnPieceCount } from "./endgamePhase";
 import {
   moveAccuracyPct,
@@ -15,17 +23,35 @@ import {
   STYLE_PIECE_VALUE,
   swapColor,
 } from "./styleMetrics";
-import { userWinProbability, WP_BLUNDER_DROP } from "./winProb";
+import {
+  userWinProbability,
+  classifyEvalDrop,
+  isMistakeOrWorse,
+  isBlunderSwingUp,
+  wpDropPp,
+} from "./winProb";
 
 export { inMiddlegamePly, middlegameStartPly } from "./middlegameBounds";
 
 const PIECE_POWER = STYLE_PIECE_VALUE;
+
+export const KING_ATTACKER_POWER_MAX =
+  PIECE_POWER.q +
+  PIECE_POWER.r * 2 +
+  PIECE_POWER.b * 2 +
+  PIECE_POWER.n * 2;
+
+export const KING_ATTACKERS_SCORE_MAX =
+  KING_ATTACKER_POWER_MAX * KING_ATTACKER_POWER_MAX;
 const FILES = "abcdefgh";
 
 export type MiddlegameEvalBucket = {
   accuracy_pct: number | null;
   accuracy_moves: number;
   blunders: number;
+  mistakes: number;
+  inaccuracies: number;
+  tactics_made: number;
   missed_opportunity_chances: number;
   missed_opportunities: number;
   missed_tactic_chances: number;
@@ -41,6 +67,8 @@ export type MiddlegameGameRow = {
   middlegame_accuracy_pct: number | null;
   middlegame_accuracy_moves: number;
   middlegame_blunders: number;
+  middlegame_mistakes: number;
+  middlegame_inaccuracies: number;
   middlegame_missed_opportunity_pct: number | null;
   middlegame_missed_tactic_pct: number | null;
   middlegame_allowed_tactic_pct: number | null;
@@ -63,6 +91,8 @@ export type MiddlegameMetricsAggregate = {
   middlegame_accuracy_pct: number | null;
   middlegame_accuracy_games: number;
   middlegame_blunder_avg: number | null;
+  middlegame_mistake_avg: number | null;
+  middlegame_inaccuracy_avg: number | null;
   middlegame_missed_opportunity_pct: number | null;
   middlegame_missed_tactic_pct: number | null;
   middlegame_allowed_tactic_pct: number | null;
@@ -110,16 +140,28 @@ export function kingAttackersScore(board: Chess, userColor: Color): number {
   const king = kingSquare(board, userColor);
   if (!king) return 0;
   const opp = swapColor(userColor);
+  const seen = new Set<string>();
   let weight = 0;
   for (const zoneSq of kingZoneSquares(king)) {
     for (const atk of board.attackers(zoneSq, opp)) {
+      if (seen.has(atk)) continue;
+      seen.add(atk);
       const piece = board.get(atk);
       if (!piece || piece.type === "k") continue;
-      const v = PIECE_POWER[piece.type] || 0;
-      weight += v;
+      weight += PIECE_POWER[piece.type] || 0;
     }
   }
   return weight * weight;
+}
+
+export function kingAttackersPct(board: Chess, userColor: Color): number {
+  const raw = kingAttackersScore(board, userColor);
+  return (
+    Math.round(
+      (Math.min(raw, KING_ATTACKERS_SCORE_MAX) / KING_ATTACKERS_SCORE_MAX) *
+        1000
+    ) / 10
+  );
 }
 
 function shieldSquares(king: Square, color: Color): Square[] | null {
@@ -194,7 +236,7 @@ function fileOpenness(
     else if (p.color === opp) theirs += 1;
   }
   if (mine === 0 && theirs === 0) return "open";
-  if (mine === 0 && theirs > 0) return "semi";
+  if (mine === 0 || theirs === 0) return "semi";
   return "closed";
 }
 
@@ -204,9 +246,156 @@ function opennessScore(kind: "open" | "semi" | "closed"): number {
   return 0;
 }
 
+function opennessFromPawnCounts(
+  mine: number,
+  theirs: number
+): "open" | "semi" | "closed" {
+  if (mine === 0 && theirs === 0) return "open";
+  if (mine === 0 || theirs === 0) return "semi";
+  return "closed";
+}
+
+export type OpenFileTracker = {
+  armed: boolean;
+  kingFile: number;
+  adjFiles: number[];
+  rookFile: number | null;
+  mine: number[];
+  theirs: number[];
+  scoreMax: number;
+};
+
+export function createOpenFileTracker(): OpenFileTracker {
+  return {
+    armed: false,
+    kingFile: 0,
+    adjFiles: [],
+    rookFile: null,
+    mine: Array.from({ length: 8 }, () => 0),
+    theirs: Array.from({ length: 8 }, () => 0),
+    scoreMax: 0,
+  };
+}
+
+function scoreOpenFileFromCounts(tracker: OpenFileTracker): number {
+  const kindOf = (file: number) =>
+    opennessFromPawnCounts(tracker.mine[file] || 0, tracker.theirs[file] || 0);
+  let best = opennessScore(kindOf(tracker.kingFile));
+  for (const adj of tracker.adjFiles) {
+    const base = opennessScore(kindOf(adj));
+    if (base > 0) best = Math.max(best, Math.round(base * 0.5));
+  }
+  if (tracker.rookFile != null) {
+    const base = opennessScore(kindOf(tracker.rookFile));
+    if (base > 0) best = Math.max(best, Math.round(base * 0.6));
+  }
+  return best;
+}
+
+export function armOpenFileTracker(
+  tracker: OpenFileTracker,
+  board: Chess,
+  userColor: Color,
+  options?: { castled?: boolean }
+): void {
+  if (tracker.armed) return;
+  const king = kingSquare(board, userColor);
+  if (!king) return;
+  const kf = squareFile(king);
+  const opp = swapColor(userColor);
+  const mine = Array.from({ length: 8 }, () => 0);
+  const theirs = Array.from({ length: 8 }, () => 0);
+  for (let file = 0; file < 8; file += 1) {
+    for (let rank = 0; rank < 8; rank += 1) {
+      const s = sq(file, rank);
+      if (!s) continue;
+      const p = board.get(s);
+      if (!p || p.type !== "p") continue;
+      if (p.color === userColor) mine[file] += 1;
+      else if (p.color === opp) theirs[file] += 1;
+    }
+  }
+  const castled = options?.castled === true;
+  const homeRank = userColor === "w" ? 0 : 7;
+  const adj = [kf - 1, kf + 1].filter((f) => f >= 0 && f <= 7);
+  let rookFile: number | null = null;
+  if (castled && squareRank(king) === homeRank) {
+    rookFile = kf >= 5 ? 7 : kf <= 2 ? 0 : null;
+  }
+  tracker.armed = true;
+  tracker.kingFile = kf;
+  tracker.adjFiles = adj;
+  tracker.rookFile = rookFile;
+  tracker.mine = mine;
+  tracker.theirs = theirs;
+  tracker.scoreMax = scoreOpenFileFromCounts(tracker);
+}
+
+export function updateOpenFileTracker(
+  tracker: OpenFileTracker,
+  move: {
+    from: Square;
+    to: Square;
+    piece: string;
+    color: Color;
+    captured?: string;
+    promotion?: string;
+  },
+  userColor: Color,
+  options?: { castled?: boolean }
+): void {
+  if (!tracker.armed) return;
+  const opp = swapColor(userColor);
+  let changed = false;
+  if (move.piece === "k" && move.color === userColor) {
+    const kf = squareFile(move.to);
+    tracker.kingFile = kf;
+    tracker.adjFiles = [kf - 1, kf + 1].filter((f) => f >= 0 && f <= 7);
+    const castled = options?.castled === true;
+    const homeRank = userColor === "w" ? 0 : 7;
+    if (castled && squareRank(move.to) === homeRank) {
+      tracker.rookFile = kf >= 5 ? 7 : kf <= 2 ? 0 : null;
+    } else {
+      tracker.rookFile = null;
+    }
+    changed = true;
+  }
+  if (move.piece === "p") {
+    const fromF = squareFile(move.from);
+    const toF = squareFile(move.to);
+    if (move.color === userColor) {
+      tracker.mine[fromF] = Math.max(0, (tracker.mine[fromF] || 0) - 1);
+      if (!move.promotion) tracker.mine[toF] = (tracker.mine[toF] || 0) + 1;
+    } else {
+      tracker.theirs[fromF] = Math.max(0, (tracker.theirs[fromF] || 0) - 1);
+      if (!move.promotion) tracker.theirs[toF] = (tracker.theirs[toF] || 0) + 1;
+    }
+    changed = true;
+  }
+  if (move.captured === "p") {
+    const toF = squareFile(move.to);
+    const capturedColor = move.color === "w" ? "b" : "w";
+    if (capturedColor === userColor) {
+      tracker.mine[toF] = Math.max(0, (tracker.mine[toF] || 0) - 1);
+    } else if (capturedColor === opp) {
+      tracker.theirs[toF] = Math.max(0, (tracker.theirs[toF] || 0) - 1);
+    }
+    changed = true;
+  }
+  if (!changed) return;
+  const next = scoreOpenFileFromCounts(tracker);
+  if (next > tracker.scoreMax) tracker.scoreMax = next;
+}
+
+export function openFileTrackerPct(tracker: OpenFileTracker): number | null {
+  if (!tracker.armed) return null;
+  return tracker.scoreMax;
+}
+
 export function openFileProximityPct(
   board: Chess,
-  userColor: Color
+  userColor: Color,
+  options?: { castled?: boolean }
 ): number {
   const king = kingSquare(board, userColor);
   if (!king) return 0;
@@ -218,8 +407,9 @@ export function openFileProximityPct(
     const base = opennessScore(kind);
     if (base > 0) best = Math.max(best, Math.round(base * 0.5));
   }
+  const castled = options?.castled === true;
   const homeRank = userColor === "w" ? 0 : 7;
-  if (squareRank(king) === homeRank) {
+  if (castled && squareRank(king) === homeRank) {
     const rookFile = kf >= 5 ? 7 : kf <= 2 ? 0 : null;
     if (rookFile != null) {
       const kind = fileOpenness(board, rookFile, userColor);
@@ -263,7 +453,7 @@ export function safeLegalMovesPct(board: Chess, userColor: Color): number | null
   const opp = swapColor(userColor);
   let safe = 0;
   for (const m of moves) {
-    if (!isAttackedByPawn(board, m.to as Square, opp)) safe += 1;
+    if (!board.isAttacked(m.to as Square, opp)) safe += 1;
   }
   return Math.round((safe / moves.length) * 1000) / 10;
 }
@@ -296,10 +486,7 @@ export function outpostControlCount(board: Chess, userColor: Color): number {
 
 export function spaceAdvantagePct(board: Chess, userColor: Color): number {
   const opp = swapColor(userColor);
-  const ranks =
-    userColor === "w"
-      ? [1, 2, 3, 4]
-      : [6, 5, 4, 3];
+  const ranks = [2, 3, 4];
   let good = 0;
   let total = 0;
   for (const file of [2, 3, 4, 5]) {
@@ -410,6 +597,288 @@ export function pawnIslandCount(board: Chess, color: Color): number {
   return islands;
 }
 
+export type PawnShieldTracker = {
+  armed: boolean;
+  files: number[] | null;
+  homeRank: number;
+  compromised: boolean[];
+};
+
+export function createPawnShieldTracker(): PawnShieldTracker {
+  return {
+    armed: false,
+    files: null,
+    homeRank: 1,
+    compromised: [false, false, false],
+  };
+}
+
+export function armPawnShieldTracker(
+  tracker: PawnShieldTracker,
+  board: Chess,
+  userColor: Color
+): void {
+  if (tracker.armed) return;
+  const king = kingSquare(board, userColor);
+  if (!king) return;
+  const f = squareFile(king);
+  const r = squareRank(king);
+  const homeRank = userColor === "w" ? 0 : 7;
+  if (r !== homeRank) return;
+  let files: number[] | null = null;
+  if (f >= 5) files = [5, 6, 7];
+  else if (f <= 2) files = [0, 1, 2];
+  if (!files) return;
+  const pawnRank = userColor === "w" ? 1 : 6;
+  tracker.armed = true;
+  tracker.files = files;
+  tracker.homeRank = pawnRank;
+  tracker.compromised = files.map((file) => {
+    const s = sq(file, pawnRank);
+    if (!s) return true;
+    const p = board.get(s);
+    return !(p && p.type === "p" && p.color === userColor);
+  });
+}
+
+export function updatePawnShieldTracker(
+  tracker: PawnShieldTracker,
+  move: { from: Square; to: Square; piece: string; color: Color; captured?: string },
+  userColor: Color
+): void {
+  if (!tracker.armed || !tracker.files) return;
+  for (let i = 0; i < tracker.files.length; i += 1) {
+    if (tracker.compromised[i]) continue;
+    const file = tracker.files[i];
+    if (
+      move.piece === "p" &&
+      move.color === userColor &&
+      squareFile(move.from) === file &&
+      squareRank(move.from) === tracker.homeRank
+    ) {
+      tracker.compromised[i] = true;
+      continue;
+    }
+    if (move.captured === "p") {
+      const capturedColor = move.color === "w" ? "b" : "w";
+      if (
+        capturedColor === userColor &&
+        squareFile(move.to) === file
+      ) {
+        tracker.compromised[i] = true;
+      }
+    }
+  }
+}
+
+export function pawnShieldIntactPct(tracker: PawnShieldTracker): number | null {
+  if (!tracker.armed || !tracker.files) return null;
+  const intact = tracker.compromised.filter((c) => !c).length;
+  return Math.round((intact / tracker.compromised.length) * 1000) / 10;
+}
+
+export function collectOutpostSquares(
+  board: Chess,
+  userColor: Color,
+  seen: Set<string>
+): void {
+  for (const pt of ["n", "b"] as PieceSymbol[]) {
+    for (const s of board.findPiece({ type: pt, color: userColor })) {
+      if (isOutpostSquare(board, s, userColor)) seen.add(s);
+    }
+  }
+}
+
+export function pawnStructureChanged(move: {
+  piece: string;
+  captured?: string;
+}): boolean {
+  return move.piece === "p" || move.captured === "p";
+}
+
+export type PawnStructureSnapshot = {
+  filesMine: number[];
+  ranksMine: number[][];
+};
+
+export function snapshotPawnStructure(
+  board: Chess,
+  color: Color
+): PawnStructureSnapshot {
+  const filesMine = Array.from({ length: 8 }, () => 0);
+  const ranksMine: number[][] = Array.from({ length: 8 }, () => []);
+  for (let file = 0; file < 8; file += 1) {
+    for (let rank = 0; rank < 8; rank += 1) {
+      const s = sq(file, rank);
+      if (!s) continue;
+      const p = board.get(s);
+      if (!p || p.type !== "p" || p.color !== color) continue;
+      filesMine[file] += 1;
+      ranksMine[file].push(rank);
+    }
+  }
+  return { filesMine, ranksMine };
+}
+
+function hasIsolatedQueenPawnFromSnap(snap: PawnStructureSnapshot): boolean {
+  if ((snap.filesMine[3] || 0) <= 0) return false;
+  return (snap.filesMine[2] || 0) === 0 && (snap.filesMine[4] || 0) === 0;
+}
+
+function hasDoubledPawnsFromSnap(snap: PawnStructureSnapshot): boolean {
+  return snap.filesMine.some((count) => count >= 2);
+}
+
+function hasBackwardPawnFromSnap(
+  board: Chess,
+  color: Color,
+  snap: PawnStructureSnapshot
+): boolean {
+  const dir = color === "w" ? 1 : -1;
+  const opp = swapColor(color);
+  for (let file = 0; file < 8; file += 1) {
+    for (const rank of snap.ranksMine[file] || []) {
+      let behindNeighbors = true;
+      for (const adj of [file - 1, file + 1]) {
+        if (adj < 0 || adj > 7) continue;
+        for (const r of snap.ranksMine[adj] || []) {
+          if (color === "w" ? r <= rank : r >= rank) {
+            behindNeighbors = false;
+            break;
+          }
+        }
+        if (!behindNeighbors) break;
+      }
+      if (!behindNeighbors) continue;
+      const ahead = sq(file, rank + dir);
+      if (!ahead || board.get(ahead)) continue;
+      if (isAttackedByPawn(board, ahead, opp)) return true;
+    }
+  }
+  return false;
+}
+
+function pawnIslandCountFromSnap(snap: PawnStructureSnapshot): number {
+  let islands = 0;
+  let inIsland = false;
+  for (const count of snap.filesMine) {
+    const has = count > 0;
+    if (has && !inIsland) {
+      islands += 1;
+      inIsland = true;
+    } else if (!has) {
+      inIsland = false;
+    }
+  }
+  return islands;
+}
+
+function fileOpennessFromSnap(
+  snap: PawnStructureSnapshot,
+  filesOpp: number[],
+  file: number
+): "open" | "semi" | "closed" {
+  const mine = snap.filesMine[file] || 0;
+  const theirs = filesOpp[file] || 0;
+  if (mine === 0 && theirs === 0) return "open";
+  if (mine === 0 || theirs === 0) return "semi";
+  return "closed";
+}
+
+export function stickyPawnFlags(
+  board: Chess,
+  userColor: Color,
+  current: { iqp: boolean; doubled: boolean; backward: boolean }
+): {
+  iqp: boolean;
+  doubled: boolean;
+  doubledNow: boolean;
+  backward: boolean;
+} {
+  const snap = snapshotPawnStructure(board, userColor);
+  const doubledNow = hasDoubledPawnsFromSnap(snap);
+  return {
+    iqp: current.iqp || hasIsolatedQueenPawnFromSnap(snap),
+    doubled: current.doubled,
+    doubledNow,
+    backward:
+      current.backward ||
+      hasBackwardPawnFromSnap(board, userColor, snap),
+  };
+}
+
+export function sampleMiddlegamePosition(
+  board: Chess,
+  userColor: Color,
+  options?: {
+    checkIqp?: boolean;
+    checkDoubled?: boolean;
+    checkBackward?: boolean;
+    castled?: boolean;
+  }
+): {
+  attackers: number;
+  shield: number | null;
+  openFile: number;
+  safe: number | null;
+  outpost: number;
+  space: number;
+  islands: number;
+  iqp: boolean;
+  doubled: boolean;
+  backward: boolean;
+} {
+  const snap = snapshotPawnStructure(board, userColor);
+  const oppSnap = snapshotPawnStructure(board, swapColor(userColor));
+  const king = kingSquare(board, userColor);
+  let openFile = 0;
+  if (king) {
+    const kf = squareFile(king);
+    let best = opennessScore(
+      fileOpennessFromSnap(snap, oppSnap.filesMine, kf)
+    );
+    for (const adj of [kf - 1, kf + 1]) {
+      if (adj < 0 || adj > 7) continue;
+      const base = opennessScore(
+        fileOpennessFromSnap(snap, oppSnap.filesMine, adj)
+      );
+      if (base > 0) best = Math.max(best, Math.round(base * 0.5));
+    }
+    const castled = options?.castled === true;
+    const homeRank = userColor === "w" ? 0 : 7;
+    if (castled && squareRank(king) === homeRank) {
+      const rookFile = kf >= 5 ? 7 : kf <= 2 ? 0 : null;
+      if (rookFile != null) {
+        const base = opennessScore(
+          fileOpennessFromSnap(snap, oppSnap.filesMine, rookFile)
+        );
+        if (base > 0) best = Math.max(best, Math.round(base * 0.6));
+      }
+    }
+    openFile = best;
+  }
+
+  return {
+    attackers: kingAttackersPct(board, userColor),
+    shield: pawnShieldIntegrityPct(board, userColor),
+    openFile,
+    safe: safeLegalMovesPct(board, userColor),
+    outpost: outpostControlCount(board, userColor),
+    space: spaceAdvantagePct(board, userColor),
+    islands: pawnIslandCountFromSnap(snap),
+    iqp:
+      options?.checkIqp === false ? false : hasIsolatedQueenPawnFromSnap(snap),
+    doubled:
+      options?.checkDoubled === false
+        ? false
+        : hasDoubledPawnsFromSnap(snap),
+    backward:
+      options?.checkBackward === false
+        ? false
+        : hasBackwardPawnFromSnap(board, userColor, snap),
+  };
+}
+
 function emptyRow(result: string): MiddlegameGameRow {
   return {
     reached_middlegame: false,
@@ -418,6 +887,8 @@ function emptyRow(result: string): MiddlegameGameRow {
     middlegame_accuracy_pct: null,
     middlegame_accuracy_moves: 0,
     middlegame_blunders: 0,
+    middlegame_mistakes: 0,
+    middlegame_inaccuracies: 0,
     middlegame_missed_opportunity_pct: null,
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
@@ -464,20 +935,26 @@ export function analyzeMiddlegameGame(
   let endgameStartPly: number | null = null;
 
   const attackerScores: number[] = [];
-  const shieldScores: number[] = [];
-  const openFileScores: number[] = [];
   const safeMoveScores: number[] = [];
-  const outpostCounts: number[] = [];
   const spaceScores: number[] = [];
-  const islandScores: number[] = [];
+  const outpostSeen = new Set<string>();
+  const shieldTracker = createPawnShieldTracker();
+  const openFileTracker = createOpenFileTracker();
+  let islandSum = 0;
+  let islandScans = 0;
   const accuracySamples: number[] = [];
   let blunders = 0;
+  let mistakes = 0;
+  let inaccuracies = 0;
   let hadIqp = false;
   let hadDoubled = false;
   let hadBackward = false;
+  let doubledNow = false;
+  let doubledStreak = 0;
   let seenMg = false;
   let mgStart: number | null = null;
   let mgEnd: number | null = null;
+  let mgSampleIdx = 0;
 
   let pendingOppBlunder = false;
   let pendingOppTactic = false;
@@ -547,22 +1024,79 @@ export function analyzeMiddlegameGame(
     if (mgStart == null) mgStart = middlegameStartPly(phaseEnd);
     mgEnd = endgameStartPly != null ? endgameStartPly : plyIdx + 1;
 
-    attackerScores.push(kingAttackersScore(board, color));
-    const shield = pawnShieldIntegrityPct(board, color);
-    if (shield != null) shieldScores.push(shield);
-    openFileScores.push(openFileProximityPct(board, color));
-    const safe = safeLegalMovesPct(board, color);
-    if (safe != null) safeMoveScores.push(safe);
-    outpostCounts.push(outpostControlCount(board, color));
-    spaceScores.push(spaceAdvantagePct(board, color));
-    islandScores.push(pawnIslandCount(board, color));
-    if (hasIsolatedQueenPawn(board, color)) hadIqp = true;
-    if (hasDoubledPawns(board, color)) hadDoubled = true;
-    if (hasBackwardPawn(board, color)) hadBackward = true;
+    armPawnShieldTracker(shieldTracker, board, color);
+    updatePawnShieldTracker(
+      shieldTracker,
+      {
+        from: move.from,
+        to: move.to,
+        piece: move.piece,
+        color: move.color,
+        captured: move.captured,
+      },
+      color
+    );
+    armOpenFileTracker(openFileTracker, board, color, {
+      castled: castleFullmove != null,
+    });
+    updateOpenFileTracker(
+      openFileTracker,
+      {
+        from: move.from,
+        to: move.to,
+        piece: move.piece,
+        color: move.color,
+        captured: move.captured,
+        promotion: move.promotion,
+      },
+      color,
+      { castled: castleFullmove != null }
+    );
+
+    if (mgSampleIdx % HEURISTICS_MG_SAMPLE_EVERY === 0) {
+      if (hasIsolatedQueenPawn(board, color)) hadIqp = true;
+      if (hasBackwardPawn(board, color)) hadBackward = true;
+      doubledNow = hasDoubledPawns(board, color);
+      collectOutpostSquares(board, color, outpostSeen);
+    } else if (pawnStructureChanged(move)) {
+      if (!hadIqp && hasIsolatedQueenPawn(board, color)) hadIqp = true;
+      if (!hadBackward && hasBackwardPawn(board, color)) hadBackward = true;
+      doubledNow = hasDoubledPawns(board, color);
+    }
+
+    if (doubledNow) {
+      doubledStreak += 1;
+      if (doubledStreak >= HEURISTICS_DOUBLED_PERSIST_PLIES) hadDoubled = true;
+    } else {
+      doubledStreak = 0;
+    }
+
+    if (mgSampleIdx % HEURISTICS_MG_ISLANDS_EVERY === 0) {
+      islandSum += pawnIslandCount(board, color);
+      islandScans += 1;
+    }
+
+    if (mgSampleIdx % HEURISTICS_MG_ATTACKERS_EVERY === 0) {
+      attackerScores.push(kingAttackersPct(board, color));
+    }
+    if (mgSampleIdx % HEURISTICS_MG_SPACE_EVERY === 0) {
+      spaceScores.push(spaceAdvantagePct(board, color));
+    }
+    if (
+      mgSampleIdx % HEURISTICS_MG_SAFE_EVERY === 0 &&
+      board.turn() === color
+    ) {
+      const safe = safeLegalMovesPct(board, color);
+      if (safe != null) safeMoveScores.push(safe);
+    }
+    mgSampleIdx += 1;
 
     if (isUser && wpBefore != null && wpAfter != null) {
       accuracySamples.push(moveAccuracyPct(wpBefore * 100, wpAfter * 100));
-      if (wpBefore - wpAfter >= WP_BLUNDER_DROP) blunders += 1;
+      const kind = classifyEvalDrop(wpBefore, wpAfter);
+      if (kind === "blunder") blunders += 1;
+      else if (kind === "mistake") mistakes += 1;
+      else if (kind === "inaccuracy") inaccuracies += 1;
     }
 
     if (isUser && pendingOppBlunder) {
@@ -571,9 +1105,9 @@ export function analyzeMiddlegameGame(
       const missed =
         wpBefore != null &&
         wpAfter != null &&
-        (wpBefore - wpAfter >= WP_BLUNDER_DROP ||
+        (isMistakeOrWorse(wpBefore, wpAfter) ||
           (pendingOppWp != null &&
-            pendingOppWp - wpAfter >= WP_BLUNDER_DROP));
+            wpDropPp(pendingOppWp, wpAfter) >= 10));
       if (missed) {
         missedOpps += 1;
         if (pendingOppTactic) missedTactics += 1;
@@ -587,14 +1121,14 @@ export function analyzeMiddlegameGame(
       const found =
         (wpBefore != null &&
           wpAfter != null &&
-          wpBefore - wpAfter >= WP_BLUNDER_DROP * 0.5) ||
+          wpDropPp(wpBefore, wpAfter) >= 7.5) ||
         move.isCapture();
       if (found) allowedFound += 1;
       pendingAllowed = false;
     }
 
     if (!isUser && wpBefore != null && wpAfter != null) {
-      if (wpAfter - wpBefore >= WP_BLUNDER_DROP) {
+      if (isBlunderSwingUp(wpBefore, wpAfter)) {
         pendingOppBlunder = true;
         pendingOppWp = wpAfter;
         pendingOppTactic = hasMaterialWinTactic(board, color);
@@ -603,7 +1137,7 @@ export function analyzeMiddlegameGame(
 
     if (isUser && wpBefore != null && wpAfter != null) {
       if (
-        wpBefore - wpAfter >= WP_BLUNDER_DROP &&
+        classifyEvalDrop(wpBefore, wpAfter) === "blunder" &&
         hasMaterialWinTactic(board, swapColor(color))
       ) {
         allowedChances += 1;
@@ -621,6 +1155,8 @@ export function analyzeMiddlegameGame(
     middlegame_accuracy_pct: mean(accuracySamples, 1),
     middlegame_accuracy_moves: accuracySamples.length,
     middlegame_blunders: blunders,
+    middlegame_mistakes: mistakes,
+    middlegame_inaccuracies: inaccuracies,
     middlegame_missed_opportunity_pct: missedOppChances
       ? Math.round((missedOpps / missedOppChances) * 1000) / 10
       : null,
@@ -631,15 +1167,18 @@ export function analyzeMiddlegameGame(
       ? Math.round((allowedFound / allowedChances) * 1000) / 10
       : null,
     middlegame_king_attackers_score: mean(attackerScores, 1),
-    middlegame_pawn_shield_pct: mean(shieldScores, 1),
-    middlegame_open_file_proximity_pct: mean(openFileScores, 1),
+    middlegame_pawn_shield_pct: pawnShieldIntactPct(shieldTracker),
+    middlegame_open_file_proximity_pct: openFileTrackerPct(openFileTracker),
     middlegame_safe_moves_pct: mean(safeMoveScores, 1),
-    middlegame_outpost_control: mean(outpostCounts, 2),
+    middlegame_outpost_control: outpostSeen.size,
     middlegame_space_advantage_pct: mean(spaceScores, 1),
     had_iqp: hadIqp,
     had_doubled_pawns: hadDoubled,
     had_backward_pawns: hadBackward,
-    middlegame_pawn_islands_avg: mean(islandScores, 2),
+    middlegame_pawn_islands_avg:
+      islandScans > 0
+        ? Math.round((islandSum / islandScans) * 100) / 100
+        : null,
     result,
   };
 }
@@ -654,6 +1193,8 @@ export function aggregateMiddlegameMetrics(
     middlegame_accuracy_pct: null,
     middlegame_accuracy_games: 0,
     middlegame_blunder_avg: null,
+    middlegame_mistake_avg: null,
+    middlegame_inaccuracy_avg: null,
     middlegame_missed_opportunity_pct: null,
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
@@ -683,6 +1224,14 @@ export function aggregateMiddlegameMetrics(
     middlegame_accuracy_games: accuracy.length,
     middlegame_blunder_avg: mean(
       mg.map((r) => r.middlegame_blunders),
+      2
+    ),
+    middlegame_mistake_avg: mean(
+      mg.map((r) => r.middlegame_mistakes),
+      2
+    ),
+    middlegame_inaccuracy_avg: mean(
+      mg.map((r) => r.middlegame_inaccuracies),
       2
     ),
     middlegame_missed_opportunity_pct: mean(
@@ -767,6 +1316,8 @@ export function mergeMiddlegameHeuristicWithBucket(
     middlegame_accuracy_pct: bucket.accuracy_pct,
     middlegame_accuracy_moves: bucket.accuracy_moves,
     middlegame_blunders: bucket.blunders,
+    middlegame_mistakes: bucket.mistakes,
+    middlegame_inaccuracies: bucket.inaccuracies,
     middlegame_missed_opportunity_pct: bucket.missed_opportunity_chances
       ? Math.round(
           (bucket.missed_opportunities / bucket.missed_opportunity_chances) *
@@ -792,12 +1343,12 @@ export function heuristicMiddlegameFromPass(input: {
   startPly: number | null;
   endPly: number | null;
   attackerScores: number[];
-  shieldScores: number[];
-  openFileScores: number[];
+  shieldPct: number | null;
+  openFilePct: number | null;
   safeMoveScores: number[];
-  outpostCounts: number[];
+  outpostUnique: number;
   spaceScores: number[];
-  islandScores: number[];
+  islandAvg: number | null;
   hadIqp: boolean;
   hadDoubled: boolean;
   hadBackward: boolean;
@@ -811,19 +1362,21 @@ export function heuristicMiddlegameFromPass(input: {
     middlegame_accuracy_pct: null,
     middlegame_accuracy_moves: 0,
     middlegame_blunders: 0,
+    middlegame_mistakes: 0,
+    middlegame_inaccuracies: 0,
     middlegame_missed_opportunity_pct: null,
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
     middlegame_king_attackers_score: mean(input.attackerScores, 1),
-    middlegame_pawn_shield_pct: mean(input.shieldScores, 1),
-    middlegame_open_file_proximity_pct: mean(input.openFileScores, 1),
+    middlegame_pawn_shield_pct: input.shieldPct,
+    middlegame_open_file_proximity_pct: input.openFilePct,
     middlegame_safe_moves_pct: mean(input.safeMoveScores, 1),
-    middlegame_outpost_control: mean(input.outpostCounts, 2),
+    middlegame_outpost_control: input.outpostUnique,
     middlegame_space_advantage_pct: mean(input.spaceScores, 1),
     had_iqp: input.hadIqp,
     had_doubled_pawns: input.hadDoubled,
     had_backward_pawns: input.hadBackward,
-    middlegame_pawn_islands_avg: mean(input.islandScores, 2),
+    middlegame_pawn_islands_avg: input.islandAvg,
     result: input.result,
   };
 }

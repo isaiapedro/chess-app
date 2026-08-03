@@ -24,7 +24,12 @@ from endgame_phase_metrics import (
     PIECE_VALUE as EG_PIECE_VALUE,
     MINOR_MAJOR as EG_MINOR_MAJOR,
     WP_BLUNDER_DROP,
+    WP_INACCURACY_DROP,
     WP_ENDGAME_ADVANTAGE,
+    classify_eval_drop,
+    is_mistake_or_worse,
+    is_blunder_swing_up,
+    wp_drop_pp,
     _mean as eg_mean,
     classify_theoretical,
     king_centralization_score,
@@ -71,17 +76,111 @@ MINOR_MAJOR = {
 
 ENDGAME_NON_KING_MAX = 10
 EARLY_MOVE_MAX = 12
+EARLY_FLANK_FULLMOVE_MAX = 12
+EG_TRADE_WINDOW_PLIES = 3
 KING_TRADE_DIST = 2
 DRAWISH_MIN_FULLMOVE = 40
+SACRIFICE_MIN_OFFER = 3
 WP_DISADVANTAGE = 0.2
-WP_CRITICAL_DELTA = 0.15
+WP_CRITICAL_DELTA = 0.1
+WP_CRITICAL_CP = 1.0
 WP_DRAWISH_LO = 0.45
 WP_DRAWISH_HI = 0.55
+WP_ENDGAME_ADVANTAGE_STICKY = 0.65
+CP_ENDGAME_ADVANTAGE_STICKY = 100.0
 ADVANTAGE_CP = 150
 DRAWISH_CP = 40
 CRITICAL_SWING_CP = 150
 DISADVANTAGE_CP = 241
 BLUNDER_CP = 241
+HEURISTICS_DOUBLED_PERSIST_PLIES = 3
+HEURISTICS_MG_SAMPLE_EVERY = 3
+HEURISTICS_MG_ISLANDS_EVERY = 5
+HEURISTICS_MG_SPACE_EVERY = 5
+HEURISTICS_MG_SAFE_EVERY = 5
+HEURISTICS_MG_ATTACKERS_EVERY = 3
+HEURISTICS_EG_KING_EVERY = 3
+HEURISTICS_EG_THEORETICAL_EVERY = 4
+
+
+def normalize_game_result(
+    result: str | None, user_is_white: bool
+) -> str:
+    r = str(result or "").strip()
+    if r in ("Win", "Draw", "Loss"):
+        return r
+    if r == "1-0":
+        return "Win" if user_is_white else "Loss"
+    if r == "0-1":
+        return "Loss" if user_is_white else "Win"
+    if r in ("1/2-1/2", "½-½") or r.lower() == "draw":
+        return "Draw"
+    return ""
+
+
+def is_flank_file(file_idx: int) -> bool:
+    return file_idx <= 1 or file_idx >= 6
+
+
+def is_early_flank_push(
+    color: chess.Color, to_file: int, to_rank: int
+) -> bool:
+    if not is_flank_file(to_file):
+        return False
+    if color == chess.WHITE:
+        return to_rank >= 3
+    return to_rank <= 4
+
+
+def threatens_higher_value(
+    board: chess.Board, move: chess.Move, color: chess.Color
+) -> bool:
+    mover = board.piece_at(move.from_square)
+    if mover is None or mover.piece_type == chess.KING:
+        return False
+    a_val = PIECE_VALUE.get(mover.piece_type, 0)
+    captured = board.piece_at(move.to_square)
+    if (
+        captured is not None
+        and captured.piece_type != chess.KING
+        and captured.piece_type != chess.PAWN
+        and a_val < PIECE_VALUE.get(captured.piece_type, 0)
+    ):
+        return True
+    board.push(move)
+    try:
+        to_sq = move.to_square
+        for pt in MINOR_MAJOR:
+            v_val = PIECE_VALUE.get(pt, 0)
+            if a_val >= v_val:
+                continue
+            for sq in board.pieces(pt, not color):
+                if to_sq in board.attackers(color, sq):
+                    return True
+        return False
+    finally:
+        board.pop()
+
+
+def sacrifice_offer_values(
+    board_after: chess.Board,
+    move: chess.Move,
+    color: chess.Color,
+    moving_pt: int,
+    captured_pt: int | None,
+    was_capture: bool,
+) -> int:
+    opp = not color
+    mover_val = PIECE_VALUE.get(moving_pt, 0)
+    captured_val = PIECE_VALUE.get(captured_pt, 0) if captured_pt else 0
+    dest_attacked = board_after.is_attacked_by(opp, move.to_square)
+    dest_defended = board_after.is_attacked_by(color, move.to_square)
+    if was_capture and dest_attacked:
+        trade_loss = mover_val - captured_val
+        return trade_loss if trade_loss >= SACRIFICE_MIN_OFFER else 0
+    if dest_attacked and not dest_defended and mover_val >= SACRIFICE_MIN_OFFER:
+        return max(0, mover_val - captured_val)
+    return 0
 
 
 def score_to_cp_white(score: chess.engine.PovScore) -> float | None:
@@ -128,10 +227,6 @@ def chebyshev(a: int, b: int) -> int:
     )
 
 
-def is_flank_file(file_idx: int) -> bool:
-    return file_idx <= 2 or file_idx >= 5
-
-
 def max_undefended_hanging_pieces(board: chess.Board, color: chess.Color) -> int:
     best = 0
     for pt in MINOR_MAJOR:
@@ -143,36 +238,6 @@ def max_undefended_hanging_pieces(board: chess.Board, color: chess.Color) -> int
                 continue
             best = max(best, val)
     return best
-
-
-def threatens_higher_value(
-    board: chess.Board, move: chess.Move, color: chess.Color
-) -> bool:
-    board.push(move)
-    try:
-        for sq in chess.SQUARES:
-            victim = board.piece_at(sq)
-            if (
-                not victim
-                or victim.color == color
-                or victim.piece_type == chess.KING
-                or victim.piece_type == chess.PAWN
-            ):
-                continue
-            attackers = board.attackers(color, sq)
-            if not attackers:
-                continue
-            v_val = PIECE_VALUE.get(victim.piece_type, 0)
-            for atk_sq in attackers:
-                atk = board.piece_at(atk_sq)
-                if not atk or atk.piece_type == chess.KING:
-                    continue
-                a_val = PIECE_VALUE.get(atk.piece_type, 0)
-                if a_val < v_val:
-                    return True
-        return False
-    finally:
-        board.pop()
 
 
 def is_under_lesser_attack(board: chess.Board, sq: int, color: chess.Color) -> bool:
@@ -290,7 +355,7 @@ def analyze_peer_game_metrics(
 
     user_is_white = str(row.get("user_color", "white")).lower() == "white"
     user_color = chess.WHITE if user_is_white else chess.BLACK
-    result = row.get("result", "")
+    result = normalize_game_result(row.get("result", ""), user_is_white)
 
     board = game.board()
     limit = (
@@ -323,13 +388,26 @@ def analyze_peer_game_metrics(
     declined_recaptures = 0
     recapture_chances = 0
     critical_times = []
+    critical_positions = 0
     disadvantage_times = []
     blunders = 0
     had_disadvantage = False
 
     had_endgame_advantage = False
+    endgame_advantage_start_ply = None
     piece_trade_pending = None
     pending_recapture_sq = None
+    pending_sacrifice_sq = None
+    pending_sacrifice_ok = False
+    pending_sacrifice_accepted = False
+    pending_sacrifice_offer_val = 0
+    last_capture = None
+    user_just_captured = False
+
+    eg_pending_cp_before = 0.0
+    eg_pending_user_net = 0
+    eg_pending_piece_seen = False
+    mg_doubled_streak = 0
 
     castle_fullmove = None
     phase_end = opening_phase_end_fullmove(None)
@@ -337,6 +415,7 @@ def analyze_peer_game_metrics(
     accuracy_samples = []
     tempo_moves = 0
     tempo_wastes = 0
+    pawn_moves = 0
     times_moved = {}
     minors_at_10 = None
     opening_closed = False
@@ -346,6 +425,8 @@ def analyze_peer_game_metrics(
     eg_king_dists = []
     eg_pawn_diffs = []
     eg_blunders = 0
+    eg_mistakes = 0
+    eg_inaccuracies = 0
     eg_piece_trades = 0
     eg_beneficial_trades = 0
     eg_winning_trades = 0
@@ -376,6 +457,8 @@ def analyze_peer_game_metrics(
     mg_seen = False
     mg_accuracy = []
     mg_blunders = 0
+    mg_mistakes = 0
+    mg_inaccuracies = 0
     mg_pending_opp = False
     mg_pending_opp_tactic = False
     mg_pending_opp_wp = None
@@ -424,6 +507,7 @@ def analyze_peer_game_metrics(
             else None
         )
         eg_wp_before_last = wp_before_eg
+        in_phase = full_move <= phase_end
 
         if not opening_closed:
             if is_user and is_castle and castle_fullmove is None:
@@ -440,10 +524,26 @@ def analyze_peer_game_metrics(
                     times_moved[move.to_square] = prior + 1
                     if move.to_square != move.from_square:
                         times_moved[move.from_square] = 0
+                else:
+                    pawn_moves += 1
 
         if is_user:
             user_move_idx = user_moves
             user_moves += 1
+
+            if pending_sacrifice_accepted and pending_sacrifice_sq is not None:
+                recovered = False
+                if is_capture and captured is not None:
+                    cap_v = PIECE_VALUE.get(captured.piece_type, 0)
+                    if cap_v >= max(3, pending_sacrifice_offer_val - 1):
+                        recovered = True
+                same_sq = is_capture and move.to_square == pending_sacrifice_sq
+                if not recovered and not same_sq:
+                    sacrifice_moves += 1
+                pending_sacrifice_sq = None
+                pending_sacrifice_ok = False
+                pending_sacrifice_accepted = False
+                pending_sacrifice_offer_val = 0
 
             eval_before_user = None
             if eval_before is not None:
@@ -457,7 +557,10 @@ def analyze_peer_game_metrics(
                         disadvantage_times.append(user_times[user_move_idx])
 
             escaping = False
-            if moving_piece and is_under_lesser_attack(board, from_sq, user_color):
+            if moving_piece and (
+                board.is_attacked_by(not user_color, from_sq)
+                or is_under_lesser_attack(board, from_sq, user_color)
+            ):
                 escaping = True
 
             if pending_recapture_sq is not None:
@@ -498,19 +601,20 @@ def analyze_peer_game_metrics(
             if (
                 moving_piece
                 and moving_piece.piece_type == chess.PAWN
-                and full_move <= EARLY_MOVE_MAX
-                and is_flank_file(to_file)
-                and in_opp
+                and full_move <= EARLY_FLANK_FULLMOVE_MAX
+                and is_early_flank_push(user_color, to_file, to_rank)
             ):
                 early_flank_pushes += 1
 
             if threatens_higher_value(board, move, user_color):
                 higher_threats += 1
 
+            user_just_captured = is_capture
             board.push(move)
 
-            if escaping and not is_under_lesser_attack(
-                board, to_sq, user_color
+            if escaping and not (
+                board.is_attacked_by(not user_color, to_sq)
+                or is_under_lesser_attack(board, to_sq, user_color)
             ):
                 threat_escapes += 1
 
@@ -521,37 +625,45 @@ def analyze_peer_game_metrics(
                 evals_white.append(cp)
 
             if eval_before is not None and cp is not None:
-                bal_after = piece_material_balance(board, user_color)
-                bal_delta = bal_after - bal_before
-                hang = max_undefended_hanging_pieces(board, user_color)
+                moving_pt = moving_piece.piece_type if moving_piece else 0
+                captured_pt = captured.piece_type if captured else None
+                offered = sacrifice_offer_values(
+                    board, move, user_color, moving_pt, captured_pt, is_capture
+                )
                 eval_before_user = (
                     eval_before if user_is_white else -eval_before
                 )
                 eval_after_user = cp if user_is_white else -cp
                 eval_delta = eval_after_user - eval_before_user
-                offered = max(-bal_delta, hang)
-                if offered >= 3 and eval_delta >= -(offered * 100) + 50:
-                    sacrifice_moves += 1
-                elif offered >= 3 and eval_after_user >= -75:
-                    sacrifice_moves += 1
-
                 wp_before_move = eg_user_wp(eval_before, user_is_white)
                 wp_after_move = eg_user_wp(cp, user_is_white)
-                if wp_before_move - wp_after_move >= WP_BLUNDER_DROP:
+                wp_drop = wp_before_move - wp_after_move
+                if (
+                    offered >= SACRIFICE_MIN_OFFER
+                    and eval_delta >= -50
+                    and wp_after_move >= wp_before_move - 0.03
+                    and wp_drop < WP_INACCURACY_DROP
+                ):
+                    pending_sacrifice_sq = to_sq
+                    pending_sacrifice_ok = True
+                    pending_sacrifice_accepted = False
+                    pending_sacrifice_offer_val = offered
+
+                drop_kind = classify_eval_drop(wp_before_move, wp_after_move)
+                if (not in_phase and drop_kind == "blunder"):
                     blunders += 1
 
+                cp_swing = abs(eval_after_user - eval_before_user)
                 if (
                     abs(wp_after_move - wp_before_move) >= WP_CRITICAL_DELTA
-                    and user_move_idx < len(user_times)
+                    and cp_swing >= WP_CRITICAL_CP
                 ):
-                    critical_times.append(user_times[user_move_idx])
+                    critical_positions += 1
+                    if user_move_idx < len(user_times):
+                        critical_times.append(user_times[user_move_idx])
 
                 if wp_after_move <= WP_DISADVANTAGE:
                     had_disadvantage = True
-
-            if cp is not None and non_king_count(board) <= ENDGAME_NON_KING_MAX:
-                if eg_user_wp(cp, user_is_white) >= WP_ENDGAME_ADVANTAGE:
-                    had_endgame_advantage = True
 
             if is_capture and captured and captured.piece_type in MINOR_MAJOR:
                 if full_move <= EARLY_MOVE_MAX:
@@ -575,10 +687,24 @@ def analyze_peer_game_metrics(
                 ):
                     trades_near_user_king += 1
         else:
-            if is_capture:
+            if (
+                pending_sacrifice_ok
+                and pending_sacrifice_sq is not None
+                and not pending_sacrifice_accepted
+            ):
+                if is_capture and move.to_square == pending_sacrifice_sq:
+                    pending_sacrifice_accepted = True
+                else:
+                    pending_sacrifice_sq = None
+                    pending_sacrifice_ok = False
+                    pending_sacrifice_accepted = False
+                    pending_sacrifice_offer_val = 0
+
+            if is_capture and not user_just_captured:
                 pending_recapture_sq = to_sq
             else:
                 pending_recapture_sq = None
+            user_just_captured = False
 
             if is_capture and captured and captured.piece_type in MINOR_MAJOR:
                 if full_move <= EARLY_MOVE_MAX:
@@ -612,16 +738,30 @@ def analyze_peer_game_metrics(
                 if eg_user_wp(cp, user_is_white) <= WP_DISADVANTAGE:
                     had_disadvantage = True
 
-            if cp is not None and non_king_count(board) <= ENDGAME_NON_KING_MAX:
-                if eg_user_wp(cp, user_is_white) >= WP_ENDGAME_ADVANTAGE:
-                    had_endgame_advantage = True
-
         cp_after_white = evals_white[-1] if evals_white else None
         wp_after_eg = (
             eg_user_wp(cp_after_white, user_is_white)
             if cp_after_white is not None
             else None
         )
+
+        if endgame_start_ply is None and non_pawn_piece_count(board) <= ENDGAME_NON_PAWN_MAX:
+            endgame_start_ply = ply_idx
+
+        if (
+            not had_endgame_advantage
+            and endgame_start_ply is not None
+            and ply_idx >= endgame_start_ply
+            and cp_after_white is not None
+        ):
+            user_cp = cp_after_white if user_is_white else -cp_after_white
+            wp = eg_user_wp(cp_after_white, user_is_white)
+            if (
+                wp >= WP_ENDGAME_ADVANTAGE_STICKY
+                or user_cp >= CP_ENDGAME_ADVANTAGE_STICKY
+            ):
+                had_endgame_advantage = True
+                endgame_advantage_start_ply = ply_idx
 
         if not opening_closed:
             in_phase = full_move <= phase_end
@@ -654,27 +794,38 @@ def analyze_peer_game_metrics(
             if (full_move > phase_end and castle_fullmove is not None) or full_move > 40:
                 opening_closed = True
 
-        if endgame_start_ply is None and non_pawn_piece_count(board) <= ENDGAME_NON_PAWN_MAX:
-            endgame_start_ply = ply_idx
-
         in_mg = in_middlegame_ply(ply_idx, phase_end, endgame_start_ply)
         if in_mg:
             mg_seen = True
-            mg_attacker.append(king_attackers_score(board, user_color))
-            shield = pawn_shield_integrity_pct(board, user_color)
-            if shield is not None:
-                mg_shield.append(shield)
-            mg_open.append(open_file_proximity_pct(board, user_color))
-            safe = safe_legal_moves_pct(board, user_color)
-            if safe is not None:
-                mg_safe.append(safe)
-            mg_outpost.append(float(outpost_control_count(board, user_color)))
-            mg_space.append(space_advantage_pct(board, user_color))
-            mg_islands.append(float(pawn_island_count(board, user_color)))
+            mg_ply = ply_idx - (phase_end * 2)
+            if mg_ply % HEURISTICS_MG_ATTACKERS_EVERY == 0:
+                mg_attacker.append(king_attackers_score(board, user_color))
+            if mg_ply % HEURISTICS_MG_SAMPLE_EVERY == 0:
+                shield = pawn_shield_integrity_pct(board, user_color)
+                if shield is not None:
+                    mg_shield.append(shield)
+                mg_open.append(
+                    open_file_proximity_pct(
+                        board, user_color, castled=castle_fullmove is not None
+                    )
+                )
+                mg_outpost.append(float(outpost_control_count(board, user_color)))
+            if mg_ply % HEURISTICS_MG_SAFE_EVERY == 0:
+                safe = safe_legal_moves_pct(board, user_color)
+                if safe is not None:
+                    mg_safe.append(safe)
+            if mg_ply % HEURISTICS_MG_SPACE_EVERY == 0:
+                mg_space.append(space_advantage_pct(board, user_color))
+            if mg_ply % HEURISTICS_MG_ISLANDS_EVERY == 0:
+                mg_islands.append(float(pawn_island_count(board, user_color)))
             if has_isolated_queen_pawn(board, user_color):
                 mg_had_iqp = True
             if has_doubled_pawns(board, user_color):
-                mg_had_doubled = True
+                mg_doubled_streak += 1
+                if mg_doubled_streak >= HEURISTICS_DOUBLED_PERSIST_PLIES:
+                    mg_had_doubled = True
+            else:
+                mg_doubled_streak = 0
             if has_backward_pawn(board, user_color):
                 mg_had_backward = True
 
@@ -682,8 +833,13 @@ def analyze_peer_game_metrics(
                 mg_accuracy.append(
                     move_accuracy_pct(wp_before_eg * 100.0, wp_after_eg * 100.0)
                 )
-                if wp_before_eg - wp_after_eg >= WP_BLUNDER_DROP:
+                kind = classify_eval_drop(wp_before_eg, wp_after_eg)
+                if kind == "blunder":
                     mg_blunders += 1
+                elif kind == "mistake":
+                    mg_mistakes += 1
+                elif kind == "inaccuracy":
+                    mg_inaccuracies += 1
 
             if is_user and mg_pending_opp:
                 mg_missed_chances += 1
@@ -693,10 +849,10 @@ def analyze_peer_game_metrics(
                     wp_before_eg is not None
                     and wp_after_eg is not None
                     and (
-                        wp_before_eg - wp_after_eg >= WP_BLUNDER_DROP
+                        is_mistake_or_worse(wp_before_eg, wp_after_eg)
                         or (
                             mg_pending_opp_wp is not None
-                            and mg_pending_opp_wp - wp_after_eg >= WP_BLUNDER_DROP
+                            and wp_drop_pp(mg_pending_opp_wp, wp_after_eg) >= 10
                         )
                     )
                 )
@@ -712,14 +868,14 @@ def analyze_peer_game_metrics(
                 found = (
                     wp_before_eg is not None
                     and wp_after_eg is not None
-                    and wp_before_eg - wp_after_eg >= WP_BLUNDER_DROP * 0.5
+                    and wp_drop_pp(wp_before_eg, wp_after_eg) >= 7.5
                 ) or is_capture
                 if found:
                     mg_allowed_found += 1
                 mg_pending_allowed = False
 
             if (not is_user) and wp_before_eg is not None and wp_after_eg is not None:
-                if wp_after_eg - wp_before_eg >= WP_BLUNDER_DROP:
+                if is_blunder_swing_up(wp_before_eg, wp_after_eg):
                     mg_pending_opp = True
                     mg_pending_opp_wp = wp_after_eg
                     mg_pending_opp_tactic = has_material_win_tactic(
@@ -728,7 +884,7 @@ def analyze_peer_game_metrics(
 
             if is_user and wp_before_eg is not None and wp_after_eg is not None:
                 if (
-                    wp_before_eg - wp_after_eg >= WP_BLUNDER_DROP
+                    classify_eval_drop(wp_before_eg, wp_after_eg) == "blunder"
                     and has_material_win_tactic(board, not user_color)
                 ):
                     mg_allowed_chances += 1
@@ -761,36 +917,111 @@ def analyze_peer_game_metrics(
                 else:
                     eg_theoretical_saved = True
             if is_user and wp_before_eg is not None and wp_after_eg is not None:
-                if wp_before_eg - wp_after_eg >= WP_BLUNDER_DROP:
+                kind = classify_eval_drop(wp_before_eg, wp_after_eg)
+                if kind == "blunder":
                     eg_blunders += 1
+                elif kind == "mistake":
+                    eg_mistakes += 1
+                elif kind == "inaccuracy":
+                    eg_inaccuracies += 1
             captured_type = captured.piece_type if captured else None
             moving_type = moving_piece.piece_type if moving_piece else None
-            if (
-                is_capture
-                and captured_type in EG_MINOR_MAJOR
-                and moving_type in EG_MINOR_MAJOR
-            ):
-                if eg_trade_pending is not None and ply_idx - eg_trade_pending <= 2:
-                    eg_piece_trades += 1
-                    tw_before = eg_pending_wp_before
-                    tw_after = wp_after_eg if wp_after_eg is not None else tw_before
-                    if tw_after > tw_before:
-                        eg_beneficial_trades += 1
-                    if tw_before >= WP_ENDGAME_ADVANTAGE:
-                        eg_winning_trades += 1
-                        if eg_pending_user:
-                            user_gave_more = eg_pending_user_val > eg_pending_cap_val
-                        else:
-                            user_gave_more = eg_pending_cap_val > eg_pending_user_val
-                        if user_gave_more and (tw_before - tw_after) < WP_BLUNDER_DROP:
-                            eg_simplification_trades += 1
-                    eg_trade_pending = None
-                else:
+            if is_capture and captured_type is not None:
+                cap_val = EG_PIECE_VALUE.get(captured_type, 0)
+                mover_val = EG_PIECE_VALUE.get(moving_type or 0, 0)
+                piece_cap = captured_type in EG_MINOR_MAJOR
+                user_gain = cap_val if is_user else -cap_val
+                if (
+                    eg_trade_pending is not None
+                    and ply_idx - eg_trade_pending <= EG_TRADE_WINDOW_PLIES
+                ):
+                    eg_pending_user_net += user_gain
+                    if piece_cap:
+                        completer_is_piece = moving_type in EG_MINOR_MAJOR
+                        major_involved = (
+                            cap_val >= 5
+                            or eg_pending_cap_val >= 5
+                            or eg_pending_user_val >= 5
+                        )
+                        if completer_is_piece or major_involved:
+                            eg_piece_trades += 1
+                            tw_before = eg_pending_wp_before
+                            tw_after = (
+                                wp_after_eg
+                                if wp_after_eg is not None
+                                else tw_before
+                            )
+                            tcp_before = eg_pending_cp_before
+                            tcp_after = (
+                                (
+                                    cp_after_white
+                                    if user_is_white
+                                    else -cp_after_white
+                                )
+                                if cp_after_white is not None
+                                else tcp_before
+                            )
+                            if tw_after > tw_before or tcp_after > tcp_before:
+                                eg_beneficial_trades += 1
+                            if eg_pending_user_net > 0:
+                                eg_winning_trades += 1
+                            if tw_before >= WP_ENDGAME_ADVANTAGE:
+                                if eg_pending_user:
+                                    user_gave_more = (
+                                        eg_pending_user_val > eg_pending_cap_val
+                                    )
+                                else:
+                                    user_gave_more = (
+                                        eg_pending_cap_val > eg_pending_user_val
+                                    )
+                                if (
+                                    user_gave_more
+                                    and (tw_before - tw_after) < WP_BLUNDER_DROP
+                                ):
+                                    eg_simplification_trades += 1
+                        eg_trade_pending = None
+                elif piece_cap:
+                    net = user_gain
+                    user_piece_val = mover_val if is_user else cap_val
+                    captured_val = cap_val if is_user else mover_val
+                    user_start = is_user
+                    if (
+                        last_capture is not None
+                        and last_capture["ply"] == ply_idx - 1
+                        and last_capture["to"] == to_sq
+                    ):
+                        last_was_user = last_capture["color"] == user_color
+                        last_cap_val = EG_PIECE_VALUE.get(
+                            last_capture["captured"], 0
+                        )
+                        if last_was_user and not is_user:
+                            net = last_cap_val - cap_val
+                            user_start = True
+                            user_piece_val = EG_PIECE_VALUE.get(
+                                last_capture["piece"], 0
+                            )
+                            captured_val = last_cap_val
+                        elif (not last_was_user) and is_user:
+                            net = cap_val - last_cap_val
+                            user_start = False
+                            user_piece_val = last_cap_val
+                            captured_val = cap_val
                     eg_trade_pending = ply_idx
-                    eg_pending_user = is_user
+                    eg_pending_user = user_start
                     eg_pending_wp_before = wp_before_eg or 0.0
-                    eg_pending_user_val = EG_PIECE_VALUE.get(moving_type or 0, 0)
-                    eg_pending_cap_val = EG_PIECE_VALUE.get(captured_type or 0, 0)
+                    eg_pending_cp_before = (
+                        (
+                            cp_before_white
+                            if user_is_white
+                            else -cp_before_white
+                        )
+                        if cp_before_white is not None
+                        else 0.0
+                    )
+                    eg_pending_user_net = net
+                    eg_pending_user_val = user_piece_val
+                    eg_pending_cap_val = captured_val
+                    eg_pending_piece_seen = True
             if cp_after_white is not None:
                 user_cp = cp_after_white if user_is_white else -cp_after_white
                 mate_now = user_cp >= MATE_CP_THRESHOLD
@@ -801,6 +1032,23 @@ def analyze_peer_game_metrics(
                 elif eg_in_mate and not mate_now:
                     eg_mate_clean = False
                     eg_in_mate = False
+
+        if is_capture and captured is not None:
+            last_capture = {
+                "ply": ply_idx,
+                "color": user_color if is_user else (not user_color),
+                "piece": moving_piece.piece_type if moving_piece else 0,
+                "captured": captured.piece_type,
+                "to": to_sq,
+            }
+        else:
+            last_capture = None
+
+    if pending_sacrifice_accepted:
+        sacrifice_moves += 1
+    pending_sacrifice_sq = None
+    pending_sacrifice_ok = False
+    pending_sacrifice_accepted = False
 
     user_evals = [cp if user_is_white else -cp for cp in evals_white]
 
@@ -869,6 +1117,7 @@ def analyze_peer_game_metrics(
         ),
         "uncastled": castle_fullmove is None,
         "opening_tempo_waste_rate_pct": tempo_rate,
+        "opening_pawn_moves": float(pawn_moves),
         "accuracy_moves": len(accuracy_samples),
         "phase_end_fullmove": float(opening_phase_end_fullmove(castle_fullmove)),
         "user_color": str(row.get("user_color") or "white"),
@@ -884,6 +1133,8 @@ def analyze_peer_game_metrics(
             "theoretical": {},
             "theoretical_saved": False,
             "blunders": 0,
+            "mistakes": 0,
+            "inaccuracies": 0,
             "king_centralization": None,
             "king_distance": None,
             "pawn_diff": None,
@@ -904,6 +1155,8 @@ def analyze_peer_game_metrics(
             "theoretical": eg_theoretical,
             "theoretical_saved": eg_theoretical_saved,
             "blunders": eg_blunders,
+            "mistakes": eg_mistakes,
+            "inaccuracies": eg_inaccuracies,
             "king_centralization": eg_mean(eg_center_scores, 2),
             "king_distance": eg_mean(eg_king_dists, 2),
             "pawn_diff": eg_mean(eg_pawn_diffs, 2),
@@ -955,7 +1208,8 @@ def analyze_peer_game_metrics(
             if critical_times
             else None
         ),
-        "critical_positions": len(critical_times),
+        "critical_positions": critical_positions,
+        "endgame_advantage_start_ply": endgame_advantage_start_ply,
         "had_disadvantage": had_disadvantage,
         "recovered_from_disadvantage": recovered,
         "blunders": blunders,
@@ -985,6 +1239,8 @@ def analyze_peer_game_metrics(
         had_backward=mg_had_backward,
         accuracy_samples=mg_accuracy,
         blunders=mg_blunders,
+        mistakes=mg_mistakes,
+        inaccuracies=mg_inaccuracies,
         missed_opp_chances=mg_missed_chances,
         missed_opps=mg_missed,
         missed_tactic_chances=mg_missed_tactic_chances,

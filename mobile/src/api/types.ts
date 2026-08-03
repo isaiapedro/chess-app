@@ -1,5 +1,5 @@
 export type Platform = "chesscom" | "lichess";
-export type Timeframe = "1 month" | "6 months" | "1 year";
+export type Timeframe = "1 month" | "6 months" | "1 year" | "all";
 export type Period = "all" | "year" | "month" | "week" | "day";
 
 export type RatingPoint = {

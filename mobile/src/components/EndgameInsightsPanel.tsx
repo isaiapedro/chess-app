@@ -44,7 +44,7 @@ const BLUNDER_METRIC: MetricDef = {
   unit: "/game",
   summary: "Average blunders per endgame.",
   detail:
-    "In the endgame phase (≤7 non-king non-pawn pieces), a blunder is a move that drops your win probability by 0.2 or more. Reported as the mean blunder count per game that reached an endgame.",
+    "In the endgame phase (≤7 non-king non-pawn pieces), a blunder is a move that drops win probability by more than 15pp. Reported as the mean blunder count per game that reached an endgame.",
   format: (v) => v.toFixed(1),
   scale: { kind: "benchmark", fallback: 2 },
 };
@@ -56,7 +56,7 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
     unit: "",
     summary: "How close your king sits to the center.",
     detail:
-      "On each endgame position we score max(0, 4 − Chebyshev distance) from your king to the nearest of d4/e4/d5/e5, then average across positions and games. Higher means a more central king.",
+      "Score max(0, 4 − Chebyshev distance) from your king to the nearest of d4/e4/d5/e5. Sampled every 3 endgame plies, then averaged. Higher means a more central king.",
     format: (v) => v.toFixed(2),
     scale: { kind: "fixed", max: 4 },
   },
@@ -66,7 +66,7 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
     unit: "",
     summary: "King moves to fight enemy pawns.",
     detail:
-      "Per endgame position: minimum Chebyshev king-moves to any enemy pawn, or to the promotion square of a clear passer. Lower means your king is closer to stopping enemy pawns.",
+      "Minimum Chebyshev king-moves to any enemy pawn, or to the promotion square of a clear passer. Sampled every 3 endgame plies with king centralization. Lower means your king is closer to stopping enemy pawns.",
     format: (v) => v.toFixed(2),
     scale: { kind: "benchmark", fallback: 4 },
   },
@@ -74,10 +74,10 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
     name: "Pawn Difference",
     key: "endgame_pawn_diff",
     unit: "",
-    summary: "Your pawn edge after the endgame starts.",
+    summary: "Net pawn captures for you after the endgame starts.",
     detail:
-      "Mean of (your pawns − opponent pawns) across endgame positions, then averaged per game.",
-    format: (v) => (v >= 0 ? `+${v.toFixed(2)}` : v.toFixed(2)),
+      "Starts at 0 when the endgame begins (≤7 non-pawn pieces). Each time you capture an enemy pawn: +1. Each time the opponent captures one of yours: −1. Promotions do not change the counter. Reported value is the final total for the game (not a mean of positions).",
+    format: (v) => (v >= 0 ? `+${v.toFixed(0)}` : v.toFixed(0)),
     scale: { kind: "benchmark", fallback: 2 },
   },
   {
@@ -86,7 +86,7 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
     unit: "%",
     summary: "Piece trades that raise winning chances.",
     detail:
-      "Among endgame piece trades (equal-ish exchanges completed within two plies), the share where your win probability increases across the trade.",
+      "Among endgame piece trades (one exchange = two pieces off; minor/major captures completed within three plies). Pawn may finish a trade only if a rook/queen is involved; minor-for-minor finished by a pawn does not count. Share where your win probability or eval improves across the trade.",
     format: (v) => v.toFixed(1),
     scale: { kind: "fixed", max: 100 },
   },
@@ -96,7 +96,7 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
     unit: "%",
     summary: "Trading down while already winning.",
     detail:
-      "Among endgame trades that start with win probability ≥ 0.7, the share where you give a higher-value piece for a lower-value one and the WP drop stays below the blunder threshold (0.2).",
+      "Among endgame trades that start with win probability ≥ 0.7, the share where you give a higher-value piece for a lower-value one and the WP drop stays below the blunder threshold (0.2). Separate from winning-material trades (net material gain including pawns).",
     format: (v) => v.toFixed(1),
     scale: { kind: "fixed", max: 100 },
   },

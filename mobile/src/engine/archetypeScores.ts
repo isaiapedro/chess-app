@@ -149,7 +149,7 @@ const FALLBACK_BASELINES: Record<string, { mean: number; std: number }> = {
   avg_eval_volatility_cp: { mean: 85.0, std: 22.5 },
   avg_disadvantage_time_s: { mean: 7.5, std: 2.8 },
   avg_critical_time_s: { mean: 11.2, std: 4.0 },
-  sacrifice_rate_pct: { mean: 15.0, std: 8.0 },
+  sacrifice_rate_pct: { mean: 1.0, std: 0.8 },
 };
 
 function clamp01(n: number): number {

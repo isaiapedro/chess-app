@@ -153,7 +153,7 @@ export function RecapScreen() {
     setRefreshing(true);
     setError(null);
     try {
-      await refreshAnalytics(true);
+      await refreshAnalytics(false);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load recap");
     } finally {

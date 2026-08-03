@@ -18,6 +18,7 @@ import {
   IBMPlexMono_500Medium,
   IBMPlexMono_700Bold,
 } from "@expo-google-fonts/ibm-plex-mono";
+import { AuthProvider } from "./src/context/AuthContext";
 import { FilterProvider } from "./src/context/FilterContext";
 import { AnalyticsProvider } from "./src/context/AnalyticsContext";
 import { ScanLogProvider } from "./src/context/ScanLogContext";
@@ -98,31 +99,33 @@ export default function App() {
   return (
     <GestureRoot style={styles.flex}>
       <SafeAreaProvider>
-        <FilterProvider>
-          <ScanLogProvider>
-            <AnalyticsProvider>
-            <TabSwipeProvider>
-              <InsightsNavProvider>
-                <StockfishProvider>
-                  {!DEBUG_DISABLE_BACKGROUND_JOBS ? <StudyPrefetch /> : null}
-                  <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
-                    <StatusBar barStyle="light-content" />
-                    <View style={styles.shell}>
-                      <FilterHeader />
-                      <View style={styles.navLayer}>
-                        <NavigationContainer theme={navTheme}>
-                          <TabNavigator />
-                        </NavigationContainer>
+        <AuthProvider>
+          <FilterProvider>
+            <ScanLogProvider>
+              <AnalyticsProvider>
+              <TabSwipeProvider>
+                <InsightsNavProvider>
+                  <StockfishProvider>
+                    {!DEBUG_DISABLE_BACKGROUND_JOBS ? <StudyPrefetch /> : null}
+                    <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
+                      <StatusBar barStyle="light-content" />
+                      <View style={styles.shell}>
+                        <FilterHeader />
+                        <View style={styles.navLayer}>
+                          <NavigationContainer theme={navTheme}>
+                            <TabNavigator />
+                          </NavigationContainer>
+                        </View>
+                        <DayHangSquare />
                       </View>
-                      <DayHangSquare />
-                    </View>
-                  </SafeAreaView>
-                </StockfishProvider>
-              </InsightsNavProvider>
-            </TabSwipeProvider>
-            </AnalyticsProvider>
-          </ScanLogProvider>
-        </FilterProvider>
+                    </SafeAreaView>
+                  </StockfishProvider>
+                </InsightsNavProvider>
+              </TabSwipeProvider>
+              </AnalyticsProvider>
+            </ScanLogProvider>
+          </FilterProvider>
+        </AuthProvider>
       </SafeAreaProvider>
     </GestureRoot>
   );
