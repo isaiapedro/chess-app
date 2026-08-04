@@ -76,6 +76,13 @@ async function loadStore(
   try {
     const raw = await AsyncStorage.getItem(storeKey(platform, username));
     if (!raw) return null;
+    await new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
     const data = JSON.parse(raw) as UserGamesStore;
     if (!data || !Array.isArray(data.games)) return null;
     return data;
@@ -266,6 +273,7 @@ function sinceForTimeframe(timeframe: Timeframe | string): {
   let days = 365;
   if (tf === "1 month") days = 30;
   else if (tf === "6 months") days = 180;
+  else if (tf === "1 year" || tf === "year") days = 365;
   const start = new Date(now);
   start.setDate(start.getDate() - days);
   start.setHours(0, 0, 0, 0);
@@ -892,7 +900,19 @@ export async function loadLocalGamesPage(
       has_more: false,
     };
   }
-  const fk = `${filters.platform}|${username.toLowerCase()}|${filters.timeframe}|${options?.force ? "force" : "soft"}`;
+  const fk = [
+    filters.platform,
+    username.toLowerCase(),
+    filters.timeframe,
+    filters.speed || "_",
+    filters.color || "_",
+    filters.result || "_",
+    filters.dateFrom || "_",
+    filters.dateTo || "_",
+    options?.force ? "force" : "soft",
+    String(limit),
+    String(offset),
+  ].join("|");
   return takeInflight(`local-ingest:${fk}`, async () => {
     const ingested = await ingestPlatformGames(
       username,
@@ -900,6 +920,13 @@ export async function loadLocalGamesPage(
       filters.timeframe,
       Boolean(options?.force)
     );
+    await new Promise<void>((resolve) => {
+      if (typeof requestAnimationFrame === "function") {
+        requestAnimationFrame(() => resolve());
+      } else {
+        setTimeout(resolve, 0);
+      }
+    });
     const filtered = filterNormalizedGames(ingested, filters).sort((a, b) =>
       String(b.created_at).localeCompare(String(a.created_at))
     );

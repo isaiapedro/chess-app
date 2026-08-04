@@ -953,6 +953,26 @@ export async function validateMoveLocal(
   }
 
   const canonUserUci = canonicalUci(fen, userUci);
+  const canonBestUci = bestUci ? canonicalUci(fen, bestUci) : null;
+
+  if (canonBestUci && canonUserUci === canonBestUci) {
+    const bestPv =
+      (knownBestPv && knownBestPv.length ? knownBestPv : null) ||
+      (canonBestUci ? [canonBestUci] : []);
+    return {
+      legal: true,
+      verdict: "best",
+      user_san: userSan,
+      centipawn_loss: 0,
+      user_eval_cp: null,
+      best_eval_cp: null,
+      best_continuation_san: pvToSanLine(fen, bestPv, CONTINUATION_PLIES),
+      best_pv: bestPv,
+      best_uci: canonBestUci,
+      correct: true,
+      accepted_as_top_line: false,
+    };
+  }
 
   try {
     const multi = await evaluate(fen, REFINE_DEPTH, 5, REFINE_MOVETIME);

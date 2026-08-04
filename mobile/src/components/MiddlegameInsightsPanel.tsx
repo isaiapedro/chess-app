@@ -17,8 +17,9 @@ import {
   type BaselineMetricHit,
   type BaselineStore,
 } from "../data/baselines";
+import { Ionicons } from "@expo/vector-icons";
 import { EdgeCard, SectionLabel } from "./ui";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
   | { kind: "fixed"; max: number }
@@ -320,7 +321,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Text style={styles.helpClose}>✕</Text>
+              <Ionicons name="close" size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -397,7 +398,11 @@ function MetricBanner({
             accessibilityLabel={`About ${name}`}
             style={styles.helpButton}
           >
-            <Text style={styles.helpButtonText}>?</Text>
+            <Ionicons
+                      name="information-circle-outline"
+                      size={20}
+                      color={colors.textDim}
+                    />
           </Pressable>
         ) : null}
       </View>
@@ -556,123 +561,153 @@ export function MiddlegameInsightsPanel() {
 }
 
 const styles = StyleSheet.create({
-  section: { marginBottom: spacing.md },
+  hint: {
+    ...type.bodySmall,
+    color: colors.textDim,
+    marginBottom: spacing.md,
+  },
+  section: { marginBottom: spacing.xl },
+  familyBlock: {
+    marginBottom: spacing.lg,
+  },
+  familyHeader: {
+    marginBottom: spacing.sm,
+  },
+  familyName: {
+    ...type.heading,
+    color: colors.text,
+    marginBottom: 2,
+  },
+  familyMeta: {
+    ...type.caption,
+    color: colors.textDim,
+    marginBottom: spacing.sm,
+  },
   card: { marginBottom: spacing.sm },
-  cardRow: { flexDirection: "row", alignItems: "flex-start" },
-  cardBody: { flex: 1 },
+  cardRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  cardBody: {
+    flex: 1,
+    flexShrink: 1,
+  },
   name: {
-    color: colors.cream,
-    fontFamily: font.sans,
-    fontSize: 14,
+    ...type.label,
+    color: colors.textMuted,
     marginBottom: 4,
   },
+  helpButton: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
   value: {
-    color: colors.cream,
-    fontFamily: font.display,
-    fontSize: 28,
+    ...type.numberSm,
+    color: colors.text,
+    marginBottom: 2,
   },
   unit: {
-    color: withAlpha(colors.cream, 0.55),
-    fontFamily: font.sans,
-    fontSize: 14,
+    ...type.caption,
+    color: colors.textMuted,
   },
   caption: {
-    color: withAlpha(colors.cream, 0.55),
-    fontFamily: font.sans,
-    fontSize: 11,
-    marginTop: 4,
-    marginBottom: 6,
+    ...type.caption,
+    color: colors.textDim,
+    marginBottom: 4,
   },
-  bulletWrap: { marginTop: 8 },
+  bulletWrap: {
+    marginTop: 10,
+    paddingVertical: 4,
+  },
   bulletTrack: {
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: withAlpha(colors.cream, 0.12),
-    overflow: "hidden",
+    height: 6,
+    borderRadius: radius.pill,
+    backgroundColor: withAlpha("#ffffff", 0.08),
     position: "relative",
+    justifyContent: "center",
   },
   bulletFill: {
     position: "absolute",
-    left: 0,
     top: 0,
     bottom: 0,
+    left: 0,
+    borderRadius: radius.pill,
     backgroundColor: result.win,
+  },
+  stackWin: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    borderRadius: radius.pill,
+    backgroundColor: result.win,
+  },
+  stackDraw: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    borderRadius: radius.pill,
+    backgroundColor: result.draw,
+  },
+  bulletOverflow: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    right: 0,
+    width: 3,
+    borderRadius: radius.pill,
+    backgroundColor: colors.text,
   },
   bulletPeer: {
     position: "absolute",
-    top: -2,
+    top: -3,
+    bottom: -3,
     width: 2,
-    height: 12,
     marginLeft: -1,
-    backgroundColor: colors.cream,
-  },
-  helpButton: {
-    width: 28,
-    height: 28,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: withAlpha(colors.cream, 0.25),
-    alignItems: "center",
-    justifyContent: "center",
-    marginLeft: spacing.sm,
-  },
-  helpButtonText: {
-    color: colors.cream,
-    fontFamily: font.sans,
-    fontSize: 14,
+    borderRadius: radius.pill,
+    backgroundColor: colors.rim,
   },
   helpBackdrop: {
     flex: 1,
-    backgroundColor: withAlpha("#000", 0.55),
-    justifyContent: "center",
-    padding: spacing.lg,
+    backgroundColor: withAlpha("#000000", 0.68),
+    justifyContent: "flex-end",
   },
   helpCard: {
-    backgroundColor: colors.bg,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: withAlpha(colors.cream, 0.18),
-    padding: spacing.md,
-    maxHeight: "70%",
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: radius.xl,
+    borderTopRightRadius: radius.xl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
+    maxHeight: "78%",
   },
   helpHeader: {
     flexDirection: "row",
+    alignItems: "flex-start",
     justifyContent: "space-between",
-    alignItems: "center",
-    marginBottom: spacing.sm,
-  },
-  helpTitle: {
-    color: colors.cream,
-    fontFamily: font.display,
-    fontSize: 20,
-    flex: 1,
-    paddingRight: spacing.sm,
-  },
-  helpClose: { color: colors.cream, fontSize: 18 },
-  helpScroll: { maxHeight: 360 },
-  helpSummary: {
-    color: colors.cream,
-    fontFamily: font.sans,
-    fontSize: 14,
+    gap: spacing.sm,
     marginBottom: spacing.md,
   },
+  helpTitle: {
+    ...type.title,
+    color: colors.text,
+    flex: 1,
+  },
+  helpScroll: { flexGrow: 0, maxHeight: 420 },
+  helpSummary: {
+    ...type.body,
+    color: colors.textSoft,
+    marginBottom: spacing.lg,
+  },
   helpDetailLabel: {
-    color: withAlpha(colors.cream, 0.55),
-    fontFamily: font.sans,
-    fontSize: 12,
-    marginBottom: 6,
-    textTransform: "uppercase",
+    ...type.label,
+    color: colors.text,
+    marginBottom: spacing.xs,
   },
   helpDetail: {
-    color: withAlpha(colors.cream, 0.85),
-    fontFamily: font.sans,
-    fontSize: 13,
+    ...type.bodySmall,
+    color: colors.textDim,
     lineHeight: 20,
-  },
-  hint: {
-    color: withAlpha(colors.cream, 0.6),
-    fontFamily: font.sans,
-    fontSize: 13,
-    marginBottom: spacing.sm,
   },
 });

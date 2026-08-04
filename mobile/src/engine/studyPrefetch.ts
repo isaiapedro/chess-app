@@ -10,17 +10,9 @@ import {
   type StudyGame,
 } from "./analyzeMistakes";
 import {
-  averageUserRating,
-  filterGamesByOpening,
-  refineRecentOpeningCandidates,
-  topOpeningsForColor,
-  type OpeningMoment,
-} from "./analyzeOpenings";
-import {
   ENGINE_LABEL,
   GLOBAL_FIRST_SCAN_MAX_GAMES,
   TARGET_MISTAKE_MOMENTS,
-  TARGET_OPENING_MOMENTS,
 } from "./analysisConfig";
 import { consumeCandidates } from "./candidateBucket";
 import { DEBUG_DISABLE_BACKGROUND_JOBS } from "./debugFlags";
@@ -34,16 +26,8 @@ import {
   type GlobalAnalysisState,
 } from "./globalAnalysis";
 import { writeCache } from "../storage/cache";
-import {
-  readMistakesCacheForPeriod,
-  readOpeningCacheForPeriod,
-} from "../storage/periodCacheReuse";
-import {
-  studyMistakesCacheKey,
-  studyOpeningCacheKey,
-} from "../storage/studyCacheKeys";
-
-const PREFETCH_TOP_OPENINGS = 3;
+import { readMistakesCacheForPeriod } from "../storage/periodCacheReuse";
+import { studyMistakesCacheKey } from "../storage/studyCacheKeys";
 
 let activePrefetchSignal: { cancelled: boolean } | null = null;
 let latestGlobalState: GlobalAnalysisState | null = null;
@@ -97,37 +81,12 @@ type MistakesCachePayload = {
   baselineAvailable?: boolean;
 };
 
-type OpeningCachePayload = {
-  moments: OpeningMoment[];
-  pendingCandidates: OpeningMoment[];
-  deferredCandidates?: OpeningMoment[];
-  scannedGameIds: string[];
-  remaining: number;
-  thresholdPass?: "strict" | "baseline";
-  baselineAvailable?: boolean;
-};
-
 async function hasMistakesCache(
   filters: QueryFilters,
   periodGames: StudyGame[]
 ): Promise<boolean> {
   const cached = await readMistakesCacheForPeriod(
     filters,
-    periodGames.map((game) => String(game.id))
-  );
-  return Boolean(cached?.moments?.length);
-}
-
-async function hasOpeningCache(
-  filters: QueryFilters,
-  color: "white" | "black",
-  openingKey: string,
-  periodGames: StudyGame[]
-): Promise<boolean> {
-  const cached = await readOpeningCacheForPeriod(
-    filters,
-    color,
-    openingKey,
     periodGames.map((game) => String(game.id))
   );
   return Boolean(cached?.moments?.length);
@@ -202,26 +161,6 @@ export async function prefetchStudyContent(options: {
 
   const mastersPgn = async (gameId: string) => fetchMastersPgn(gameId);
   let mistakesDone = await hasMistakesCache(filters, games);
-  const openingDone = new Set<string>();
-
-  const openingPlans: Array<{
-    color: "white" | "black";
-    opening: ReturnType<typeof topOpeningsForColor>[number];
-    games: StudyGame[];
-  }> = [];
-  for (const color of ["white", "black"] as const) {
-    const top = topOpeningsForColor(games, color, PREFETCH_TOP_OPENINGS);
-    for (const opening of top) {
-      if (await hasOpeningCache(filters, color, opening.key, games)) {
-        openingDone.add(`${color}:${opening.key}`);
-        continue;
-      }
-      const filtered = filterGamesByOpening(games, color, opening);
-      if (filtered.length) {
-        openingPlans.push({ color, opening, games: filtered });
-      }
-    }
-  }
 
   try {
     const globalState = await runGlobalPeriodAnalysis({
@@ -270,60 +209,6 @@ export async function prefetchStudyContent(options: {
         } satisfies MistakesCachePayload);
         mistakesDone = true;
         return true;
-      },
-      onEarlyOpeningsReady: async (_candidates, state) => {
-        if (signal.cancelled || !openingPlans.length) return false;
-        let anyAccepted = false;
-        for (const plan of openingPlans) {
-          const planKey = `${plan.color}:${plan.opening.key}`;
-          if (openingDone.has(planKey) || signal.cancelled) continue;
-          const periodIds = new Set(plan.games.map((g) => String(g.id)));
-          const scoped = state.openingCandidates.filter((item) =>
-            periodIds.has(String(item.game_id))
-          );
-          const overall = state.openingCandidates;
-          if (!scoped.length && !overall.length) continue;
-          const batch = await refineRecentOpeningCandidates({
-            candidates: scoped.length ? scoped : overall,
-            games: scoped.length ? plan.games : games,
-            fallbackCandidates: scoped.length ? overall : undefined,
-            fallbackGames: scoped.length ? games : undefined,
-            color: plan.color,
-            userRating: averageUserRating(plan.games),
-            evaluate,
-            signal,
-            limit: TARGET_OPENING_MOMENTS,
-            lookupEval: createEvalLookup(state),
-            fetchMastersPgn: mastersPgn,
-            fetchExplorer: explorer,
-          });
-          await consumeCandidates(filters, "opening", batch.moments);
-          if (signal.cancelled || !batch.moments.length) continue;
-          openingDone.add(planKey);
-          anyAccepted = true;
-          const reservoir = await periodReservoirStatus(
-            filters,
-            games,
-            "opening",
-            {
-              periodGameIds: [...periodIds],
-              pendingCount: batch.pendingCandidates.length,
-            }
-          );
-          await writeCache(
-            studyOpeningCacheKey(filters, plan.color, plan.opening.key),
-            {
-              moments: batch.moments,
-              pendingCandidates: batch.pendingCandidates,
-              deferredCandidates: batch.deferredCandidates,
-              scannedGameIds: batch.scannedGameIds,
-              remaining: reservoir.remaining,
-              thresholdPass: batch.thresholdPass,
-              baselineAvailable: batch.baselineAvailable,
-            } satisfies OpeningCachePayload
-          );
-        }
-        return anyAccepted;
       },
     });
     if (signal.cancelled) return;

@@ -5,7 +5,7 @@ import {
   TARGET_MISTAKE_MOMENTS,
   TARGET_OPENING_MOMENTS,
 } from "../engine/analysisConfig";
-import { colors, font } from "../theme";
+import { colors, font, spacing, type } from "../theme";
 import { AnalysisLoadingBars } from "./LoadingSkeletons";
 
 const WAITING_LINES = [
@@ -94,11 +94,16 @@ export function StudyAnalyzeStatus({
 }
 
 const styles = StyleSheet.create({
-  wrap: { alignItems: "center", gap: 8, paddingVertical: 8, width: "100%" },
+  wrap: {
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingVertical: spacing.sm,
+    width: "100%",
+  },
   phrase: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 14,
     textAlign: "center",
   },
 });

@@ -9,7 +9,7 @@ import {
 } from "react-native";
 import { useFilters } from "../context/FilterContext";
 import { useTabSwipe } from "../context/TabSwipeContext";
-import { colors, font, spacing } from "../theme";
+import { colors, font, radius, spacing } from "../theme";
 
 const HANG_SIZE = 52;
 const OVERLAP = 16;
@@ -96,13 +96,13 @@ const styles = StyleSheet.create({
   },
   hangSquare: {
     width: HANG_SIZE,
-    borderWidth: 1,
-    borderColor: "#1a1a1a",
-    backgroundColor: colors.cream,
+    borderRadius: radius.sm,
+    overflow: "hidden",
+    backgroundColor: colors.surfaceRaised,
     shadowColor: "#000",
-    shadowOpacity: 0.35,
-    shadowRadius: 4,
-    shadowOffset: { width: 1, height: 3 },
+    shadowOpacity: 0.4,
+    shadowRadius: 10,
+    shadowOffset: { width: 0, height: 4 },
     elevation: 101,
   },
   hangHeader: {
@@ -113,20 +113,20 @@ const styles = StyleSheet.create({
   },
   hangMonth: {
     color: colors.text,
-    fontFamily: font.monoBold,
+    fontFamily: font.sansMedium,
     fontSize: 9,
-    letterSpacing: 1,
+    letterSpacing: 0.6,
   },
   hangBody: {
     height: 34,
     alignItems: "center",
     justifyContent: "center",
-    backgroundColor: colors.cream,
+    backgroundColor: colors.surfaceRaised,
   },
   hangDay: {
-    color: "#111111",
-    fontFamily: font.display,
-    fontSize: 22,
+    color: colors.text,
+    fontFamily: font.sansBold,
+    fontSize: 20,
     lineHeight: 24,
   },
 });

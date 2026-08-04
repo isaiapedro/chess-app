@@ -29,8 +29,9 @@ import {
   ratingBand,
   type BaselineMetricHit,
 } from "../data/baselines";
+import { Ionicons } from "@expo/vector-icons";
 import { EdgeCard, SectionLabel } from "./ui";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 const EVAL_DEPENDENT_METRICS = new Set([
   "Time When Losing",
@@ -262,7 +263,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Text style={styles.helpClose}>✕</Text>
+              <Ionicons name="close" size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -914,9 +915,7 @@ export function StyleOfPlayPanel() {
       />
       {topArchetype ? (
         <View style={styles.archetypeHero}>
-          <Text style={styles.archetypeHeroLabel}>
-            Your Personality Type is
-          </Text>
+          <Text style={styles.archetypeHeroLabel}>Your personality type</Text>
           <View style={styles.archetypeTitleRow}>
             <Text style={styles.archetypeName}>{topArchetype.name}</Text>
             <Pressable
@@ -926,7 +925,11 @@ export function StyleOfPlayPanel() {
               accessibilityLabel="About personality type"
               style={styles.helpButton}
             >
-              <Text style={styles.helpButtonText}>?</Text>
+              <Ionicons
+                name="information-circle-outline"
+                size={22}
+                color={colors.textDim}
+              />
             </Pressable>
           </View>
           <Text style={styles.archetypeDesc}>
@@ -987,7 +990,11 @@ export function StyleOfPlayPanel() {
                     accessibilityLabel={`About ${metric.name}`}
                     style={styles.helpButton}
                   >
-                    <Text style={styles.helpButtonText}>?</Text>
+                    <Ionicons
+                      name="information-circle-outline"
+                      size={20}
+                      color={colors.textDim}
+                    />
                   </Pressable>
                 </View>
               </EdgeCard>
@@ -1001,13 +1008,11 @@ export function StyleOfPlayPanel() {
 
 const styles = StyleSheet.create({
   hint: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 13,
-    lineHeight: 18,
     marginBottom: spacing.md,
   },
-  section: { marginBottom: spacing.md },
+  section: { marginBottom: spacing.xl },
   card: { marginBottom: spacing.sm },
   cardRow: {
     flexDirection: "row",
@@ -1019,15 +1024,12 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
   archetypeHero: {
-    marginBottom: spacing.md,
+    marginBottom: spacing.xl,
   },
   archetypeHeroLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
-    marginBottom: 6,
+    ...type.label,
+    color: colors.textMuted,
+    marginBottom: 4,
   },
   archetypeTitleRow: {
     flexDirection: "row",
@@ -1037,58 +1039,40 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   archetypeName: {
+    ...type.title,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 28,
     flex: 1,
     flexShrink: 1,
   },
   archetypeDesc: {
-    color: colors.textSoft,
-    fontFamily: font.sans,
-    fontSize: 14,
-    lineHeight: 21,
+    ...type.body,
+    color: colors.textMuted,
   },
   name: {
-    color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    lineHeight: 21,
-    marginBottom: 8,
+    ...type.label,
+    color: colors.textMuted,
+    marginBottom: 4,
   },
   helpButton: {
-    width: 33,
-    height: 33,
-    borderRadius: 17,
-    borderWidth: 1,
-    borderColor: withAlpha(colors.cream, 0.75),
-    backgroundColor: withAlpha(colors.cream, 0.22),
     alignItems: "center",
     justifyContent: "center",
   },
-  helpButtonText: {
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 16,
-    lineHeight: 18,
-  },
   value: {
+    ...type.numberSm,
     color: colors.text,
-    fontFamily: font.displayLight,
-    fontSize: 26,
     marginBottom: 2,
   },
   unit: {
+    ...type.caption,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 13,
   },
   bulletWrap: {
     marginTop: 10,
     paddingVertical: 4,
   },
   bulletTrack: {
-    height: 8,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: withAlpha("#ffffff", 0.08),
     position: "relative",
     justifyContent: "center",
@@ -1098,6 +1082,7 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
     left: 0,
+    borderRadius: radius.pill,
     backgroundColor: result.win,
   },
   bulletOverflow: {
@@ -1106,15 +1091,17 @@ const styles = StyleSheet.create({
     bottom: 0,
     right: 0,
     width: 3,
-    backgroundColor: colors.cream,
+    borderRadius: radius.pill,
+    backgroundColor: colors.text,
   },
   bulletPeer: {
     position: "absolute",
-    top: -4,
-    bottom: -4,
+    top: -3,
+    bottom: -3,
     width: 2,
     marginLeft: -1,
-    backgroundColor: colors.cream,
+    borderRadius: radius.pill,
+    backgroundColor: colors.rim,
   },
   bulletZero: {
     position: "absolute",
@@ -1122,19 +1109,20 @@ const styles = StyleSheet.create({
     bottom: 0,
     width: 1,
     marginLeft: -0.5,
-    backgroundColor: withAlpha("#ffffff", 0.28),
+    backgroundColor: withAlpha("#ffffff", 0.24),
   },
   helpBackdrop: {
     flex: 1,
-    backgroundColor: withAlpha("#000000", 0.72),
-    justifyContent: "center",
-    padding: spacing.lg,
+    backgroundColor: withAlpha("#000000", 0.68),
+    justifyContent: "flex-end",
   },
   helpCard: {
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.md,
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: radius.xl,
+    borderTopRightRadius: radius.xl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
     maxHeight: "78%",
   },
   helpHeader: {
@@ -1145,39 +1133,26 @@ const styles = StyleSheet.create({
     marginBottom: spacing.md,
   },
   helpTitle: {
+    ...type.title,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 22,
     flex: 1,
-  },
-  helpClose: {
-    color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 16,
-    paddingTop: 2,
   },
   helpScroll: {
     flexGrow: 0,
   },
   helpSummary: {
+    ...type.body,
     color: colors.textSoft,
-    fontFamily: font.sans,
-    fontSize: 15,
-    lineHeight: 22,
-    marginBottom: spacing.md,
+    marginBottom: spacing.lg,
   },
   helpDetailLabel: {
-    color: colors.cream,
-    fontFamily: font.monoMedium,
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
-    marginBottom: spacing.sm,
+    ...type.label,
+    color: colors.text,
+    marginBottom: spacing.xs,
   },
   helpDetail: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 13,
     lineHeight: 20,
   },
 });

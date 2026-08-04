@@ -12,11 +12,7 @@ import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
 import { selectFactors } from "../api/selectors";
 import type { FactorItem, Period } from "../api/types";
-import {
-  AnalyticsScanBanner,
-  EvalPendingWarning,
-  useAnalyticsScanReady,
-} from "../components/AnalyticsScanBanner";
+import { EvalPendingWarning } from "../components/AnalyticsScanBanner";
 import {
   InsightsSkeleton,
   PageLoadingTransition,
@@ -25,14 +21,14 @@ import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui"
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
 import { useInsightsNav } from "../context/InsightsNavContext";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 import { agentLog } from "../debug/agentLog";
 import { CatalogScreen } from "./CatalogScreen";
 
 const FIXED_LOADER_MS = 2000;
 
 function usesFixedLoader(period: Period): boolean {
-  return period === "day" || period === "week" || period === "month";
+  return period === "month";
 }
 
 export function InsightsScreen() {
@@ -42,10 +38,10 @@ export function InsightsScreen() {
     recap,
     gamesLoading,
     sessionKey,
+    metricsReady,
     refreshAnalytics,
     requestVaultMetrics,
   } = useAnalytics();
-  const metricsReady = useAnalyticsScanReady();
   const [error, setError] = useState<string | null>(null);
   const [minLoaderDone, setMinLoaderDone] = useState(!usesFixedLoader(period));
   const [refreshing, setRefreshing] = useState(false);
@@ -72,6 +68,7 @@ export function InsightsScreen() {
   }, [showCatalog, setDepth, registerPopHandler]);
 
   const openCatalog = useCallback(() => {
+    if (!metricsReady) return;
     Animated.timing(insightsOpacity, {
       toValue: 0,
       duration: 160,
@@ -81,7 +78,7 @@ export function InsightsScreen() {
       if (!finished) return;
       setShowCatalog(true);
     });
-  }, [insightsOpacity]);
+  }, [insightsOpacity, metricsReady]);
 
   const closeCatalog = useCallback(() => {
     setShowCatalog(false);
@@ -116,21 +113,18 @@ export function InsightsScreen() {
     }
   }, [refreshAnalytics]);
 
-  const loading =
-    metricsReady && ((gamesLoading && !data) || (!data && !minLoaderDone));
-  const showPieceLoader = loading && usesFixedLoader(period);
-  const showSkeleton = loading && !data && !usesFixedLoader(period);
-  const contentKey = !metricsReady
-    ? `metrics:${period}:${refreshToken}`
-    : showPieceLoader
-      ? `loader:${period}:${refreshToken}`
-      : showSkeleton
-        ? `skeleton:${period}`
-        : error && !data
-          ? "error"
-          : data
-            ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
-            : "empty";
+  const showPieceLoader =
+    usesFixedLoader(period) && (!minLoaderDone || !data);
+  const showSkeleton = !usesFixedLoader(period) && !data;
+  const contentKey = showPieceLoader
+    ? `loader:${period}:${refreshToken}`
+    : showSkeleton
+      ? `skeleton:${period}:${refreshToken}`
+      : error && !data
+        ? "error"
+        : data
+          ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
+          : "empty";
 
   const factors = data ? selectFactors(data) : null;
   const results = recap?.results || {
@@ -149,33 +143,19 @@ export function InsightsScreen() {
       hasData: !!data,
       gamesLoading,
       showPieceLoader,
-      contentBlocked: !metricsReady,
+      showSkeleton,
     });
     // #endregion
-  }, [metricsReady, data, gamesLoading, showPieceLoader]);
+  }, [metricsReady, data, gamesLoading, showPieceLoader, showSkeleton]);
 
   return (
     <View style={styles.stack}>
       <EvalPendingWarning />
       <Animated.View style={[styles.insightsLayer, { opacity: insightsOpacity }]}>
-      {!metricsReady ? (
-        <ScrollView
-          style={styles.scroll}
-          contentContainerStyle={styles.content}
-        >
-          <View style={styles.hero}>
-            <Eyebrow>Performance Analysis</Eyebrow>
-            <DisplayTitle size={34}>
-              What Moves{"\n"}the Needle
-            </DisplayTitle>
-          </View>
-          <AnalyticsScanBanner />
-        </ScrollView>
-      ) : (
       <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
         {showSkeleton ? (
           <InsightsSkeleton />
-        ) : error && !data ? (
+        ) : showPieceLoader ? null : error && !data ? (
           <View style={styles.center}>
             <Text style={styles.error}>{error}</Text>
           </View>
@@ -195,9 +175,9 @@ export function InsightsScreen() {
             }
           >
             <View style={styles.hero}>
-              <Eyebrow>Performance Analysis</Eyebrow>
+              <Eyebrow>Performance analysis</Eyebrow>
               <DisplayTitle size={34}>
-                What Moves{"\n"}the Needle
+                What moves{"\n"}the needle
               </DisplayTitle>
             </View>
 
@@ -249,7 +229,7 @@ export function InsightsScreen() {
             </EdgeCard>
 
             <View style={styles.pad}>
-              <GroupHeading label="Driving Your Wins" accent={result.win} />
+              <GroupHeading label="Driving your wins" accent={result.win} />
               {factors.driving.length ? (
                 factors.driving.map((item) => (
                   <FactorCard
@@ -267,7 +247,7 @@ export function InsightsScreen() {
             </View>
 
             <View style={styles.pad}>
-              <GroupHeading label="Costing You Points" accent={result.loss} />
+              <GroupHeading label="Costing you points" accent={result.loss} />
               {factors.costing.length ? (
                 factors.costing.map((item) => (
                   <FactorCard
@@ -286,14 +266,13 @@ export function InsightsScreen() {
 
             <View style={[styles.pad, { marginTop: spacing.md }]}>
               <BrutalButton
-                label="Explore All Metrics →"
+                label="Explore all metrics"
                 onPress={openCatalog}
               />
             </View>
           </ScrollView>
         ) : null}
       </PageLoadingTransition>
-      )}
       </Animated.View>
 
       {showCatalog && data && metricsReady ? (
@@ -348,9 +327,8 @@ function WinRateDial({ value }: { value: number }) {
 function GroupHeading({ label, accent }: { label: string; accent: string }) {
   return (
     <View style={styles.groupHead}>
-      <View style={[styles.dot, { backgroundColor: accent }]} />
-      <Text style={[styles.groupLabel, { color: accent }]}>{label}</Text>
-      <View style={styles.rule} />
+      <Text style={styles.groupLabel}>{label}</Text>
+      <View style={[styles.groupUnderline, { backgroundColor: accent }]} />
     </View>
   );
 }
@@ -369,23 +347,20 @@ function FactorCard({
   const baselinePct = Math.max(0, Math.min(100, baseline));
 
   return (
-    <EdgeCard style={{ ...styles.factorCard, borderLeftColor: accent, borderLeftWidth: 3 }}>
+    <EdgeCard style={styles.factorCard}>
       <Text style={styles.factorName}>{item.condition}</Text>
       <View style={styles.factorRow}>
         <Text style={styles.factorValue}>{item.win_rate}%</Text>
         <Text style={[styles.factorDelta, { color: accent }]}>
           {item.diff > 0 ? "+" : ""}
-          {item.diff}%
+          {item.diff}% vs baseline
         </Text>
       </View>
-      <Text style={styles.factorMeta}>baseline {baseline}%</Text>
       <View style={styles.barTrack}>
-        <View style={[styles.barFill, { width: `${widthPct}%`, backgroundColor: accent }]} />
+        <View
+          style={[styles.barFill, { width: `${widthPct}%`, backgroundColor: accent }]}
+        />
         <View style={[styles.baselineMark, { left: `${baselinePct}%` }]} />
-      </View>
-      <View style={styles.barLabels}>
-        <Text style={styles.barLabel}>You</Text>
-        <Text style={styles.barLabel}>Your baseline</Text>
       </View>
     </EdgeCard>
   );
@@ -407,18 +382,15 @@ const styles = StyleSheet.create({
     backgroundColor: colors.bg,
     padding: spacing.lg,
   },
-  error: { color: colors.red, fontFamily: font.monoBold, textAlign: "center" },
+  error: { ...type.subheading, color: colors.red, textAlign: "center" },
   hero: { padding: spacing.md, paddingTop: spacing.lg },
-  summaryCard: { marginHorizontal: spacing.md, marginBottom: spacing.md },
+  summaryCard: { marginHorizontal: spacing.md, marginBottom: spacing.lg },
   summaryRow: { flexDirection: "row", alignItems: "center" },
-  wdlRow: { flexDirection: "row", gap: 14, marginBottom: 6 },
-  wdlValue: { fontFamily: font.display, fontSize: 20 },
+  wdlRow: { flexDirection: "row", gap: spacing.lg, marginBottom: 6 },
+  wdlValue: { ...type.numberSm },
   wdlLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
+    ...type.caption,
+    color: colors.textMuted,
   },
   dialCenter: {
     ...StyleSheet.absoluteFillObject,
@@ -426,79 +398,59 @@ const styles = StyleSheet.create({
     justifyContent: "center",
   },
   dialValue: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 15,
   },
-  pad: { paddingHorizontal: spacing.md, marginTop: spacing.sm },
+  pad: { paddingHorizontal: spacing.md, marginTop: spacing.lg },
   groupHead: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
-  },
-  dot: { width: 8, height: 8 },
-  groupLabel: {
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-  },
-  rule: { flex: 1, height: 1, backgroundColor: colors.border },
-  empty: {
-    color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 12,
+    alignItems: "flex-start",
+    gap: 6,
     marginBottom: spacing.md,
   },
-  factorCard: { marginBottom: spacing.sm },
-  factorName: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1.4,
-    textTransform: "uppercase",
-    marginBottom: 6,
-  },
-  factorRow: { flexDirection: "row", alignItems: "baseline", gap: 8 },
-  factorValue: {
+  groupLabel: {
+    ...type.heading,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 28,
+  },
+  groupUnderline: {
+    height: 2,
+    width: 28,
+    borderRadius: radius.pill,
+  },
+  empty: {
+    ...type.bodySmall,
+    color: colors.textDim,
+    marginBottom: spacing.md,
+  },
+  factorCard: { marginBottom: spacing.sm, gap: 8 },
+  factorName: {
+    ...type.subheading,
+    color: colors.textSoft,
+  },
+  factorRow: { flexDirection: "row", alignItems: "baseline", gap: spacing.sm },
+  factorValue: {
+    ...type.numberMd,
+    color: colors.text,
   },
   factorDelta: {
-    fontFamily: font.monoBold,
-    fontSize: 12,
-  },
-  factorMeta: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
-    marginTop: 2,
-    marginBottom: 10,
+    ...type.caption,
+    fontFamily: font.sansMedium,
   },
   barTrack: {
-    height: 4,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: withAlpha("#ffffff", 0.08),
     position: "relative",
+    marginTop: 2,
   },
-  barFill: { height: 4 },
+  barFill: { height: 6, borderRadius: radius.pill },
   baselineMark: {
     position: "absolute",
-    top: -1,
+    top: -2,
     width: 2,
-    height: 6,
+    height: 10,
+    borderRadius: radius.pill,
     backgroundColor: colors.rim,
     marginLeft: -1,
-  },
-  barLabels: {
-    flexDirection: "row",
-    justifyContent: "space-between",
-    marginTop: 5,
-  },
-  barLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
   },
 });

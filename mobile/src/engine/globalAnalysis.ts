@@ -25,7 +25,7 @@ import {
   TARGET_MISTAKE_MOMENTS,
   TARGET_OPENING_MOMENTS,
 } from "./analysisConfig";
-import { yieldForUi } from "./backgroundWork";
+import { waitForPuzzleIdle, yieldForUi } from "./backgroundWork";
 import { DEBUG_DISABLE_STYLE_METRICS } from "./debugFlags";
 
 function debugScanLog(
@@ -496,6 +496,8 @@ async function scanOneGame(
     evalCalls += 1;
     if (evalCalls % 8 === 0) {
       await yieldForUi({ heavy: true });
+    } else {
+      await waitForPuzzleIdle();
     }
     const raw = await evaluate(fen, SCAN_DEPTH, GLOBAL_MULTIPV, 0);
     const bestUci = raw.bestUci ? canonicalUci(fen, raw.bestUci) : null;
@@ -848,7 +850,7 @@ export async function runGlobalPeriodAnalysis(options: {
     onProgress,
     onGameScanned,
     onEarlyMistakesReady,
-    onEarlyOpeningsReady,
+    onEarlyOpeningsReady: _onEarlyOpeningsReady,
   } = options;
   const owner = options.owner || "study";
   const sessionKey = options.sessionKey || globalScanSessionKey(filters);
@@ -863,8 +865,6 @@ export async function runGlobalPeriodAnalysis(options: {
   try {
     const earlyMistakeTarget =
       options.earlyMistakeTarget ?? TARGET_MISTAKE_MOMENTS;
-    const earlyOpeningTarget =
-      options.earlyOpeningTarget ?? TARGET_OPENING_MOMENTS;
 
     let sourceGames = options.games;
     if (options.continueScan) {
@@ -927,7 +927,6 @@ export async function runGlobalPeriodAnalysis(options: {
     };
 
     let mistakesReady = false;
-    let openingsReady = false;
     let unsavedMutations = 0;
     const persistVault = async (force = false) => {
       if (unsavedMutations <= 0 && !force) return;
@@ -962,18 +961,6 @@ export async function runGlobalPeriodAnalysis(options: {
     const emitState = async (partialDone: number) => {
       const state = buildPeriodState(games, vault, null);
       await onGameScanned?.(state);
-      report(
-        mistakesReady || openingsReady
-          ? "Puzzle batches ready · filling eval buffer"
-          : "Scanning period games",
-        "scan",
-        partialDone
-      );
-    };
-
-    const runDeferredEarlyRefines = async () => {
-      const state = buildPeriodState(games, vault, null);
-      await onGameScanned?.(state);
       if (!mistakesReady && onEarlyMistakesReady) {
         const picks = selectRecentPeriodCandidates({
           candidates: state.mistakeCandidates,
@@ -981,41 +968,38 @@ export async function runGlobalPeriodAnalysis(options: {
           consumedKeys: vault.consumedMistakeKeys,
           limit: earlyMistakeTarget,
         });
-        if (picks.length) {
-          report("Refining mistake puzzles…", "style", state.scannedGameIds.length);
-          const accepted = await onEarlyMistakesReady(picks, state);
-          if (accepted !== false) {
+        if (picks.length >= earlyMistakeTarget || state.complete) {
+          if (picks.length) {
+            report(
+              "Deep-refining first mistake batch…",
+              "style",
+              partialDone
+            );
+            const accepted = await onEarlyMistakesReady(picks, state);
+            if (accepted !== false) {
+              mistakesReady = true;
+              await mergeVaultConsumed();
+              await persistVault(true);
+            }
+          } else if (state.complete) {
             mistakesReady = true;
-            await mergeVaultConsumed();
-            await persistVault(true);
           }
-        } else {
-          mistakesReady = true;
         }
       }
-      if (
-        (mistakesReady || !onEarlyMistakesReady) &&
-        !openingsReady &&
-        onEarlyOpeningsReady
-      ) {
-        const picks = selectRecentPeriodCandidates({
-          candidates: state.openingCandidates,
-          periodGameIds: periodIds,
-          consumedKeys: vault.consumedOpeningKeys,
-          limit: earlyOpeningTarget,
-        });
-        if (picks.length) {
-          report("Refining opening puzzles…", "style", state.scannedGameIds.length);
-          const accepted = await onEarlyOpeningsReady(picks, state);
-          if (accepted !== false) {
-            openingsReady = true;
-            await mergeVaultConsumed();
-            await persistVault(true);
-          }
-        } else {
-          openingsReady = true;
-        }
-      }
+      report(
+        mistakesReady
+          ? "First puzzle batch ready · filling eval buffer"
+          : "Scanning period games",
+        "scan",
+        partialDone
+      );
+    };
+
+    const runDeferredEarlyRefines = async () => {
+      if (mistakesReady || !onEarlyMistakesReady) return;
+      await emitState(
+        buildPeriodState(games, vault, null).scannedGameIds.length
+      );
     };
 
     await emitState(cachedCount);
@@ -1073,6 +1057,12 @@ export async function runGlobalPeriodAnalysis(options: {
         continue;
       }
       if (existing) continue;
+
+      await waitForPuzzleIdle();
+      if (signal.cancelled) {
+        await persistVault(true);
+        return buildPeriodState(games, vault, null);
+      }
 
       const label =
         opponentName(game) || game.opening_name || id.slice(0, 8);

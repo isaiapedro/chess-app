@@ -1,13 +1,15 @@
+import type { TextStyle } from "react-native";
+
 export const colors = {
   bg: "#000000",
   charcoal: "#0d0d0d",
-  surface: "#1a1a1a",
-  surfaceRaised: "#1d1d1d",
-  muted: "#222222",
-  mutedAlt: "#2b2b2b",
-  border: "#333333",
-  rim: "rgba(255,255,255,0.2)",
-  borderSoft: "rgba(255,255,255,0.08)",
+  surface: "#121212",
+  surfaceRaised: "#181818",
+  muted: "#1c1c1c",
+  mutedAlt: "#242424",
+  border: "rgba(255,255,255,0.07)",
+  rim: "rgba(255,255,255,0.14)",
+  borderSoft: "rgba(255,255,255,0.05)",
 
   red: "#D32531",
   redHover: "#a0000f",
@@ -19,17 +21,17 @@ export const colors = {
   shadowGray: "#6D7876",
 
   text: "#ffffff",
-  textMuted: "#aaaaaa",
-  textDim: "#888888",
-  textSoft: "#e0e0e0",
-  textDisabled: "#444444",
+  textMuted: "#a1a1a1",
+  textDim: "#7a7a7a",
+  textSoft: "#e6e6e6",
+  textDisabled: "#4a4a4a",
 
   accent: "#D32531",
   accentDim: "#a0000f",
   warning: "#ede7d3",
   danger: "#D32531",
   info: "#0084d2",
-  badge: "#1a1a1a",
+  badge: "#121212",
 
   boardDark: "#71828F",
   boardLight: "#C7C7C7",
@@ -43,14 +45,18 @@ export const result = {
   data: colors.blue,
 };
 
+// Single type family: Inter. Legacy token names (display/mono) are kept so
+// existing call sites keep working — they now resolve to Inter weights.
 export const font = {
-  display: "PlayfairDisplay_700Bold",
-  displayMedium: "PlayfairDisplay_600SemiBold",
-  displayLight: "Playfair_300Light",
-  mono: "IBMPlexMono_400Regular",
-  monoMedium: "IBMPlexMono_500Medium",
-  monoBold: "IBMPlexMono_700Bold",
-  sans: "System",
+  display: "Inter_700Bold",
+  displayMedium: "Inter_600SemiBold",
+  displayLight: "Inter_300Light",
+  mono: "Inter_400Regular",
+  monoMedium: "Inter_500Medium",
+  monoBold: "Inter_600SemiBold",
+  sans: "Inter_400Regular",
+  sansMedium: "Inter_500Medium",
+  sansBold: "Inter_700Bold",
 };
 
 export const spacing = {
@@ -59,6 +65,51 @@ export const spacing = {
   md: 16,
   lg: 24,
   xl: 32,
+  xxl: 44,
+};
+
+/** Corner radii. Everything visible should use one of these — no square edges. */
+export const radius = {
+  xs: 8,
+  sm: 12,
+  md: 18,
+  lg: 24,
+  xl: 32,
+  pill: 999,
+};
+
+/** Type scale. Sizes/line-heights tuned for readability on small screens. */
+export const type = {
+  hero: { fontFamily: font.sansBold, fontSize: 34, lineHeight: 40, letterSpacing: -0.8 },
+  title: { fontFamily: font.sansBold, fontSize: 26, lineHeight: 32, letterSpacing: -0.5 },
+  heading: { fontFamily: font.sansBold, fontSize: 20, lineHeight: 26, letterSpacing: -0.3 },
+  subheading: { fontFamily: font.sansMedium, fontSize: 16, lineHeight: 22, letterSpacing: -0.1 },
+  body: { fontFamily: font.sans, fontSize: 15, lineHeight: 22 },
+  bodySmall: { fontFamily: font.sans, fontSize: 13, lineHeight: 19 },
+  label: { fontFamily: font.sansMedium, fontSize: 13, lineHeight: 18 },
+  caption: { fontFamily: font.sans, fontSize: 12, lineHeight: 17 },
+  micro: { fontFamily: font.sans, fontSize: 11, lineHeight: 15 },
+  numberLg: {
+    fontFamily: font.sansBold,
+    fontSize: 44,
+    lineHeight: 50,
+    letterSpacing: -1.5,
+    fontVariant: ["tabular-nums"] as TextStyle["fontVariant"],
+  },
+  numberMd: {
+    fontFamily: font.sansBold,
+    fontSize: 28,
+    lineHeight: 34,
+    letterSpacing: -0.8,
+    fontVariant: ["tabular-nums"] as TextStyle["fontVariant"],
+  },
+  numberSm: {
+    fontFamily: font.sansBold,
+    fontSize: 20,
+    lineHeight: 26,
+    letterSpacing: -0.4,
+    fontVariant: ["tabular-nums"] as TextStyle["fontVariant"],
+  },
 };
 
 export function withAlpha(hex: string, alpha: number): string {

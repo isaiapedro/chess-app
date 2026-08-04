@@ -61,10 +61,17 @@ export async function waitForPrefetchGate(timeoutMs = 20000): Promise<void> {
   ]);
 }
 
+export async function waitForPuzzleIdle(): Promise<void> {
+  if (puzzleDemand <= 0) return;
+  await waitUntil(() => puzzleDemand <= 0);
+}
+
 export async function yieldForUi(options?: { heavy?: boolean }): Promise<void> {
+  if (puzzleDemand > 0) {
+    await waitForPuzzleIdle();
+  }
   const heavy = options?.heavy ?? false;
-  const busy = puzzleDemand > 0;
-  const delayMs = busy ? (heavy ? 48 : 24) : heavy ? 4 : 0;
+  const delayMs = heavy ? 4 : 0;
   if (typeof requestAnimationFrame === "function") {
     await new Promise<void>((resolve) => {
       requestAnimationFrame(() => {

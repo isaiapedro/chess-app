@@ -21,8 +21,9 @@ import {
   type TheoreticalKey,
   type TheoreticalOutcome,
 } from "../engine/endgamePhase";
+import { Ionicons } from "@expo/vector-icons";
 import { EdgeCard, SectionLabel } from "./ui";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
   | { kind: "fixed"; max: number }
@@ -263,7 +264,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Text style={styles.helpClose}>✕</Text>
+              <Ionicons name="close" size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -331,7 +332,11 @@ function MetricBanner({
             accessibilityLabel={`About ${name}`}
             style={styles.helpButton}
           >
-            <Text style={styles.helpButtonText}>?</Text>
+            <Ionicons
+                      name="information-circle-outline"
+                      size={20}
+                      color={colors.textDim}
+                    />
           </Pressable>
         ) : null}
       </View>
@@ -501,7 +506,7 @@ export function EndgameInsightsPanel() {
 
       {blunderCard || showSaved || practicalAfterCards.length ? (
         <View style={styles.section}>
-          <SectionLabel>Practical Endgames</SectionLabel>
+          <SectionLabel>Practical endgames</SectionLabel>
           {blunderCard ? (
             <MetricBanner
               name={blunderCard.name}
@@ -596,7 +601,7 @@ export function EndgameInsightsPanel() {
       ) : null}
 
       <View style={styles.section}>
-        <SectionLabel>Theoretical Endgames</SectionLabel>
+        <SectionLabel>Theoretical endgames</SectionLabel>
         {theoreticalCards.length ? (
           theoreticalCards.map((card) => (
             <TheoreticalCard
@@ -621,20 +626,26 @@ export function EndgameInsightsPanel() {
 
 const styles = StyleSheet.create({
   hint: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 13,
-    lineHeight: 18,
     marginBottom: spacing.md,
   },
-  section: { marginBottom: spacing.md },
+  section: { marginBottom: spacing.xl },
+  familyBlock: {
+    marginBottom: spacing.lg,
+  },
+  familyHeader: {
+    marginBottom: spacing.sm,
+  },
+  familyName: {
+    ...type.heading,
+    color: colors.text,
+    marginBottom: 2,
+  },
   familyMeta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    marginBottom: 8,
+    marginBottom: spacing.sm,
   },
   card: { marginBottom: spacing.sm },
   cardRow: {
@@ -647,45 +658,35 @@ const styles = StyleSheet.create({
     flexShrink: 1,
   },
   name: {
-    color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    lineHeight: 21,
-    marginBottom: 8,
+    ...type.label,
+    color: colors.textMuted,
+    marginBottom: 4,
   },
   helpButton: {
-    width: 33,
-    height: 33,
-    borderRadius: 17,
-    borderWidth: 1,
-    borderColor: withAlpha(colors.cream, 0.75),
-    backgroundColor: withAlpha(colors.cream, 0.22),
     alignItems: "center",
     justifyContent: "center",
   },
-  helpButtonText: {
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 16,
-    lineHeight: 18,
-  },
   value: {
+    ...type.numberSm,
     color: colors.text,
-    fontFamily: font.displayLight,
-    fontSize: 26,
     marginBottom: 2,
   },
   unit: {
+    ...type.caption,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 13,
+  },
+  caption: {
+    ...type.caption,
+    color: colors.textDim,
+    marginBottom: 4,
   },
   bulletWrap: {
     marginTop: 10,
     paddingVertical: 4,
   },
   bulletTrack: {
-    height: 8,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: withAlpha("#ffffff", 0.08),
     position: "relative",
     justifyContent: "center",
@@ -695,6 +696,7 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
     left: 0,
+    borderRadius: radius.pill,
     backgroundColor: result.win,
   },
   stackWin: {
@@ -702,73 +704,74 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
     left: 0,
+    borderRadius: radius.pill,
     backgroundColor: result.win,
   },
   stackDraw: {
     position: "absolute",
     top: 0,
     bottom: 0,
+    borderRadius: radius.pill,
     backgroundColor: result.draw,
+  },
+  bulletOverflow: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    right: 0,
+    width: 3,
+    borderRadius: radius.pill,
+    backgroundColor: colors.text,
   },
   bulletPeer: {
     position: "absolute",
-    top: -2,
-    bottom: -2,
+    top: -3,
+    bottom: -3,
     width: 2,
     marginLeft: -1,
-    backgroundColor: colors.cream,
+    borderRadius: radius.pill,
+    backgroundColor: colors.rim,
   },
   helpBackdrop: {
     flex: 1,
-    backgroundColor: withAlpha("#000000", 0.55),
-    justifyContent: "center",
-    padding: spacing.lg,
+    backgroundColor: withAlpha("#000000", 0.68),
+    justifyContent: "flex-end",
   },
   helpCard: {
-    backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: withAlpha(colors.cream, 0.35),
-    padding: spacing.md,
-    maxHeight: "70%",
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: radius.xl,
+    borderTopRightRadius: radius.xl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
+    maxHeight: "78%",
   },
   helpHeader: {
     flexDirection: "row",
-    alignItems: "center",
+    alignItems: "flex-start",
     justifyContent: "space-between",
-    marginBottom: spacing.sm,
-  },
-  helpTitle: {
-    color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 20,
-    flex: 1,
-    paddingRight: spacing.sm,
-  },
-  helpClose: {
-    color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 18,
-  },
-  helpScroll: { maxHeight: 360 },
-  helpSummary: {
-    color: colors.text,
-    fontFamily: font.sans,
-    fontSize: 14,
-    lineHeight: 20,
+    gap: spacing.sm,
     marginBottom: spacing.md,
   },
+  helpTitle: {
+    ...type.title,
+    color: colors.text,
+    flex: 1,
+  },
+  helpScroll: { flexGrow: 0, maxHeight: 420 },
+  helpSummary: {
+    ...type.body,
+    color: colors.textSoft,
+    marginBottom: spacing.lg,
+  },
   helpDetailLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    marginBottom: 6,
+    ...type.label,
+    color: colors.text,
+    marginBottom: spacing.xs,
   },
   helpDetail: {
-    color: colors.textMuted,
-    fontFamily: font.sans,
-    fontSize: 13,
-    lineHeight: 19,
+    ...type.bodySmall,
+    color: colors.textDim,
+    lineHeight: 20,
   },
 });

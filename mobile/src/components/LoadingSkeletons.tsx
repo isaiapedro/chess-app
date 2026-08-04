@@ -10,7 +10,7 @@ import {
   type ViewStyle,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
-import { colors, spacing, withAlpha } from "../theme";
+import { colors, radius, spacing, withAlpha } from "../theme";
 
 type BoneProps = {
   width?: DimensionValue;
@@ -580,11 +580,11 @@ const styles = StyleSheet.create({
     paddingBottom: 120,
   },
   bone: {
-    backgroundColor: withAlpha(colors.textMuted, 0.38),
+    backgroundColor: withAlpha(colors.textMuted, 0.3),
+    borderRadius: radius.xs,
   },
   card: {
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderRadius: radius.md,
     backgroundColor: colors.surface,
     padding: spacing.md,
     overflow: "hidden",
@@ -653,16 +653,16 @@ const styles = StyleSheet.create({
   },
   loadingBarTrack: {
     width: "100%",
-    height: 20,
-    marginTop: spacing.sm,
+    height: 14,
+    marginTop: spacing.md,
     overflow: "hidden",
-    borderRadius: 999,
-    backgroundColor: colors.boardLight,
+    borderRadius: radius.pill,
+    backgroundColor: withAlpha("#ffffff", 0.1),
   },
   loadingBarFill: {
     height: "100%",
-    borderRadius: 999,
-    backgroundColor: colors.boardDark,
+    borderRadius: radius.pill,
+    backgroundColor: colors.textSoft,
     overflow: "hidden",
   },
   loadingBarRibbonRow: {
@@ -676,8 +676,8 @@ const styles = StyleSheet.create({
   loadingBarRibbon: {
     width: RIBBON_WIDTH,
     marginRight: RIBBON_GAP,
-    backgroundColor: colors.boardLight,
-    opacity: 0.3,
+    backgroundColor: colors.bg,
+    opacity: 0.18,
     transform: [{ skewX: "-28deg" }],
   },
   gapXs: {

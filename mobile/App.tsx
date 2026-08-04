@@ -9,15 +9,12 @@ import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { NavigationContainer, DarkTheme } from "@react-navigation/native";
 import {
   useFonts,
-  PlayfairDisplay_600SemiBold,
-  PlayfairDisplay_700Bold,
-} from "@expo-google-fonts/playfair-display";
-import { Playfair_300Light } from "@expo-google-fonts/playfair";
-import {
-  IBMPlexMono_400Regular,
-  IBMPlexMono_500Medium,
-  IBMPlexMono_700Bold,
-} from "@expo-google-fonts/ibm-plex-mono";
+  Inter_300Light,
+  Inter_400Regular,
+  Inter_500Medium,
+  Inter_600SemiBold,
+  Inter_700Bold,
+} from "@expo-google-fonts/inter";
 import { AuthProvider } from "./src/context/AuthContext";
 import { FilterProvider } from "./src/context/FilterContext";
 import { AnalyticsProvider } from "./src/context/AnalyticsContext";
@@ -61,12 +58,11 @@ const navTheme = {
 
 export default function App() {
   const [fontsLoaded] = useFonts({
-    Playfair_300Light,
-    PlayfairDisplay_600SemiBold,
-    PlayfairDisplay_700Bold,
-    IBMPlexMono_400Regular,
-    IBMPlexMono_500Medium,
-    IBMPlexMono_700Bold,
+    Inter_300Light,
+    Inter_400Regular,
+    Inter_500Medium,
+    Inter_600SemiBold,
+    Inter_700Bold,
   });
 
   useEffect(() => {

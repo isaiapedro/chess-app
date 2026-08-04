@@ -140,7 +140,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
   let wantedMultiPv = 1;
   let bootTimer = null;
   let searching = false;
-  let queuedReq = null;
+  let queuedReqs = [];
   let seenIds = {};
   let seenCount = 0;
   // #region agent log
@@ -270,9 +270,8 @@ const ENGINE_HTML = `<!DOCTYPE html>
       });
       currentId = null;
       resetCollect();
-      if (queuedReq) {
-        var next = queuedReq;
-        queuedReq = null;
+      if (queuedReqs.length) {
+        var next = queuedReqs.shift();
         startSearch(next);
       }
     }
@@ -464,7 +463,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
         seenCount++;
       }
       if (searching) {
-        queuedReq = msg;
+        queuedReqs.push(msg);
         try { engine.postMessage('stop'); } catch (e) {}
         return;
       }

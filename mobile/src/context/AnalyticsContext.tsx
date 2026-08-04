@@ -350,7 +350,9 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
 
       try {
         await new Promise<void>((resolve) => {
-          InteractionManager.runAfterInteractions(() => resolve());
+          requestAnimationFrame(() => {
+            InteractionManager.runAfterInteractions(() => resolve());
+          });
         });
         if (metricsRunIdRef.current !== runId) return;
         const [session, peerStore] = await Promise.all([

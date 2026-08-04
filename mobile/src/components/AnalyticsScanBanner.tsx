@@ -3,7 +3,7 @@ import { StyleSheet, Text, View } from "react-native";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useScanLog } from "../context/ScanLogContext";
 import { GLOBAL_FIRST_SCAN_MAX_GAMES } from "../engine/analysisConfig";
-import { colors, font, spacing } from "../theme";
+import { colors, font, spacing, type } from "../theme";
 import { AnalysisLoadingBars } from "./LoadingSkeletons";
 
 const WAITING_LINES = [
@@ -183,15 +183,15 @@ export function EvalPendingWarning() {
 const styles = StyleSheet.create({
   wrap: {
     alignItems: "center",
-    gap: 10,
+    gap: spacing.sm,
     paddingVertical: spacing.md,
     paddingHorizontal: spacing.md,
     width: "100%",
   },
   phrase: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 14,
     textAlign: "center",
   },
   trackBlock: {
@@ -199,33 +199,26 @@ const styles = StyleSheet.create({
     gap: 4,
   },
   trackLabel: {
+    ...type.caption,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 11,
     textAlign: "center",
-    letterSpacing: 0.4,
-    textTransform: "uppercase",
   },
   subtitle: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 12,
     textAlign: "center",
   },
   warningWrap: {
     width: "100%",
+    marginHorizontal: spacing.md,
     paddingVertical: spacing.sm,
     paddingHorizontal: spacing.md,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.borderSoft,
     backgroundColor: colors.charcoal,
     gap: 8,
   },
   warningText: {
-    color: colors.warning,
-    fontFamily: font.sans,
-    fontSize: 13,
-    lineHeight: 18,
+    ...type.bodySmall,
+    color: colors.textMuted,
     textAlign: "center",
   },
   evalLog: {
@@ -233,10 +226,8 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   evalLogStatus: {
+    ...type.caption,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 11,
-    lineHeight: 15,
     textAlign: "center",
   },
   evalLogLines: {
@@ -244,10 +235,8 @@ const styles = StyleSheet.create({
     gap: 2,
   },
   evalLogLine: {
+    ...type.micro,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 10,
-    lineHeight: 14,
     textAlign: "left",
   },
 });

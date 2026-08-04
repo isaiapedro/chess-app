@@ -71,7 +71,7 @@ import {
 } from "../storage/cache";
 import { readOpeningCacheForPeriod } from "../storage/periodCacheReuse";
 import { studyOpeningCacheKey } from "../storage/studyCacheKeys";
-import { colors, font, result, spacing } from "../theme";
+import { colors, font, radius, result, spacing, type } from "../theme";
 
 type Phase = "color" | "opening" | "analyze" | "quiz";
 
@@ -475,6 +475,38 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
 
       const waitForVault = async (): Promise<GlobalAnalysisState | null> => {
         while (!signal.cancelled) {
+          const cached = parseOpeningCache(
+            await readOpeningCacheForPeriod(
+              queryFilters,
+              color,
+              opening.key,
+              allGames.map((game) => String(game.id))
+            )
+          );
+          if (cached?.moments.length) {
+            setMoments(cached.moments);
+            setIdx(0);
+            visibleBatchStartRef.current = 0;
+            pendingBatchRef.current = null;
+            setPendingReady(false);
+            secondPagePrefetchKeyRef.current = null;
+            scannedIdsRef.current = cached.scannedGameIds;
+            pendingCandidatesRef.current = cached.pendingCandidates || [];
+            deferredCandidatesRef.current = cached.deferredCandidates || [];
+            setPendingCount((cached.pendingCandidates || []).length);
+            setRemainingGames(cached.remaining);
+            thresholdPassRef.current = cached.thresholdPass || "strict";
+            baselineAvailableRef.current = Boolean(cached.baselineAvailable);
+            setPhase("quiz");
+            setAnalyzeStatus(null);
+            completed = true;
+            void syncOpeningReservoir(
+              allGames,
+              filtered.map((g) => String(g.id)),
+              (cached.pendingCandidates || []).length
+            );
+            return null;
+          }
           const live = getPrefetchedGlobalState();
           const state =
             live ||
@@ -510,7 +542,11 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       };
 
       const state = await waitForVault();
-      if (signal.cancelled || !state) return;
+      if (signal.cancelled) return;
+      if (!state) {
+        if (completed) return;
+        return;
+      }
 
       const scoped = state.openingCandidates.filter((item) =>
         openingGameIds.has(String(item.game_id))
@@ -1294,11 +1330,19 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
             </Text>
             <BrutalButton label="Change" ghost onPress={resetFlow} />
           </View>
-          <View style={styles.center}>
+          <View style={[styles.center, { gap: spacing.md }]}>
             <BrutalButton
-              label="Scan more"
+              label="Show More Games"
               disabled={!engineReady}
               onPress={requestScanMoreOpenings}
+            />
+            <BrutalButton
+              label="Go Back"
+              ghost
+              onPress={() => {
+                setShowScanMore(false);
+                setAllDone(false);
+              }}
             />
           </View>
         </View>
@@ -1609,43 +1653,38 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
 }
 
 const styles = StyleSheet.create({
-  center: { alignItems: "center", paddingVertical: spacing.lg, gap: 10 },
+  center: { alignItems: "center", paddingVertical: spacing.lg, gap: spacing.sm },
   prompt: {
-    color: colors.cream,
-    fontFamily: font.display,
-    fontSize: 22,
+    ...type.heading,
+    color: colors.text,
     marginBottom: spacing.md,
   },
   muted: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
     marginBottom: spacing.sm,
   },
   error: {
+    ...type.bodySmall,
     color: result.loss,
-    fontFamily: font.mono,
-    fontSize: 12,
     marginTop: spacing.sm,
   },
   choiceRow: { flexDirection: "row", gap: spacing.sm },
   openingOption: {
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderRadius: radius.md,
     padding: spacing.md,
     marginBottom: spacing.sm,
     backgroundColor: colors.surface,
   },
   openingOptionTitle: {
-    color: colors.cream,
-    fontFamily: font.monoBold,
-    fontSize: 14,
+    ...type.subheading,
+    fontFamily: font.sansBold,
+    color: colors.text,
   },
   openingOptionMeta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    marginTop: 4,
+    marginTop: 2,
   },
   suggestList: {
     marginTop: spacing.sm,
@@ -1653,21 +1692,19 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   suggestOption: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    paddingVertical: 10,
-    paddingHorizontal: spacing.sm,
-    backgroundColor: colors.charcoal,
+    borderRadius: radius.sm,
+    paddingVertical: 12,
+    paddingHorizontal: spacing.md,
+    backgroundColor: colors.muted,
   },
   input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    color: colors.cream,
-    fontFamily: font.mono,
-    fontSize: 14,
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    backgroundColor: colors.surface,
+    borderRadius: radius.pill,
+    color: colors.text,
+    fontFamily: font.sans,
+    fontSize: 15,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 13,
+    backgroundColor: colors.muted,
   },
   headerRow: {
     flexDirection: "row",
@@ -1677,10 +1714,9 @@ const styles = StyleSheet.create({
     marginBottom: spacing.md,
   },
   openingTitle: {
+    ...type.heading,
     flex: 1,
-    color: colors.cream,
-    fontFamily: font.display,
-    fontSize: 20,
+    color: colors.text,
   },
   mistakeHeader: {
     flexDirection: "row",
@@ -1690,78 +1726,67 @@ const styles = StyleSheet.create({
   },
   gameIdentity: { flex: 1 },
   gameDate: {
-    color: colors.cream,
-    fontFamily: font.monoBold,
-    fontSize: 13,
+    ...type.label,
+    color: colors.textSoft,
   },
   opponentName: {
-    color: colors.cream,
-    fontFamily: font.mono,
-    fontSize: 12,
+    ...type.caption,
+    color: colors.textMuted,
     marginTop: 2,
   },
   gameDetails: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
     marginTop: 2,
   },
   evalSummary: { alignItems: "flex-end", maxWidth: "42%" },
   metaLine: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 10,
-    textTransform: "uppercase",
-    letterSpacing: 1,
   },
   evalDrop: {
-    color: colors.cream,
-    fontFamily: font.monoBold,
-    fontSize: 14,
+    ...type.numberSm,
+    fontSize: 16,
+    lineHeight: 21,
+    color: colors.text,
     marginTop: 2,
   },
   mistakePill: { alignSelf: "flex-end", marginTop: 6 },
   movePillText: { textTransform: "none" },
-  moveCompare: { flexDirection: "row", gap: spacing.md },
+  moveCompare: { flexDirection: "row", gap: spacing.lg },
   compareLabel: {
-    fontFamily: font.mono,
-    fontSize: 10,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
-    marginBottom: 4,
+    ...type.caption,
+    marginBottom: 2,
   },
   compareValue: {
-    fontFamily: font.monoBold,
+    ...type.numberSm,
     fontSize: 18,
+    lineHeight: 24,
   },
   comment: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
-    lineHeight: 18,
+    ...type.bodySmall,
+    color: colors.textMuted,
     marginTop: spacing.sm,
   },
   gmGameLine: {
-    color: colors.cream,
-    fontFamily: font.mono,
-    fontSize: 11,
-    lineHeight: 16,
+    ...type.caption,
+    color: colors.textDim,
     marginTop: 4,
   },
   feedback: {
-    fontFamily: font.mono,
-    fontSize: 13,
+    ...type.label,
     marginTop: spacing.sm,
   },
   navRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
-    marginTop: spacing.md,
+    marginTop: spacing.lg,
   },
   pageCount: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.monoBold,
-    fontSize: 12,
+    minWidth: 44,
+    textAlign: "center",
   },
 });

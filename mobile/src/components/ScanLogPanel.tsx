@@ -7,7 +7,7 @@ import {
   View,
 } from "react-native";
 import { useScanLog } from "../context/ScanLogContext";
-import { colors, font, spacing, withAlpha } from "../theme";
+import { colors, radius, spacing, type, withAlpha } from "../theme";
 
 export function ScanLogPanel() {
   const { lines, status, phase, gamesDone, gamesTotal, running } = useScanLog();
@@ -69,67 +69,60 @@ const styles = StyleSheet.create({
     marginHorizontal: spacing.md,
     marginBottom: spacing.md,
     backgroundColor: colors.surface,
-    borderWidth: 1,
-    borderColor: colors.border,
-    padding: spacing.sm,
+    borderRadius: radius.md,
+    padding: spacing.md,
   },
   header: {
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
-    marginBottom: 8,
+    marginBottom: spacing.sm,
   },
   title: {
-    color: colors.textDim,
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 1.4,
-    textTransform: "uppercase",
+    ...type.label,
+    color: colors.textSoft,
   },
   status: {
-    color: colors.text,
-    fontFamily: font.mono,
-    fontSize: 12,
+    ...type.caption,
+    color: colors.textMuted,
     marginTop: 2,
   },
   chevron: {
+    ...type.body,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 16,
   },
   track: {
-    height: 3,
+    height: 4,
+    borderRadius: radius.pill,
     backgroundColor: withAlpha("#ffffff", 0.08),
-    marginBottom: 6,
+    marginBottom: 8,
+    overflow: "hidden",
   },
   fill: {
-    height: 3,
+    height: 4,
+    borderRadius: radius.pill,
     backgroundColor: colors.blue,
   },
   meta: {
+    ...type.micro,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 10,
-    letterSpacing: 0.8,
     marginBottom: 6,
   },
   log: {
     maxHeight: 140,
-    backgroundColor: withAlpha("#000000", 0.25),
+    borderRadius: radius.sm,
+    backgroundColor: withAlpha("#000000", 0.3),
   },
   logContent: {
-    padding: 8,
+    padding: spacing.sm,
     gap: 2,
   },
   line: {
+    ...type.micro,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 10,
-    lineHeight: 14,
   },
   lineDim: {
+    ...type.micro,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 10,
   },
 });

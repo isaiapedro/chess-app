@@ -1,6 +1,6 @@
 import React from "react";
 import { StyleSheet, Text, View } from "react-native";
-import { colors, spacing } from "../theme";
+import { colors, radius, spacing, type } from "../theme";
 
 export function MetricCard({
   label,
@@ -59,71 +59,63 @@ export function ComparisonCard({
 const styles = StyleSheet.create({
   card: {
     backgroundColor: colors.surface,
-    borderRadius: 12,
-    borderWidth: 1,
-    borderColor: colors.border,
+    borderRadius: radius.md,
     padding: spacing.md,
     minWidth: "47%",
     flexGrow: 1,
   },
   label: {
+    ...type.label,
     color: colors.textMuted,
-    fontSize: 12,
     marginBottom: 4,
   },
   value: {
+    ...type.numberMd,
     color: colors.text,
-    fontSize: 22,
-    fontWeight: "700",
   },
   caption: {
-    color: colors.textMuted,
-    fontSize: 11,
+    ...type.caption,
+    color: colors.textDim,
     marginTop: 4,
   },
   badge: {
-    backgroundColor: colors.badge,
-    borderRadius: 12,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
     padding: spacing.md,
     marginBottom: spacing.sm,
-    borderWidth: 1,
-    borderColor: "#4338ca",
   },
   badgeEmoji: {
-    fontSize: 28,
-    marginBottom: 4,
+    fontSize: 24,
+    marginBottom: 6,
   },
   badgeTitle: {
+    ...type.subheading,
     color: colors.text,
-    fontSize: 16,
-    fontWeight: "700",
     marginBottom: 4,
   },
   badgeDesc: {
+    ...type.bodySmall,
     color: colors.textMuted,
-    fontSize: 13,
-    lineHeight: 18,
   },
   comparison: {
-    backgroundColor: colors.muted,
-    borderRadius: 12,
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
     padding: spacing.md,
     alignItems: "center",
     flex: 1,
     minWidth: 100,
   },
   comparisonIcon: {
-    fontSize: 24,
-    marginBottom: 4,
+    fontSize: 22,
+    marginBottom: 6,
   },
   comparisonValue: {
-    color: colors.warning,
-    fontSize: 20,
-    fontWeight: "700",
+    ...type.numberSm,
+    color: colors.text,
   },
   comparisonLabel: {
+    ...type.caption,
     color: colors.textMuted,
-    fontSize: 11,
     textAlign: "center",
     marginTop: 2,
   },

@@ -7,10 +7,12 @@ import { GLOBAL_MAX_GAMES } from "../engine/analysisConfig";
 import type { InsightsResponse, RecapResponse } from "../api/types";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import {
+  filterNormalizedGames,
   loadLocalGamesPage,
   toStudyGameList,
   type NormalizedGame,
 } from "../data/platformGames";
+import { yieldForUi } from "../engine/backgroundWork";
 import {
   buildLocalInsights,
   buildLocalRecap,
@@ -208,6 +210,33 @@ function emptyInsights(filters: QueryFilters): InsightsResponse {
   return buildLocalInsights(filters, []);
 }
 
+async function tryRemeshSessionFromRelated(
+  filters: QueryFilters
+): Promise<SessionBundle | null> {
+  for (const related of relatedPeriodFilters(filters)) {
+    const cached = await readCache<StudyGame[]>(
+      analyticsStudyGamesCacheKey(related),
+      GAMES_TTL_MS
+    );
+    if (!cached?.length) continue;
+    await yieldForUi({ heavy: true });
+    const filtered = filterNormalizedGames(
+      cached as NormalizedGame[],
+      filters
+    ).sort((a, b) =>
+      String(b.created_at).localeCompare(String(a.created_at))
+    );
+    const bundle: SessionBundle = {
+      games: toStudyGameList(filtered),
+      recap: buildLocalRecap(filters, filtered),
+      insights: buildLocalInsights(filters, filtered),
+    };
+    await writeSessionCaches(filters, bundle);
+    return bundle;
+  }
+  return null;
+}
+
 export async function ensureSession(
   filters: QueryFilters,
   forceNetwork = false
@@ -238,19 +267,27 @@ export async function ensureSession(
       if (games != null && recap && insights) {
         return { games, recap, insights };
       }
+      const remeshed = await tryRemeshSessionFromRelated(filters);
+      if (remeshed) return remeshed;
     }
 
+    await yieldForUi({ heavy: true });
     const page = await loadLocalGamesPage(filters, {
       force: forceNetwork,
       limit: GAMES_FIRST_PAGE_SIZE,
       offset: 0,
     });
+    await yieldForUi({ heavy: true });
     const allFiltered: NormalizedGame[] = page.allFiltered;
     const periodGames = toStudyGameList(allFiltered);
+    await yieldForUi({ heavy: true });
+    const recap = buildLocalRecap(filters, allFiltered);
+    await yieldForUi({ heavy: true });
+    const insights = buildLocalInsights(filters, allFiltered);
     const bundle: SessionBundle = {
       games: periodGames,
-      recap: buildLocalRecap(filters, allFiltered),
-      insights: buildLocalInsights(filters, allFiltered),
+      recap,
+      insights,
     };
     await writeSessionCaches(filters, bundle);
     return bundle;
@@ -517,8 +554,11 @@ export async function ensureVaultMetrics(
   const key = analyticsVaultHeuristicsCacheKey(filters);
   return takeInflight(`vault-heuristics:${filtersKey(filters)}:${force}`, async () => {
     const games = options?.games ?? (await ensureStudyGames(filters, false));
+    await yieldForUi({ heavy: true });
     const vault = await loadPermanentEvalStore(filters);
+    await yieldForUi({ heavy: true });
     let store = await loadHeuristicStore(filters);
+    await yieldForUi({ heavy: true });
     const seeded = await seedHeuristicStoreFromRelatedCaches(filters, store);
     if (seeded !== store) {
       store = seeded;

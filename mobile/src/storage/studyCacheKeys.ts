@@ -12,25 +12,52 @@ function isoDateLocal(d: Date): string {
 }
 
 export function relatedPeriodFilters(filters: QueryFilters): QueryFilters[] {
-  if (filters.timeframe !== "1 month" || !filters.dateFrom || !filters.dateTo) {
-    return [];
-  }
+  const out: QueryFilters[] = [];
+  const seen = new Set<string>();
+  const selfKey = studyFiltersKey(filters);
+  const push = (next: QueryFilters) => {
+    const key = studyFiltersKey(next);
+    if (key === selfKey || seen.has(key)) return;
+    seen.add(key);
+    out.push(next);
+  };
+
   const now = new Date();
   const monthStart = new Date(now);
   monthStart.setDate(monthStart.getDate() - 29);
   monthStart.setHours(0, 0, 0, 0);
-  const monthFrom = isoDateLocal(monthStart);
-  const monthTo = isoDateLocal(now);
-  if (filters.dateFrom === monthFrom && filters.dateTo === monthTo) {
-    return [];
-  }
-  return [
-    {
+  const yearStart = new Date(now);
+  yearStart.setFullYear(yearStart.getFullYear() - 1);
+  yearStart.setHours(0, 0, 0, 0);
+
+  if (filters.timeframe === "1 month" && filters.dateFrom && filters.dateTo) {
+    push({
       ...filters,
-      dateFrom: monthFrom,
-      dateTo: monthTo,
-    },
-  ];
+      timeframe: "1 month",
+      dateFrom: isoDateLocal(monthStart),
+      dateTo: isoDateLocal(now),
+    });
+  }
+
+  if (filters.timeframe === "1 month" || filters.timeframe === "1 year") {
+    push({
+      ...filters,
+      timeframe: "1 year",
+      dateFrom: isoDateLocal(yearStart),
+      dateTo: isoDateLocal(now),
+    });
+  }
+
+  if (filters.timeframe !== "all") {
+    push({
+      ...filters,
+      timeframe: "all",
+      dateFrom: null,
+      dateTo: null,
+    });
+  }
+
+  return out;
 }
 
 export function studyFiltersKey(filters: QueryFilters): string {

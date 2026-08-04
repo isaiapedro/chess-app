@@ -2,6 +2,7 @@ import React, { useState } from "react";
 import {
   Modal,
   Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
@@ -9,8 +10,15 @@ import {
   View,
   ViewStyle,
 } from "react-native";
-import { colors, font, spacing, withAlpha } from "../theme";
+import { Ionicons } from "@expo/vector-icons";
+import { colors, font, radius, spacing, type, withAlpha } from "../theme";
 
+/* ---------------------------------------------------------------- surfaces */
+
+/**
+ * Soft rounded surface. Replaces the old hard-edged "edge card" — same name so
+ * existing call sites keep working.
+ */
 export function EdgeCard({
   children,
   style,
@@ -21,44 +29,152 @@ export function EdgeCard({
   lifted?: boolean;
 }) {
   return (
-    <View style={[styles.edgeCard, lifted && styles.edgeCardLifted, style]}>
+    <View style={[styles.card, lifted && styles.cardLifted, style]}>
       {children}
     </View>
   );
 }
 
+/** Card with no fill — content grouped by spacing alone. */
+export function BareGroup({
+  children,
+  style,
+}: {
+  children: React.ReactNode;
+  style?: ViewStyle;
+}) {
+  return <View style={[styles.bareGroup, style]}>{children}</View>;
+}
+
+export function Divider({ style }: { style?: ViewStyle }) {
+  return <View style={[styles.divider, style]} />;
+}
+
+/* ----------------------------------------------------------------- buttons */
+
+/**
+ * Minimal action. `ghost` renders text-only (no container at all); default is a
+ * single rounded pill with no nested boxes or offset shadow.
+ */
 export function BrutalButton({
   label,
   onPress,
   disabled,
   ghost,
+  tone,
   style,
 }: {
   label: string;
   onPress?: () => void;
   disabled?: boolean;
   ghost?: boolean;
+  tone?: string;
   style?: ViewStyle;
 }) {
-  return (
-    <View style={[styles.brutalOuter, disabled && styles.brutalDisabledOuter, style]}>
+  const accent = tone || colors.accent;
+  if (ghost) {
+    return (
       <Pressable
         onPress={onPress}
         disabled={disabled}
+        hitSlop={8}
         style={({ pressed }) => [
-          styles.brutalInner,
-          ghost && styles.brutalGhost,
-          disabled && styles.brutalDisabled,
-          pressed && !disabled && styles.brutalPressed,
+          styles.textButton,
+          pressed && !disabled && styles.pressedSoft,
+          style,
         ]}
       >
-        <Text style={[styles.brutalText, ghost && styles.brutalGhostText, disabled && styles.brutalDisabledText]}>
+        <Text
+          style={[
+            styles.textButtonLabel,
+            { color: accent },
+            disabled && styles.disabledText,
+          ]}
+        >
           {label}
         </Text>
       </Pressable>
-    </View>
+    );
+  }
+  return (
+    <Pressable
+      onPress={onPress}
+      disabled={disabled}
+      style={({ pressed }) => [
+        styles.pillButton,
+        { backgroundColor: accent },
+        disabled && styles.pillButtonDisabled,
+        pressed && !disabled && styles.pressedSoft,
+        style,
+      ]}
+    >
+      <Text style={[styles.pillButtonLabel, disabled && styles.disabledText]}>
+        {label}
+      </Text>
+    </Pressable>
   );
 }
+
+/** Icon-only tap target. No frame, no background. */
+export function IconButton({
+  name,
+  onPress,
+  size = 22,
+  color = colors.textSoft,
+  accessibilityLabel,
+  style,
+}: {
+  name: keyof typeof Ionicons.glyphMap;
+  onPress?: () => void;
+  size?: number;
+  color?: string;
+  accessibilityLabel?: string;
+  style?: ViewStyle;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={12}
+      accessibilityRole="button"
+      accessibilityLabel={accessibilityLabel}
+      style={({ pressed }) => [
+        styles.iconButton,
+        pressed && styles.pressedSoft,
+        style,
+      ]}
+    >
+      <Ionicons name={name} size={size} color={color} />
+    </Pressable>
+  );
+}
+
+/** Text + arrow back affordance. */
+export function BackLink({
+  label,
+  onPress,
+  style,
+}: {
+  label: string;
+  onPress?: () => void;
+  style?: ViewStyle;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      hitSlop={10}
+      style={({ pressed }) => [
+        styles.backLink,
+        pressed && styles.pressedSoft,
+        style,
+      ]}
+    >
+      <Ionicons name="chevron-back" size={18} color={colors.textMuted} />
+      <Text style={styles.backLinkLabel}>{label}</Text>
+    </Pressable>
+  );
+}
+
+/* ------------------------------------------------------------------- chips */
 
 export function Pill({
   children,
@@ -73,45 +189,222 @@ export function Pill({
 }) {
   return (
     <View
-      style={[
-        styles.pill,
-        {
-          borderColor: withAlpha(color, 0.45),
-          backgroundColor: withAlpha(color, 0.12),
-        },
-        style,
-      ]}
+      style={[styles.pill, { backgroundColor: withAlpha(color, 0.16) }, style]}
     >
       <Text style={[styles.pillText, { color }, textStyle]}>{children}</Text>
     </View>
   );
 }
 
+/** Selectable rounded chip (filter row). Filled when active, soft when not. */
 export function MetaTag({
   label,
   active,
   onPress,
+  tone,
 }: {
   label: string;
   active?: boolean;
   onPress?: () => void;
+  tone?: string;
 }) {
+  const accent = tone || colors.text;
   return (
     <Pressable
       onPress={onPress}
-      style={[styles.metaTag, active && styles.metaTagActive]}
+      style={({ pressed }) => [
+        styles.chip,
+        active && { backgroundColor: accent },
+        pressed && styles.pressedSoft,
+      ]}
     >
-      <Text style={[styles.metaTagText, active && styles.metaTagTextActive]}>
+      <Text
+        style={[
+          styles.chipText,
+          active && { color: accent === colors.text ? "#000000" : colors.text },
+        ]}
+      >
         {label}
       </Text>
     </Pressable>
   );
 }
 
-export function SectionLabel({ children }: { children: React.ReactNode }) {
-  return <Text style={styles.sectionLabel}>{children}</Text>;
+/* ---------------------------------------------------------------- headings */
+
+/** Small muted kicker above a title. */
+export function Eyebrow({
+  children,
+  color = colors.textDim,
+}: {
+  children: React.ReactNode;
+  color?: string;
+}) {
+  return <Text style={[styles.eyebrow, { color }]}>{children}</Text>;
 }
 
+/** Page-level title. */
+export function DisplayTitle({
+  children,
+  size = 30,
+  style,
+}: {
+  children: React.ReactNode;
+  size?: number;
+  style?: TextStyle;
+}) {
+  return (
+    <Text
+      style={[
+        styles.displayTitle,
+        { fontSize: size, lineHeight: Math.round(size * 1.16) },
+        style,
+      ]}
+    >
+      {children}
+    </Text>
+  );
+}
+
+/** Section name — a plain name, no box, no all-caps tracking. */
+export function SectionLabel({
+  children,
+  style,
+}: {
+  children: React.ReactNode;
+  style?: TextStyle;
+}) {
+  return <Text style={[styles.sectionLabel, style]}>{children}</Text>;
+}
+
+/** Secondary caption under a heading or value. */
+export function Caption({
+  children,
+  style,
+}: {
+  children: React.ReactNode;
+  style?: TextStyle;
+}) {
+  return <Text style={[styles.caption, style]}>{children}</Text>;
+}
+
+/**
+ * Tab row where the active item is marked by a short underline only.
+ */
+export function SectionTabs({
+  items,
+  activeKey,
+  onSelect,
+  style,
+}: {
+  items: { key: string; label: string }[];
+  activeKey: string;
+  onSelect: (key: string) => void;
+  style?: ViewStyle;
+}) {
+  return (
+    <ScrollView
+      horizontal
+      showsHorizontalScrollIndicator={false}
+      contentContainerStyle={[styles.tabsRow, style]}
+    >
+      {items.map((item) => {
+        const active = item.key === activeKey;
+        return (
+          <Pressable
+            key={item.key}
+            onPress={() => onSelect(item.key)}
+            style={styles.tabItem}
+            accessibilityRole="tab"
+            accessibilityState={{ selected: active }}
+          >
+            <Text style={[styles.tabLabel, active && styles.tabLabelActive]}>
+              {item.label}
+            </Text>
+            <View
+              style={[styles.tabUnderline, active && styles.tabUnderlineActive]}
+            />
+          </Pressable>
+        );
+      })}
+    </ScrollView>
+  );
+}
+
+/* ------------------------------------------------------------------- data */
+
+/** Number + name, no container. */
+export function StatTile({
+  label,
+  value,
+  caption,
+  tone = colors.text,
+  style,
+}: {
+  label: string;
+  value: string | number;
+  caption?: string;
+  tone?: string;
+  style?: ViewStyle;
+}) {
+  return (
+    <View style={[styles.statTile, style]}>
+      <Text style={[styles.statValue, { color: tone }]}>{value}</Text>
+      <Text style={styles.statLabel}>{label}</Text>
+      {caption ? <Text style={styles.statCaption}>{caption}</Text> : null}
+    </View>
+  );
+}
+
+/** Thin rounded progress track. */
+export function Meter({
+  ratio,
+  tone = colors.text,
+  markerRatio,
+  style,
+}: {
+  ratio: number;
+  tone?: string;
+  markerRatio?: number;
+  style?: ViewStyle;
+}) {
+  const clamped = Math.max(0, Math.min(1, ratio));
+  return (
+    <View style={[styles.meterTrack, style]}>
+      <View
+        style={[
+          styles.meterFill,
+          { width: `${clamped * 100}%`, backgroundColor: tone },
+        ]}
+      />
+      {markerRatio != null ? (
+        <View
+          style={[
+            styles.meterMarker,
+            { left: `${Math.max(0, Math.min(1, markerRatio)) * 100}%` },
+          ]}
+        />
+      ) : null}
+    </View>
+  );
+}
+
+/** Explicit stand-in for data we don't have yet. */
+export function Placeholder({
+  label = "No data yet",
+  style,
+}: {
+  label?: string;
+  style?: ViewStyle;
+}) {
+  return (
+    <View style={[styles.placeholder, style]}>
+      <Text style={styles.placeholderText}>{label}</Text>
+    </View>
+  );
+}
+
+/** Quiet note card, replaces the taped-paper card. */
 export function PaperCard({
   title,
   children,
@@ -120,20 +413,19 @@ export function PaperCard({
   children: React.ReactNode;
 }) {
   return (
-    <View style={styles.paperWrap}>
-      <View style={styles.paperCard}>
-        <View style={styles.tape} />
-        {title ? <Text style={styles.paperTitle}>{title}</Text> : null}
-        <Text style={styles.paperBody}>{children}</Text>
-      </View>
+    <View style={styles.noteCard}>
+      {title ? <Text style={styles.noteTitle}>{title}</Text> : null}
+      <Text style={styles.noteBody}>{children}</Text>
     </View>
   );
 }
 
+/* ------------------------------------------------------------------ inputs */
+
 export function SearchField({
   value,
   onChangeText,
-  placeholder = "Search...",
+  placeholder = "Search",
 }: {
   value: string;
   onChangeText: (v: string) => void;
@@ -141,7 +433,7 @@ export function SearchField({
 }) {
   return (
     <View style={styles.searchWrap}>
-      <Text style={styles.searchIcon}>⌕</Text>
+      <Ionicons name="search" size={17} color={colors.textDim} />
       <TextInput
         value={value}
         onChangeText={onChangeText}
@@ -150,8 +442,8 @@ export function SearchField({
         style={styles.searchInput}
       />
       {value ? (
-        <Pressable onPress={() => onChangeText("")} hitSlop={8}>
-          <Text style={styles.searchClear}>✕</Text>
+        <Pressable onPress={() => onChangeText("")} hitSlop={10}>
+          <Ionicons name="close" size={17} color={colors.textDim} />
         </Pressable>
       ) : null}
     </View>
@@ -160,6 +452,7 @@ export function SearchField({
 
 type SelectOption = { value: string; label: string };
 
+/** Borderless select: value + caret, opens a rounded sheet. */
 export function SelectField({
   label,
   value,
@@ -176,14 +469,25 @@ export function SelectField({
 
   return (
     <View style={styles.selectGroup}>
-      <Text style={styles.selectLabel}>{label}</Text>
-      <Pressable style={styles.selectField} onPress={() => setOpen(true)}>
+      <Pressable
+        style={({ pressed }) => [
+          styles.selectField,
+          pressed && styles.pressedSoft,
+        ]}
+        onPress={() => setOpen(true)}
+        accessibilityLabel={label}
+      >
         <Text style={styles.selectValue} numberOfLines={1}>
           {current}
         </Text>
-        <Text style={styles.selectCaret}>▾</Text>
+        <Ionicons name="chevron-down" size={14} color={colors.textDim} />
       </Pressable>
-      <Modal visible={open} transparent animationType="fade" onRequestClose={() => setOpen(false)}>
+      <Modal
+        visible={open}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setOpen(false)}
+      >
         <Pressable style={styles.modalBackdrop} onPress={() => setOpen(false)}>
           <View style={styles.modalCard}>
             <Text style={styles.modalTitle}>{label}</Text>
@@ -192,15 +496,23 @@ export function SelectField({
               return (
                 <Pressable
                   key={option.value}
-                  style={[styles.modalOption, active && styles.modalOptionActive]}
+                  style={styles.modalOption}
                   onPress={() => {
                     onChange(option.value);
                     setOpen(false);
                   }}
                 >
-                  <Text style={[styles.modalOptionText, active && styles.modalOptionTextActive]}>
+                  <Text
+                    style={[
+                      styles.modalOptionText,
+                      active && styles.modalOptionTextActive,
+                    ]}
+                  >
                     {option.label}
                   </Text>
+                  {active ? (
+                    <Ionicons name="checkmark" size={18} color={colors.text} />
+                  ) : null}
                 </Pressable>
               );
             })}
@@ -211,264 +523,326 @@ export function SelectField({
   );
 }
 
-export function Eyebrow({ children, color = colors.red }: { children: React.ReactNode; color?: string }) {
-  return <Text style={[styles.eyebrow, { color }]}>{children}</Text>;
-}
-
-export function DisplayTitle({ children, size = 34 }: { children: React.ReactNode; size?: number }) {
-  return <Text style={[styles.displayTitle, { fontSize: size }]}>{children}</Text>;
+/** Settings-style row: name, optional value, chevron. No box. */
+export function SettingsRow({
+  label,
+  value,
+  icon,
+  tone = colors.text,
+  onPress,
+  showChevron = true,
+}: {
+  label: string;
+  value?: string;
+  icon?: keyof typeof Ionicons.glyphMap;
+  tone?: string;
+  onPress?: () => void;
+  showChevron?: boolean;
+}) {
+  return (
+    <Pressable
+      onPress={onPress}
+      style={({ pressed }) => [styles.row, pressed && styles.pressedSoft]}
+      accessibilityRole="button"
+    >
+      {icon ? (
+        <Ionicons name={icon} size={20} color={tone} style={styles.rowIcon} />
+      ) : null}
+      <Text style={[styles.rowLabel, { color: tone }]}>{label}</Text>
+      {value ? <Text style={styles.rowValue}>{value}</Text> : null}
+      {showChevron ? (
+        <Ionicons name="chevron-forward" size={18} color={colors.textDim} />
+      ) : null}
+    </Pressable>
+  );
 }
 
 const styles = StyleSheet.create({
-  edgeCard: {
+  /* surfaces */
+  card: {
     backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 0,
+    borderRadius: radius.md,
     padding: spacing.md,
   },
-  edgeCardLifted: {
-    shadowColor: "#000",
-    shadowOpacity: 0.6,
-    shadowRadius: 0,
-    shadowOffset: { width: 6, height: 6 },
-    elevation: 4,
+  cardLifted: {
+    backgroundColor: colors.surfaceRaised,
   },
-  brutalOuter: {
-    backgroundColor: colors.shadowGray,
-    paddingBottom: 5,
-    paddingRight: 0,
+  bareGroup: {
+    gap: spacing.sm,
   },
-  brutalDisabledOuter: {
-    backgroundColor: colors.mutedAlt,
+  divider: {
+    height: StyleSheet.hairlineWidth,
+    backgroundColor: colors.border,
   },
-  brutalInner: {
-    backgroundColor: colors.red,
-    borderColor: colors.text,
-    borderWidth: 2,
-    paddingVertical: 12,
-    paddingHorizontal: 16,
+
+  /* buttons */
+  pillButton: {
+    borderRadius: radius.pill,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.lg,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  pillButtonDisabled: {
+    backgroundColor: colors.muted,
+  },
+  pillButtonLabel: {
+    ...type.label,
+    fontFamily: font.sansBold,
+    fontSize: 15,
+    color: colors.text,
+  },
+  textButton: {
+    paddingVertical: 10,
     alignItems: "center",
   },
-  brutalGhost: {
-    backgroundColor: colors.bg,
-    borderColor: colors.border,
+  textButtonLabel: {
+    ...type.label,
+    fontFamily: font.sansBold,
+    fontSize: 15,
   },
-  brutalDisabled: {
-    backgroundColor: colors.muted,
-    borderColor: colors.border,
-  },
-  brutalPressed: {
-    transform: [{ translateY: 2 }],
-  },
-  brutalText: {
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-  },
-  brutalGhostText: {
-    color: colors.textSoft,
-  },
-  brutalDisabledText: {
+  disabledText: {
     color: colors.textDisabled,
   },
+  pressedSoft: {
+    opacity: 0.55,
+  },
+  iconButton: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  backLink: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 2,
+    marginBottom: spacing.sm,
+    alignSelf: "flex-start",
+  },
+  backLinkLabel: {
+    ...type.label,
+    color: colors.textMuted,
+  },
+
+  /* chips */
   pill: {
-    borderWidth: 1,
-    borderRadius: 16,
-    paddingHorizontal: 9,
-    paddingVertical: 3,
+    borderRadius: radius.pill,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
     alignSelf: "flex-start",
   },
   pillText: {
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
+    ...type.micro,
+    fontFamily: font.sansMedium,
   },
-  metaTag: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    borderRadius: 4,
-    paddingHorizontal: 8,
-    paddingVertical: 4,
-  },
-  metaTagActive: {
-    backgroundColor: colors.textSoft,
-    borderColor: colors.textSoft,
-  },
-  metaTagText: {
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    color: colors.textMuted,
-  },
-  metaTagTextActive: {
-    color: "#111111",
-  },
-  sectionLabel: {
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    color: colors.textDim,
-    marginBottom: spacing.sm,
-  },
-  paperWrap: {
-    paddingTop: 18,
-    paddingHorizontal: 4,
-  },
-  paperCard: {
-    backgroundColor: colors.cream,
-    paddingTop: 22,
+  chip: {
+    backgroundColor: colors.mutedAlt,
+    borderRadius: radius.pill,
     paddingHorizontal: 18,
-    paddingBottom: 18,
-    transform: [{ rotate: "-1deg" }],
-    shadowColor: "#000",
-    shadowOpacity: 0.45,
-    shadowRadius: 8,
-    shadowOffset: { width: 0, height: 6 },
-    elevation: 5,
+    paddingVertical: 10,
   },
-  tape: {
-    position: "absolute",
-    top: -14,
-    alignSelf: "center",
-    width: 120,
-    height: 28,
-    backgroundColor: "rgba(255,255,255,0.45)",
-    transform: [{ rotate: "-3deg" }],
+  chipText: {
+    ...type.label,
+    color: colors.textSoft,
   },
-  paperTitle: {
-    fontFamily: font.monoMedium,
-    fontSize: 12,
-    letterSpacing: 1.5,
-    textTransform: "uppercase",
-    color: "#6b6355",
+
+  /* headings */
+  eyebrow: {
+    ...type.caption,
+    fontFamily: font.sansMedium,
     marginBottom: 6,
   },
-  paperBody: {
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    lineHeight: 24,
-    color: "#1c1a16",
+  displayTitle: {
+    fontFamily: font.sansBold,
+    color: colors.text,
+    letterSpacing: -0.8,
   },
+  sectionLabel: {
+    ...type.heading,
+    color: colors.text,
+    marginBottom: spacing.sm,
+  },
+  caption: {
+    ...type.caption,
+    color: colors.textDim,
+  },
+  tabsRow: {
+    gap: spacing.lg,
+    paddingRight: spacing.md,
+  },
+  tabItem: {
+    alignItems: "center",
+    gap: 6,
+  },
+  tabLabel: {
+    ...type.subheading,
+    fontFamily: font.sansMedium,
+    color: colors.textDim,
+  },
+  tabLabelActive: {
+    color: colors.text,
+    fontFamily: font.sansBold,
+  },
+  tabUnderline: {
+    height: 2,
+    width: 22,
+    borderRadius: radius.pill,
+    backgroundColor: "transparent",
+  },
+  tabUnderlineActive: {
+    backgroundColor: colors.text,
+  },
+
+  /* data */
+  statTile: {
+    minWidth: 0,
+  },
+  statValue: {
+    ...type.numberMd,
+  },
+  statLabel: {
+    ...type.label,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
+  statCaption: {
+    ...type.caption,
+    color: colors.textDim,
+    marginTop: 4,
+  },
+  meterTrack: {
+    height: 6,
+    borderRadius: radius.pill,
+    backgroundColor: withAlpha("#ffffff", 0.08),
+    overflow: "visible",
+    position: "relative",
+  },
+  meterFill: {
+    height: 6,
+    borderRadius: radius.pill,
+  },
+  meterMarker: {
+    position: "absolute",
+    top: -2,
+    width: 2,
+    height: 10,
+    borderRadius: radius.pill,
+    backgroundColor: colors.rim,
+    marginLeft: -1,
+  },
+  placeholder: {
+    borderRadius: radius.md,
+    backgroundColor: withAlpha("#ffffff", 0.03),
+    paddingVertical: spacing.lg,
+    paddingHorizontal: spacing.md,
+    alignItems: "center",
+  },
+  placeholderText: {
+    ...type.caption,
+    color: colors.textDim,
+  },
+  noteCard: {
+    backgroundColor: colors.surface,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    gap: 6,
+  },
+  noteTitle: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
+    color: colors.text,
+  },
+  noteBody: {
+    ...type.body,
+    color: colors.textMuted,
+  },
+
+  /* inputs */
   searchWrap: {
     flexDirection: "row",
     alignItems: "center",
-    backgroundColor: "rgba(240,240,240,0.08)",
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderRadius: 20,
-    paddingHorizontal: 12,
-    minHeight: 44,
-  },
-  searchIcon: {
-    color: colors.textDim,
-    marginRight: 8,
-    fontSize: 14,
+    gap: spacing.sm,
+    backgroundColor: colors.muted,
+    borderRadius: radius.pill,
+    paddingHorizontal: spacing.md,
+    minHeight: 46,
   },
   searchInput: {
     flex: 1,
     color: colors.text,
-    fontSize: 13,
+    fontFamily: font.sans,
+    fontSize: 15,
     paddingVertical: 10,
-  },
-  searchClear: {
-    color: colors.textDim,
-    fontSize: 14,
-    paddingLeft: 8,
   },
   selectGroup: {
     flex: 1,
     minWidth: 0,
   },
-  selectLabel: {
-    fontFamily: font.mono,
-    fontSize: 10,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    color: colors.textDim,
-    marginBottom: 5,
-  },
   selectField: {
-    minHeight: 42,
-    borderWidth: 1,
-    borderColor: colors.text,
-    backgroundColor: colors.charcoal,
-    paddingHorizontal: 12,
+    minHeight: 38,
+    borderRadius: radius.pill,
+    backgroundColor: colors.muted,
+    paddingHorizontal: spacing.md,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    shadowColor: colors.shadowGray,
-    shadowOpacity: 1,
-    shadowRadius: 0,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 3,
+    gap: 6,
   },
   selectValue: {
     flex: 1,
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    marginRight: 8,
-  },
-  selectCaret: {
-    color: colors.red,
-    fontSize: 12,
+    color: colors.textSoft,
+    fontFamily: font.sansMedium,
+    fontSize: 14,
   },
   modalBackdrop: {
     flex: 1,
-    backgroundColor: "rgba(0,0,0,0.7)",
-    justifyContent: "center",
-    padding: spacing.lg,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "flex-end",
   },
   modalCard: {
-    backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    padding: spacing.md,
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: radius.xl,
+    borderTopRightRadius: radius.xl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
   },
   modalTitle: {
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    letterSpacing: 2,
-    textTransform: "uppercase",
+    ...type.caption,
     color: colors.textDim,
     marginBottom: spacing.sm,
   },
   modalOption: {
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
-  },
-  modalOptionActive: {
-    backgroundColor: withAlpha(colors.red, 0.12),
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    paddingVertical: 14,
   },
   modalOptionText: {
-    fontFamily: font.monoMedium,
-    fontSize: 13,
-    color: colors.textSoft,
-    textTransform: "uppercase",
-    letterSpacing: 1,
+    ...type.body,
+    fontFamily: font.sansMedium,
+    color: colors.textMuted,
   },
   modalOptionTextActive: {
-    color: colors.red,
-  },
-  eyebrow: {
-    fontFamily: font.monoBold,
-    fontSize: 12,
-    letterSpacing: 2.2,
-    textTransform: "uppercase",
-    marginBottom: 8,
-  },
-  displayTitle: {
-    fontFamily: font.display,
     color: colors.text,
-    lineHeight: 40,
+  },
+
+  /* rows */
+  row: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    paddingVertical: 15,
+  },
+  rowIcon: {
+    width: 24,
+  },
+  rowLabel: {
+    ...type.body,
+    fontFamily: font.sansMedium,
+    flex: 1,
+  },
+  rowValue: {
+    ...type.caption,
+    color: colors.textDim,
   },
 });

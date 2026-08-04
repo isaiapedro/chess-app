@@ -8,7 +8,7 @@ import {
 } from "react-native";
 import { LineChart, PieChart } from "react-native-chart-kit";
 import { Text as SvgText } from "react-native-svg";
-import { colors, font, result, spacing } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 import type { HourlyPoint, MonthlyPoint, Period, RatingPoint } from "../api/types";
 import type { RatingCurve } from "../api/selectors";
 
@@ -19,19 +19,24 @@ const chartConfig = {
   backgroundGradientFrom: colors.surface,
   backgroundGradientTo: colors.surface,
   color: (opacity = 1) => `rgba(52, 199, 89, ${opacity})`,
-  labelColor: (opacity = 1) => `rgba(136, 136, 136, ${opacity})`,
+  labelColor: (opacity = 1) => `rgba(160, 160, 160, ${opacity})`,
   decimalPlaces: 0,
+  strokeWidth: 2.5,
   propsForDots: {
-    r: "2",
-    strokeWidth: "1",
-    stroke: result.win,
+    r: "0",
+  },
+  propsForLabels: {
+    fontFamily: font.sans,
+    fontSize: 11,
   },
   propsForBackgroundLines: {
-    stroke: colors.border,
-    strokeDasharray: "4 6",
+    stroke: "rgba(255,255,255,0.05)",
+    strokeDasharray: "",
   },
   fillShadowGradientFrom: result.win,
+  fillShadowGradientFromOpacity: 0.22,
   fillShadowGradientTo: colors.surface,
+  fillShadowGradientToOpacity: 0,
 };
 
 function useEntranceAnimation() {
@@ -159,7 +164,7 @@ export function RatingChart({
 
   return (
     <Animated.View style={[styles.panel, animation]}>
-      <Text style={styles.title}>Rating Progression</Text>
+      <Text style={styles.title}>Rating</Text>
       <LineChart
         data={{
           labels,
@@ -235,7 +240,7 @@ export function MonthlyGamesChart({ points }: { points: MonthlyPoint[] }) {
 
   return (
     <Animated.View style={[styles.panel, animation]}>
-      <Text style={styles.title}>Games by Month</Text>
+      <Text style={styles.title}>Games by month</Text>
       <View style={styles.barRow}>
         {points.map((point) => {
           const ratio = point.games / max;
@@ -271,10 +276,10 @@ export function HourlyGamesChart({
   return (
     <Animated.View style={[styles.panel, animation]}>
       <View style={styles.rowBetween}>
-        <Text style={styles.title}>When You Play</Text>
+        <Text style={styles.title}>When you play</Text>
         {peakLabel ? (
           <Text style={styles.meta}>
-            Peak: <Text style={styles.metaStrong}>{peakLabel}</Text>
+            Peak <Text style={styles.metaStrong}>{peakLabel}</Text>
           </Text>
         ) : null}
       </View>
@@ -357,24 +362,20 @@ export function AnimatedPanel({
 const styles = StyleSheet.create({
   panel: {
     backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderRadius: 0,
-    borderWidth: 1,
+    borderRadius: radius.lg,
     marginBottom: spacing.md,
     overflow: "hidden",
-    padding: spacing.md,
+    paddingVertical: spacing.md,
+    paddingHorizontal: spacing.md,
   },
   title: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    fontWeight: "400",
-    letterSpacing: 2,
-    marginBottom: spacing.sm,
-    textTransform: "uppercase",
+    ...type.subheading,
+    fontFamily: font.sansBold,
+    color: colors.text,
+    marginBottom: spacing.md,
   },
   chart: {
-    borderRadius: 0,
+    borderRadius: radius.md,
     marginLeft: -spacing.sm,
   },
   legendRow: {
@@ -389,13 +390,13 @@ const styles = StyleSheet.create({
     gap: 6,
   },
   legendSwatch: {
-    width: 10,
-    height: 10,
+    width: 8,
+    height: 8,
+    borderRadius: radius.pill,
   },
   legendLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
+    ...type.caption,
+    color: colors.textMuted,
   },
   rowBetween: {
     flexDirection: "row",
@@ -403,19 +404,18 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   meta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 11,
   },
   metaStrong: {
-    color: colors.cream,
-    fontFamily: font.monoBold,
+    color: colors.text,
+    fontFamily: font.sansMedium,
   },
   barRow: {
     flexDirection: "row",
     alignItems: "flex-end",
-    gap: 4,
-    marginTop: spacing.sm,
+    gap: 5,
+    marginTop: spacing.xs,
   },
   barSlot: {
     flex: 1,
@@ -423,21 +423,23 @@ const styles = StyleSheet.create({
   },
   barTrack: {
     width: "100%",
-    height: 96,
+    height: 104,
     justifyContent: "flex-end",
-    backgroundColor: "rgba(255,255,255,0.04)",
+    borderRadius: radius.pill,
+    backgroundColor: withAlpha("#ffffff", 0.04),
+    overflow: "hidden",
   },
   barFill: {
     width: "100%",
-    backgroundColor: colors.cream,
+    borderRadius: radius.pill,
+    backgroundColor: colors.textSoft,
   },
   barFillRed: {
     backgroundColor: colors.red,
   },
   barTick: {
+    ...type.micro,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 10,
-    marginTop: 6,
+    marginTop: 8,
   },
 });

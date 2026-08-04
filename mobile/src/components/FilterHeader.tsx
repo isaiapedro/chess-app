@@ -9,10 +9,10 @@ import {
 import type { Period } from "../api/types";
 import { useFilters } from "../context/FilterContext";
 import { SelectField } from "./ui";
-import { colors, font, spacing, withAlpha } from "../theme";
+import { colors, font, radius, spacing, withAlpha } from "../theme";
 
 const PERIODS: { value: Period; label: string }[] = [
-  { value: "all", label: "All Time" },
+  { value: "all", label: "All time" },
   { value: "year", label: "Year" },
   { value: "month", label: "Month" },
   { value: "week", label: "Week" },
@@ -20,11 +20,11 @@ const PERIODS: { value: Period; label: string }[] = [
 ];
 
 const SPEEDS = [
-  { value: "", label: "All Formats" },
-  { value: "bullet", label: "♟ Bullet" },
-  { value: "blitz", label: "♝ Blitz" },
-  { value: "rapid", label: "♞ Rapid" },
-  { value: "classical", label: "♔ Classical" },
+  { value: "", label: "All formats" },
+  { value: "bullet", label: "Bullet" },
+  { value: "blitz", label: "Blitz" },
+  { value: "rapid", label: "Rapid" },
+  { value: "classical", label: "Classical" },
 ];
 
 const DOW = ["M", "T", "W", "T", "F", "S", "S"] as const;
@@ -99,7 +99,7 @@ export function FilterHeader() {
           onChange={(v) => setPeriod(v as Period)}
         />
         <SelectField
-          label="Time Format"
+          label="Time format"
           value={speed || ""}
           options={SPEEDS}
           onChange={(v) => setSpeed(v || null)}
@@ -175,9 +175,7 @@ export function FilterHeader() {
 
 const styles = StyleSheet.create({
   wrap: {
-    backgroundColor: "rgba(0,0,0,0.96)",
-    borderBottomWidth: 1,
-    borderBottomColor: colors.rim,
+    backgroundColor: colors.bg,
     paddingHorizontal: spacing.md,
     paddingTop: spacing.sm,
     paddingBottom: spacing.sm,
@@ -187,54 +185,54 @@ const styles = StyleSheet.create({
   },
   selectRow: {
     flexDirection: "row",
-    gap: 10,
+    gap: spacing.sm,
   },
   weekRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 1,
+    gap: 2,
   },
   navBtn: {
-    width: 18,
-    height: 30,
+    width: 22,
+    height: 40,
     alignItems: "center",
     justifyContent: "center",
   },
   navText: {
-    color: colors.cream,
-    fontFamily: font.monoBold,
-    fontSize: 18,
-    lineHeight: 20,
+    color: colors.textMuted,
+    fontFamily: font.sansMedium,
+    fontSize: 20,
+    lineHeight: 22,
   },
   weekCell: {
     flex: 1,
     minWidth: 0,
-    height: 30,
+    height: 44,
     alignItems: "center",
     justifyContent: "center",
-    borderRadius: 3,
+    gap: 2,
+    borderRadius: radius.pill,
   },
   weekCellSelected: {
-    backgroundColor: withAlpha(colors.red, 0.22),
+    backgroundColor: withAlpha(colors.red, 0.9),
   },
   weekCellDisabled: {
-    opacity: 0.35,
+    opacity: 0.3,
   },
   weekDow: {
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 8,
-    letterSpacing: 0.3,
-    lineHeight: 10,
+    fontFamily: font.sans,
+    fontSize: 10,
+    lineHeight: 13,
   },
   weekDowSelected: {
-    color: colors.cream,
+    color: withAlpha("#ffffff", 0.8),
   },
   weekDayNum: {
     color: colors.textSoft,
-    fontFamily: font.monoBold,
-    fontSize: 11,
-    lineHeight: 13,
+    fontFamily: font.sansMedium,
+    fontSize: 14,
+    lineHeight: 17,
   },
   weekDayNumSelected: {
     color: colors.text,

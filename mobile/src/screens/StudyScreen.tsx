@@ -23,6 +23,7 @@ import {
   DisplayTitle,
   EdgeCard,
   Pill,
+  SectionTabs,
 } from "../components/ui";
 import { useFilters } from "../context/FilterContext";
 import {
@@ -52,9 +53,9 @@ import {
   joinActiveGlobalScanIfOwned,
   periodReservoirStatus,
   runGlobalPeriodAnalysis,
-  type GlobalAnalysisState,
+  waitForActiveGlobalScan,
 } from "../engine/globalAnalysis";
-import { cancelStudyPrefetch } from "../engine/studyPrefetch";
+import { isStudyPrefetchActive } from "../engine/studyPrefetch";
 import { useStockfish } from "../engine/StockfishProvider";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
 import {
@@ -64,7 +65,7 @@ import {
 } from "../storage/cache";
 import { readMistakesCacheForPeriod } from "../storage/periodCacheReuse";
 import { studyMistakesCacheKey } from "../storage/studyCacheKeys";
-import { colors, font, result, spacing } from "../theme";
+import { colors, font, radius, result, spacing, type } from "../theme";
 
 type Mode = "mistakes" | "repertoire";
 
@@ -384,7 +385,7 @@ export function StudyScreen() {
           active.sessionKey === sessionKey &&
           active.owner === "prefetch"
         ) {
-          setAnalyzeStatus("Waiting for background scan…");
+          setAnalyzeStatus("Waiting for first puzzle batch…");
         }
         const joined = await joinActiveGlobalScanIfOwned({
           sessionKey,
@@ -392,9 +393,9 @@ export function StudyScreen() {
           signal,
           until: async () => {
             const cached = parseMistakesCache(
-              await readCache<MistakesCachePayload | MistakeItem[]>(
-                mistakesCacheKey,
-                STUDY_ANALYSIS_TTL_MS
+              await readMistakesCacheForPeriod(
+                queryFilters,
+                games.map((game) => String(game.id))
               )
             );
             return Boolean(cached?.moments.length);
@@ -403,9 +404,9 @@ export function StudyScreen() {
         if (signal.cancelled) return;
         if (joined) {
           const afterPrefetch = parseMistakesCache(
-            await readCache<MistakesCachePayload | MistakeItem[]>(
-              mistakesCacheKey,
-              STUDY_ANALYSIS_TTL_MS
+            await readMistakesCacheForPeriod(
+              queryFilters,
+              games.map((game) => String(game.id))
             )
           );
           if (afterPrefetch?.moments.length) {
@@ -437,16 +438,63 @@ export function StudyScreen() {
             return;
           }
         }
+        if (isStudyPrefetchActive(sessionKey)) {
+          setAnalyzeStatus("Waiting for first puzzle batch…");
+          await waitForActiveGlobalScan({ sessionKey, signal });
+          if (signal.cancelled) return;
+          const late = parseMistakesCache(
+            await readMistakesCacheForPeriod(
+              queryFilters,
+              games.map((game) => String(game.id))
+            )
+          );
+          if (late?.moments.length) {
+            setMistakes(late.moments);
+            setIdx(0);
+            visibleBatchStartRef.current = 0;
+            pendingBatchRef.current = null;
+            setPendingReady(false);
+            secondPagePrefetchKeyRef.current = null;
+            scannedIdsRef.current = late.scannedGameIds;
+            pendingCandidatesRef.current = late.pendingCandidates || [];
+            deferredCandidatesRef.current = late.deferredCandidates || [];
+            setPendingCount((late.pendingCandidates || []).length);
+            setRemainingGames(late.remaining);
+            thresholdPassRef.current = late.thresholdPass || "strict";
+            baselineAvailableRef.current = Boolean(late.baselineAvailable);
+            setShowScanMore(false);
+            setMistakesError(null);
+            loadedCacheKeyRef.current = mistakesCacheKey;
+            setLoadingMistakes(false);
+            setAnalyzeStatus(null);
+            setAnalyzeProgress(null);
+            setAnalysisComplete(true);
+            completed = true;
+            void syncMistakeReservoir(
+              games,
+              (late.pendingCandidates || []).length
+            );
+            return;
+          }
+        }
       }
 
-      cancelStudyPrefetch();
+      if (isStudyPrefetchActive(sessionKey)) {
+        setMistakesError("Background scan still running. Try again shortly.");
+        setLoadingMistakes(false);
+        return;
+      }
+
+      if (await hydrateFromCache()) {
+        setAnalysisComplete(true);
+        completed = true;
+        return;
+      }
+
       beginPuzzleBatch();
       heldPuzzleSlot = true;
       setAnalyzeStatus("Global Stockfish scan…");
       let delivered = false;
-      const latestStateRef = {
-        current: null as GlobalAnalysisState | null,
-      };
       const partialBatchRef = {
         current: null as Awaited<
           ReturnType<typeof refineRecentMistakeCandidates>
@@ -520,12 +568,9 @@ export function StudyScreen() {
             currentGame: p.currentGame,
           });
         },
-        onGameScanned: (state) => {
-          latestStateRef.current = state;
-        },
         onEarlyMistakesReady: async (candidates, state) => {
           if (signal.cancelled || delivered) return false;
-          setAnalyzeStatus("Refining recent candidates…");
+          setAnalyzeStatus("Deep-refining first mistake batch…");
           const pool = state.mistakeCandidates.length
             ? state.mistakeCandidates
             : candidates;
@@ -548,45 +593,19 @@ export function StudyScreen() {
           });
           if (signal.cancelled) return false;
           partialBatchRef.current = batch;
-          if (batch.moments.length >= TARGET_MISTAKE_MOMENTS) {
+          if (batch.moments.length) {
             await applyBatch(batch, batch.moments);
+            return true;
           }
-          return true;
+          return state.complete;
         },
       });
       if (signal.cancelled) return;
-      const partialBatch = partialBatchRef.current;
-      const latestState = latestStateRef.current;
-      if (
-        !delivered &&
-        partialBatch &&
-        partialBatch.moments.length < TARGET_MISTAKE_MOMENTS &&
-        latestState?.mistakeCandidates?.length
-      ) {
-        setAnalyzeStatus("Refining remaining candidates…");
-        const batch = await refineRecentMistakeCandidates({
-          candidates: latestState.mistakeCandidates,
-          games,
-          evaluate,
-          signal,
-          limit: TARGET_MISTAKE_MOMENTS,
-          existingMoments: partialBatch.moments,
-          lookupEval: createEvalLookup(latestState),
-          fetchMastersPgn: async (gameId) => fetchMastersPgn(gameId),
-          fetchExplorer: async (fen, source) => {
-            const res = await fetchExplorer(fen, source);
-            return {
-              moves: res.moves || [],
-              topGames: res.topGames || [],
-            };
-          },
-          onProgress: pushProgress,
-        });
-        if (!signal.cancelled) partialBatchRef.current = batch;
-      }
-      const finalBatch = partialBatchRef.current;
-      if (!delivered && finalBatch?.moments.length) {
-        await applyBatch(finalBatch, finalBatch.moments);
+      if (!delivered && partialBatchRef.current?.moments.length) {
+        await applyBatch(
+          partialBatchRef.current,
+          partialBatchRef.current.moments
+        );
       }
       if (!delivered) {
         setMistakesError("No critical swings found in recent games.");
@@ -600,10 +619,9 @@ export function StudyScreen() {
     } finally {
       if (heldPuzzleSlot) endPuzzleBatch();
       if (!signal.cancelled) {
+        setLoadingMistakes(false);
         if (completed) {
           setAnalysisComplete(true);
-        } else {
-          setLoadingMistakes(false);
         }
       }
     }
@@ -653,7 +671,6 @@ export function StudyScreen() {
       });
       setAnalyzeStatus("Scanning next batch…");
     }
-    cancelStudyPrefetch();
     beginPuzzleBatch();
     if (silent) {
       backgroundScanningRef.current = true;
@@ -713,38 +730,49 @@ export function StudyScreen() {
         });
         taken = batch.moments.slice(keptMoments.length);
         await consumeCandidates(queryFilters, "mistake", taken);
-      } else if (!vault.complete) {
-        const early: {
-          batch: Awaited<
-            ReturnType<typeof refineRecentMistakeCandidates>
-          > | null;
-          taken: MistakeItem[];
-        } = { batch: null, taken: [] };
-        await runGlobalPeriodAnalysis({
-          filters: queryFilters,
-          evaluate,
-          signal,
-          games,
-          owner: "study",
-          sessionKey: globalScanSessionKey(queryFilters),
-          continueScan: true,
-          onEarlyMistakesReady: async (candidates, state) => {
-            if (signal.cancelled || early.batch) return false;
-            const pool = state.mistakeCandidates.length
-              ? state.mistakeCandidates
-              : candidates;
-            early.batch = await refineRecentMistakeCandidates({
+      } else if (!vault.complete || isStudyPrefetchActive()) {
+        if (!silent) {
+          setAnalyzeStatus("Waiting for more eval buffer…");
+        }
+        let waited = 0;
+        while (
+          !signal.cancelled &&
+          waited < 30 &&
+          (isStudyPrefetchActive() || !vault.complete)
+        ) {
+          await new Promise<void>((resolve) => setTimeout(resolve, 500));
+          waited += 1;
+          const again = await periodReservoirStatus(
+            queryFilters,
+            games,
+            "mistake",
+            {
+              pendingCount: carriedCandidates.length,
+              batchLimit: Number.MAX_SAFE_INTEGER,
+            }
+          );
+          if (again.batch.length || carriedCandidates.length) {
+            batch = await refineRecentMistakeCandidates({
               ...refineOpts,
-              candidates: [...carriedCandidates, ...pool],
-              lookupEval: createEvalLookup(state),
+              candidates: [...carriedCandidates, ...again.batch],
+              lookupEval: createEvalLookup(again.state),
             });
-            early.taken = early.batch.moments.slice(keptMoments.length);
-            await consumeCandidates(queryFilters, "mistake", early.taken);
-            return true;
-          },
-        });
-        batch = early.batch;
-        taken = early.taken;
+            taken = batch.moments.slice(keptMoments.length);
+            await consumeCandidates(queryFilters, "mistake", taken);
+            break;
+          }
+          if (again.complete && !isStudyPrefetchActive()) break;
+        }
+        if (!batch) {
+          setScanExhausted(true);
+          setRemainingGames(0);
+          setPeriodComplete(true);
+          if (!silent) {
+            setShowScanMore(false);
+            setAllDone(true);
+          }
+          return;
+        }
       } else {
         setScanExhausted(true);
         setRemainingGames(0);
@@ -859,11 +887,11 @@ export function StudyScreen() {
           }
           setScanningMore(false);
         }
-      } else if (!signal.cancelled) {
-        if (completed) {
+      } else {
+        setScanningMore(false);
+        setLoadingMistakes(false);
+        if (!signal.cancelled && completed) {
           setAnalysisComplete(true);
-        } else {
-          setScanningMore(false);
         }
       }
     }
@@ -1061,22 +1089,17 @@ export function StudyScreen() {
         keyboardDismissMode="interactive"
         automaticallyAdjustKeyboardInsets
       >
-      <DisplayTitle size={30}>Study Board</DisplayTitle>
+      <DisplayTitle size={30}>Study</DisplayTitle>
 
-      <View style={styles.tabRow}>
-        <Pressable
-          style={[styles.tab, mode === "mistakes" ? styles.tabActive : styles.tabIdle]}
-          onPress={() => setMode("mistakes")}
-        >
-          <Text style={styles.tabText}>Critical Mistakes</Text>
-        </Pressable>
-        <Pressable
-          style={[styles.tab, mode === "repertoire" ? styles.tabActive : styles.tabIdle]}
-          onPress={() => setMode("repertoire")}
-        >
-          <Text style={styles.tabText}>Opening Prep</Text>
-        </Pressable>
-      </View>
+      <SectionTabs
+        style={styles.tabRow}
+        activeKey={mode}
+        onSelect={(key) => setMode(key as typeof mode)}
+        items={[
+          { key: "mistakes", label: "Mistakes" },
+          { key: "repertoire", label: "Openings" },
+        ]}
+      />
 
       <View style={mode === "mistakes" ? undefined : styles.hiddenTab}>
         <PageLoadingTransition
@@ -1114,11 +1137,19 @@ export function StudyScreen() {
             </Text>
           ) : null}
           {showScanMore && canScanMoreMistakes ? (
-            <View style={styles.center}>
+            <View style={[styles.center, { gap: spacing.md }]}>
               <BrutalButton
-                label="Scan more"
+                label="Show more games"
                 disabled={!engineReady}
                 onPress={requestScanMoreMistakes}
+              />
+              <BrutalButton
+                label="Back"
+                ghost
+                onPress={() => {
+                  setShowScanMore(false);
+                  setAllDone(false);
+                }}
               />
             </View>
           ) : null}
@@ -1129,7 +1160,7 @@ export function StudyScreen() {
                 games has been reviewed.
               </Text>
               <BrutalButton
-                label="Go Back"
+                label="Back"
                 onPress={() => {
                   setAllDone(false);
                   setShowScanMore(false);
@@ -1219,7 +1250,7 @@ export function StudyScreen() {
                           },
                         ]}
                       >
-                        Puzzle Move
+                        Your move
                       </Text>
                       <Text
                         style={[
@@ -1244,7 +1275,7 @@ export function StudyScreen() {
                   {revealed ? (
                     <View style={{ flex: 1 }}>
                       <Text style={[styles.compareLabel, { color: result.win }]}>
-                        Best Move
+                        Best move
                       </Text>
                       <Text style={[styles.compareValue, { color: result.win }]}>
                         {current.best_san || current.best_uci}
@@ -1282,7 +1313,7 @@ export function StudyScreen() {
                 ) : null}
                 {!revealed ? (
                   <BrutalButton
-                    label="Reveal Best Move"
+                    label="Reveal best move"
                     onPress={async () => {
                       if (!current.best_uci) return;
                       if (retryTimerRef.current) {
@@ -1328,12 +1359,12 @@ export function StudyScreen() {
               </EdgeCard>
 
               <View style={styles.navRow}>
-                <BrutalButton label="← Prev" ghost onPress={prevMistake} disabled={idx === 0} style={{ flex: 1 }} />
+                <BrutalButton label="Previous" ghost onPress={prevMistake} disabled={idx === 0} style={{ flex: 1 }} />
                 <Text style={styles.pageCount}>
                   {idx + 1}/{mistakes.length}
                 </Text>
                 <BrutalButton
-                  label="Next →"
+                  label="Next"
                   ghost
                   onPress={nextMistake}
                   style={{ flex: 1 }}
@@ -1354,98 +1385,55 @@ export function StudyScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
   hiddenTab: { display: "none" },
-  content: { padding: spacing.md, paddingBottom: 100 },
-  tabRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.md, marginBottom: spacing.md },
-  tab: {
-    flex: 1,
-    paddingVertical: 10,
-    alignItems: "center",
-    borderWidth: 1,
-  },
-  tabActive: {
-    backgroundColor: colors.red,
-    borderColor: colors.text,
-    borderWidth: 2,
-    shadowColor: colors.shadowGray,
-    shadowOpacity: 1,
-    shadowRadius: 0,
-    shadowOffset: { width: 0, height: 3 },
-    elevation: 3,
-  },
-  tabIdle: {
-    backgroundColor: colors.bg,
-    borderColor: colors.border,
-    borderWidth: 2,
-  },
-  tabText: {
-    color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 12,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-  },
-  center: { alignItems: "center", gap: 8, paddingVertical: 24 },
+  content: { padding: spacing.md, paddingBottom: 120 },
+  tabRow: { marginTop: spacing.lg, marginBottom: spacing.lg },
+  center: { alignItems: "center", gap: spacing.sm, paddingVertical: spacing.lg },
   muted: {
+    ...type.bodySmall,
     color: colors.textDim,
     textAlign: "center",
-    fontFamily: font.sans,
-    fontSize: 12,
   },
   error: {
+    ...type.bodySmall,
     color: colors.red,
-    marginBottom: 8,
-    fontFamily: font.mono,
+    marginBottom: spacing.sm,
   },
   mistakeHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     gap: spacing.md,
-    marginBottom: spacing.sm,
-    paddingBottom: spacing.sm,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+    marginBottom: spacing.md,
   },
   gameIdentity: {
     flex: 1,
   },
   gameDate: {
-    color: colors.red,
-    fontFamily: font.monoBold,
-    fontSize: 13,
-    letterSpacing: 1,
-    textTransform: "uppercase",
+    ...type.caption,
+    color: colors.textDim,
+    marginBottom: 2,
   },
   opponentName: {
+    ...type.heading,
     color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 20,
-    marginBottom: 3,
+    marginBottom: 4,
   },
   gameDetails: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    lineHeight: 16,
-    marginBottom: 4,
+    ...type.caption,
+    color: colors.textMuted,
     textTransform: "capitalize",
+    marginBottom: 2,
   },
   openingLine: {
-    color: colors.cream,
-    fontFamily: font.mono,
-    fontSize: 12,
-    lineHeight: 17,
-    marginBottom: 4,
+    ...type.caption,
+    color: colors.textDim,
   },
   metaLine: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
-    marginBottom: 4,
+    marginBottom: 2,
   },
   evalSummary: {
-    width: 118,
+    width: 124,
     alignItems: "flex-end",
     gap: 4,
   },
@@ -1456,17 +1444,16 @@ const styles = StyleSheet.create({
     textAlign: "right",
   },
   evalDrop: {
+    ...type.numberSm,
+    fontSize: 16,
+    lineHeight: 21,
     color: colors.text,
-    fontFamily: font.monoBold,
-    fontSize: 14,
     textAlign: "right",
     width: "100%",
-    fontVariant: ["tabular-nums"],
   },
   evalGain: {
+    ...type.caption,
     color: result.win,
-    fontFamily: font.monoBold,
-    fontSize: 12,
     marginBottom: 2,
     textAlign: "right",
     width: "100%",
@@ -1478,62 +1465,59 @@ const styles = StyleSheet.create({
     textTransform: "none",
   },
   evalBarTrack: {
-    height: 4,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: result.loss,
-    marginBottom: spacing.md,
+    marginBottom: spacing.lg,
+    overflow: "hidden",
   },
   evalBarFill: {
-    height: 4,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: result.win,
   },
   prompt: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
+    marginBottom: spacing.md,
+  },
+  moveCompare: {
+    flexDirection: "row",
+    gap: spacing.lg,
     marginBottom: spacing.sm,
   },
-  moveCompare: { flexDirection: "row", gap: spacing.md, marginBottom: spacing.sm },
   compareLabel: {
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
-    marginBottom: 4,
+    ...type.caption,
+    marginBottom: 2,
   },
   compareValue: {
-    fontFamily: font.display,
-    fontSize: 22,
+    ...type.numberSm,
   },
   feedback: {
+    ...type.label,
     marginTop: spacing.sm,
-    fontFamily: font.monoBold,
-    fontSize: 12,
   },
   comment: {
+    ...type.bodySmall,
     color: colors.textMuted,
     marginTop: spacing.sm,
-    lineHeight: 20,
-    fontFamily: font.sans,
-    fontSize: 12,
   },
   gmGameLine: {
-    color: colors.cream,
+    ...type.caption,
+    color: colors.textDim,
     marginTop: 4,
-    lineHeight: 18,
-    fontFamily: font.mono,
-    fontSize: 11,
   },
   navRow: {
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
-    marginTop: spacing.md,
+    marginTop: spacing.lg,
   },
   pageCount: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
-    minWidth: 40,
+    minWidth: 44,
     textAlign: "center",
   },
   sourceRow: {
@@ -1543,10 +1527,9 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   openingTitle: {
-    color: colors.cream,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    lineHeight: 22,
+    ...type.subheading,
+    fontFamily: font.sansBold,
+    color: colors.text,
     marginBottom: spacing.sm,
   },
   quizGrid: {
@@ -1558,38 +1541,35 @@ const styles = StyleSheet.create({
     width: "48%",
     flexGrow: 1,
     minWidth: "46%",
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    paddingVertical: 12,
-    paddingHorizontal: 12,
+    borderRadius: radius.md,
+    backgroundColor: colors.muted,
+    paddingVertical: 14,
+    paddingHorizontal: spacing.md,
   },
   quizOptionText: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 18,
   },
   moveRow: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
-    paddingVertical: 12,
-    borderBottomWidth: 1,
-    borderBottomColor: colors.border,
+    paddingVertical: 14,
   },
   moveSan: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
   },
   moveMeta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
     marginTop: 2,
   },
   moveWr: {
-    fontFamily: font.display,
-    fontSize: 16,
+    ...type.numberSm,
+    fontSize: 17,
+    lineHeight: 22,
   },
 });

@@ -20,13 +20,14 @@ import { OpeningInsightsPanel } from "../components/OpeningInsightsPanel";
 import { MiddlegameInsightsPanel } from "../components/MiddlegameInsightsPanel";
 import { EndgameInsightsPanel } from "../components/EndgameInsightsPanel";
 import {
+  BackLink,
   DisplayTitle,
   EdgeCard,
   SearchField,
   SectionLabel,
 } from "../components/ui";
 import { useInsightsNav } from "../context/InsightsNavContext";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type Props = {
   data: InsightsResponse;
@@ -228,9 +229,9 @@ export function CatalogScreen({ data, onBack }: Props) {
               <Pressable
                 key={section.key}
                 onPress={() => openSection(section.key)}
-                style={[
+                style={({ pressed }) => [
                   styles.categoryCard,
-                  { borderTopColor: section.color },
+                  pressed && styles.categoryCardPressed,
                 ]}
               >
                 <Text style={[styles.categoryIcon, { color: section.color }]}>
@@ -257,11 +258,13 @@ export function CatalogScreen({ data, onBack }: Props) {
           {filtered.map((section) => (
             <View key={section.key} style={{ marginBottom: spacing.md }}>
               <View style={styles.sectionHead}>
-                <Text style={{ color: section.color }}>{section.icon}</Text>
-                <Text style={[styles.sectionTitle, { color: section.color }]}>
-                  {section.title}
-                </Text>
-                <View style={styles.rule} />
+                <Text style={styles.sectionTitle}>{section.title}</Text>
+                <View
+                  style={[
+                    styles.sectionUnderline,
+                    { backgroundColor: section.color },
+                  ]}
+                />
               </View>
               {section.metrics.map((metric) => (
                 <MetricCard key={metric.id} metric={metric} />
@@ -296,18 +299,14 @@ export function CatalogScreen({ data, onBack }: Props) {
       <Animated.View style={[styles.sheet, { opacity: contentOpacity }]}>
         <ScrollView style={styles.scroll} contentContainerStyle={styles.content}>
           <View style={styles.header}>
-            <Pressable
+            <BackLink
+              label={activeSection ? "All categories" : "Insights"}
               onPress={() => {
                 animatePopRef.current();
               }}
-              hitSlop={8}
-            >
-              <Text style={styles.back}>
-                {activeSection ? "← All Categories" : "← Insights Summary"}
-              </Text>
-            </Pressable>
+            />
             <DisplayTitle size={30}>
-              {current?.title || "Metrics Catalog"}
+              {current?.title || "Metrics"}
             </DisplayTitle>
             {!activeSection ? (
               <>
@@ -361,7 +360,7 @@ const styles = StyleSheet.create({
   },
   scroll: { flex: 1, backgroundColor: colors.bg },
   content: { paddingBottom: 100 },
-  header: { padding: spacing.md },
+  header: { padding: spacing.md, paddingTop: spacing.md },
   pad: { paddingHorizontal: spacing.md },
   grid: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm },
   categoryCard: {
@@ -369,82 +368,66 @@ const styles = StyleSheet.create({
     flexGrow: 1,
     minWidth: "46%",
     backgroundColor: colors.surface,
-    borderColor: colors.border,
-    borderWidth: 1,
-    borderTopWidth: 3,
+    borderRadius: radius.lg,
     padding: spacing.md,
+    paddingVertical: spacing.lg,
   },
-  categoryIcon: { fontSize: 22, marginBottom: 8 },
+  categoryCardPressed: { opacity: 0.6 },
+  categoryIcon: { fontSize: 24, marginBottom: spacing.sm },
   categoryTitle: {
+    ...type.subheading,
+    fontFamily: font.sansBold,
     color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    marginBottom: 4,
+    marginBottom: 2,
   },
   categoryMeta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1,
-  },
-  back: {
-    color: colors.red,
-    fontFamily: font.monoBold,
-    fontSize: 15,
-    letterSpacing: 1,
-    textTransform: "uppercase",
-    marginBottom: spacing.md,
   },
   empty: {
+    ...type.body,
     color: colors.textDim,
-    fontFamily: font.sans,
     textAlign: "center",
-    marginTop: spacing.lg,
+    marginTop: spacing.xl,
   },
   sectionHead: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: spacing.sm,
-    marginBottom: spacing.sm,
+    alignItems: "flex-start",
+    gap: 6,
+    marginBottom: spacing.md,
   },
   sectionTitle: {
-    fontFamily: font.monoBold,
-    fontSize: 13,
-    letterSpacing: 1.2,
-    textTransform: "uppercase",
+    ...type.heading,
+    color: colors.text,
   },
-  rule: {
-    flex: 1,
-    height: 1,
-    backgroundColor: withAlpha("#ffffff", 0.12),
+  sectionUnderline: {
+    height: 2,
+    width: 28,
+    borderRadius: radius.pill,
   },
   metricName: {
-    color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 16,
-    marginBottom: 6,
-  },
-  metricValue: {
-    color: colors.text,
-    fontFamily: font.display,
-    fontSize: 22,
+    ...type.label,
+    color: colors.textMuted,
     marginBottom: 4,
   },
+  metricValue: {
+    ...type.numberSm,
+    color: colors.text,
+    marginBottom: 6,
+  },
   metricUnit: {
+    ...type.caption,
     color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 12,
   },
   metricDesc: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 12,
-    lineHeight: 17,
   },
   barTrack: {
-    marginTop: 12,
-    height: 3,
+    marginTop: spacing.md,
+    height: 6,
+    borderRadius: radius.pill,
     backgroundColor: withAlpha("#ffffff", 0.08),
+    overflow: "hidden",
   },
-  barFill: { height: 3 },
+  barFill: { height: 6, borderRadius: radius.pill },
 });

@@ -9,7 +9,7 @@ import {
 import Svg, { Path } from "react-native-svg";
 import { Chess, Square } from "chess.js";
 import { tryMove, uciFromMove } from "../engine/chessMoves";
-import { colors, withAlpha } from "../theme";
+import { colors, font, radius, withAlpha } from "../theme";
 import {
   ALPHA_PIECES,
   ALPHA_VIEWBOX,
@@ -221,13 +221,10 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   boardShadow: {
-    backgroundColor: colors.shadowGray,
-    paddingBottom: 4,
-    paddingRight: 0,
+    backgroundColor: "transparent",
   },
   board: {
-    borderWidth: 2,
-    borderColor: colors.text,
+    borderRadius: radius.md,
     overflow: "hidden",
     backgroundColor: colors.boardDark,
   },
@@ -243,36 +240,37 @@ const styles = StyleSheet.create({
     borderColor: colors.sage,
   },
   highlight: {
-    backgroundColor: withAlpha(colors.sage, 0.55),
+    backgroundColor: withAlpha(colors.sage, 0.5),
   },
   guessHighlight: {
-    backgroundColor: withAlpha(colors.blue, 0.55),
+    backgroundColor: withAlpha(colors.blue, 0.5),
   },
   coord: {
     position: "absolute",
     zIndex: 2,
-    fontSize: 11,
+    fontFamily: font.sansMedium,
+    fontSize: 10,
     lineHeight: 12,
-    fontWeight: "700",
     includeFontPadding: false,
   },
   rankCoord: {
     top: 3,
-    left: 3,
+    left: 4,
   },
   fileCoord: {
     bottom: 3,
-    right: 3,
+    right: 4,
   },
   dot: {
     position: "absolute",
-    width: 12,
-    height: 12,
+    width: 11,
+    height: 11,
     borderRadius: 6,
     backgroundColor: withAlpha(colors.red, 0.45),
   },
   captureRing: {
     ...StyleSheet.absoluteFillObject,
+    borderRadius: radius.xs,
     borderWidth: 3,
     borderColor: withAlpha(colors.red, 0.55),
   },

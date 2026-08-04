@@ -36,7 +36,7 @@ import {
   peerTimeInvestedCaption,
   ratingBand,
 } from "../data/baselines";
-import { colors, font, result, spacing, withAlpha } from "../theme";
+import { colors, font, radius, result, spacing, type } from "../theme";
 
 function debugRecapLog(
   message: string,
@@ -99,7 +99,7 @@ const HERO_PIECES = [
 const FIXED_LOADER_MS = 2000;
 
 function usesFixedLoader(period: Period): boolean {
-  return period === "day" || period === "week" || period === "month";
+  return period === "month";
 }
 
 export function RecapScreen() {
@@ -161,13 +161,13 @@ export function RecapScreen() {
     }
   }, [refreshAnalytics]);
 
-  const loading = (gamesLoading && !data) || !minLoaderDone;
-  const showPieceLoader = loading && usesFixedLoader(period);
-  const showSkeleton = loading && !data && !usesFixedLoader(period);
+  const showPieceLoader =
+    usesFixedLoader(period) && (!minLoaderDone || !data);
+  const showSkeleton = !usesFixedLoader(period) && !data;
   const contentKey = showPieceLoader
     ? `loader:${period}:${periodLabel}`
     : showSkeleton
-      ? `skeleton:${period}`
+      ? `skeleton:${period}:${refreshToken}`
       : error && !data
         ? "error"
         : data
@@ -331,7 +331,7 @@ export function RecapScreen() {
 
       {view.badges.length ? (
         <View style={styles.sectionPad}>
-          <SectionLabel>Your Playing Archetypes</SectionLabel>
+          <SectionLabel>Playing archetypes</SectionLabel>
           <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.badgeRow}>
             {view.badges.map((item, index) => {
               const active = index === activeBadge;
@@ -341,14 +341,11 @@ export function RecapScreen() {
                   onPress={() => setActiveBadge(index)}
                   style={[
                     styles.badgeChip,
-                    active && {
-                      borderColor: colors.cream,
-                      backgroundColor: withAlpha(colors.cream, 0.12),
-                    },
+                    active && { backgroundColor: colors.text },
                   ]}
                 >
                   <Text style={styles.badgeEmoji}>{item.emoji}</Text>
-                  <Text style={[styles.badgeTitle, active && { color: colors.cream }]}>
+                  <Text style={[styles.badgeTitle, active && { color: "#000000" }]}>
                     {item.title}
                   </Text>
                 </Pressable>
@@ -362,7 +359,7 @@ export function RecapScreen() {
       ) : null}
 
       <View style={styles.sectionPad}>
-        <SectionLabel>What You Could Have Done Instead</SectionLabel>
+        <SectionLabel>Time spent instead</SectionLabel>
         <View style={styles.grid}>
           {view.comparisons.map((item) => (
             <EdgeCard key={item.label} style={styles.gridCard}>
@@ -393,14 +390,14 @@ const styles = StyleSheet.create({
     padding: spacing.lg,
   },
   error: {
+    ...type.subheading,
     color: colors.red,
-    fontFamily: font.monoBold,
     marginBottom: spacing.sm,
     textAlign: "center",
   },
   muted: {
+    ...type.bodySmall,
     color: colors.textDim,
-    fontFamily: font.sans,
     textAlign: "center",
   },
   hero: {
@@ -433,9 +430,8 @@ const styles = StyleSheet.create({
   },
   byline: {
     marginTop: spacing.sm,
+    ...type.body,
     color: colors.textMuted,
-    fontFamily: font.sans,
-    fontSize: 14,
   },
   peakRow: {
     paddingHorizontal: spacing.md,
@@ -445,12 +441,9 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   peakLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 2,
-    textTransform: "uppercase",
-    marginBottom: 6,
+    ...type.label,
+    color: colors.textMuted,
+    marginBottom: 2,
   },
   peakValueRow: {
     flexDirection: "row",
@@ -458,13 +451,12 @@ const styles = StyleSheet.create({
     gap: spacing.sm,
   },
   peakValue: {
-    color: colors.text,
-    fontFamily: font.monoBold,
+    ...type.numberLg,
     fontSize: 52,
     lineHeight: 58,
-    letterSpacing: -1,
+    letterSpacing: -2,
+    color: colors.text,
     includeFontPadding: false,
-    fontVariant: ["tabular-nums"],
   },
   streakBadge: {
     width: 50,
@@ -493,15 +485,15 @@ const styles = StyleSheet.create({
     right: 0,
     textAlign: "center",
     color: STREAK_OUTLINE_COLOR,
-    fontFamily: font.monoBold,
-    fontSize: 28,
+    fontFamily: font.sansBold,
+    fontSize: 26,
     lineHeight: 29,
     fontVariant: ["tabular-nums"],
   },
   streakCount: {
     color: "#FFF7ED",
-    fontFamily: font.monoBold,
-    fontSize: 28,
+    fontFamily: font.sansBold,
+    fontSize: 26,
     lineHeight: 29,
     textAlign: "center",
     fontVariant: ["tabular-nums"],
@@ -518,78 +510,66 @@ const styles = StyleSheet.create({
     width: "48.4%",
   },
   statLabel: {
-    color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 11,
-    letterSpacing: 1.5,
-    textTransform: "uppercase",
-    marginBottom: 8,
-  },
-  statValue: {
-    color: colors.text,
-    fontFamily: font.display,
-    fontSize: 30,
-    lineHeight: 34,
+    ...type.label,
+    color: colors.textMuted,
     marginBottom: 6,
   },
+  statValue: {
+    ...type.numberMd,
+    color: colors.text,
+    marginBottom: 4,
+  },
   statSub: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 11,
   },
   sectionPad: {
     paddingHorizontal: spacing.md,
-    paddingTop: spacing.md,
+    paddingTop: spacing.xl,
   },
   badgeRow: {
     gap: spacing.sm,
-    paddingBottom: spacing.sm,
+    paddingBottom: spacing.md,
   },
   badgeChip: {
-    minWidth: 112,
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: "rgba(255,255,255,0.04)",
-    paddingHorizontal: 14,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: colors.mutedAlt,
+    borderRadius: radius.pill,
+    paddingHorizontal: 16,
     paddingVertical: 10,
   },
   badgeEmoji: {
-    fontSize: 18,
-    marginBottom: 6,
+    fontSize: 16,
   },
   badgeTitle: {
+    ...type.label,
     color: colors.textSoft,
-    fontFamily: font.displayMedium,
-    fontSize: 14,
   },
   compIcon: {
-    color: colors.red,
+    color: colors.textMuted,
     fontSize: 16,
     marginBottom: 8,
   },
   compValue: {
+    ...type.numberMd,
+    fontSize: 26,
+    lineHeight: 32,
     color: colors.text,
-    fontFamily: font.display,
-    fontSize: 28,
-    lineHeight: 30,
-    marginBottom: 6,
+    marginBottom: 4,
   },
   compValueSmall: {
-    fontFamily: font.displayMedium,
-    fontSize: 18,
-    lineHeight: 22,
+    ...type.subheading,
+    fontFamily: font.sansBold,
   },
   compLabel: {
-    color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 12,
-    lineHeight: 14,
+    ...type.label,
+    color: colors.textMuted,
   },
   compSub: {
     marginTop: 4,
-    color: colors.textDisabled,
-    fontFamily: font.mono,
-    fontSize: 11,
-    lineHeight: 13,
+    ...type.caption,
+    color: colors.textDim,
   },
 });

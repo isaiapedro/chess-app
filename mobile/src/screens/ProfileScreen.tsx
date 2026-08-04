@@ -1,19 +1,32 @@
 import React, { useState } from "react";
 import {
   ActivityIndicator,
-  Pressable,
+  ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { BrutalButton, DisplayTitle, MetaTag } from "../components/ui";
+import { Ionicons } from "@expo/vector-icons";
+import {
+  BrutalButton,
+  Caption,
+  Divider,
+  DisplayTitle,
+  MetaTag,
+  SectionLabel,
+  SettingsRow,
+} from "../components/ui";
 import { useAuth } from "../context/AuthContext";
 import { useFilters } from "../context/FilterContext";
 import { resetPrefetchMemory } from "../engine/studyPrefetch";
 import { clearAppCache } from "../storage/cache";
 import type { Platform } from "../api/types";
-import { colors, font, result, spacing } from "../theme";
+import { colors, font, radius, result, spacing, type } from "../theme";
+
+// Not wired to a backend yet — surfaced as explicit placeholders.
+const BUG_REPORT_PLACEHOLDER = "Bug report destination not configured yet.";
+const DONATE_PLACEHOLDER = "Donation link not configured yet.";
 
 export function ProfileScreen() {
   const auth = useAuth();
@@ -37,7 +50,7 @@ export function ProfileScreen() {
       refresh();
       setStatus(
         removed
-          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"} (incl. Stockfish vault).`
+          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"}.`
           : "Nothing cached."
       );
     } catch (e) {
@@ -99,30 +112,41 @@ export function ProfileScreen() {
     }
   };
 
+  const platformLabel =
+    auth.platform === "lichess" ? "Lichess" : "Chess.com";
+
   return (
-    <View style={styles.container}>
+    <ScrollView
+      style={styles.scroll}
+      contentContainerStyle={styles.content}
+      keyboardShouldPersistTaps="handled"
+    >
       <DisplayTitle size={30}>Profile</DisplayTitle>
-      <Text style={styles.muted}>Account, local data & tools</Text>
 
       {auth.isLoggedIn ? (
-        <View style={styles.card}>
-          <Text style={styles.label}>Signed in</Text>
-          <Text style={styles.value}>{auth.username}</Text>
-          <Text style={styles.meta}>
-            {auth.platform === "lichess" ? "Lichess" : "Chess.com"}
-            {auth.email ? ` · ${auth.email}` : ""}
-          </Text>
-          <BrutalButton
-            label={busy ? "Working…" : "Log out"}
-            onPress={() => void onLogout()}
-            disabled={busy}
-            ghost
-            style={styles.button}
-          />
+        <View style={styles.identity}>
+          <View style={styles.avatar}>
+            <Text style={styles.avatarInitial}>
+              {(auth.username || "?").slice(0, 1).toUpperCase()}
+            </Text>
+          </View>
+          <View style={styles.identityText}>
+            <Text style={styles.identityName} numberOfLines={1}>
+              {auth.username || "Unnamed player"}
+            </Text>
+            <Text style={styles.identityMeta} numberOfLines={1}>
+              {platformLabel}
+              {auth.email ? ` · ${auth.email}` : ""}
+            </Text>
+          </View>
         </View>
       ) : (
-        <View style={styles.card}>
-          <Text style={styles.label}>Sign in</Text>
+        <View style={styles.signInBlock}>
+          <SectionLabel>Sign in</SectionLabel>
+          <Caption>
+            Connect an account to ingest your games on-device.
+          </Caption>
+
           <View style={styles.toggleRow}>
             <MetaTag
               label="Chess.com"
@@ -138,166 +162,199 @@ export function ProfileScreen() {
 
           {loginPlatform === "chesscom" ? (
             <View style={styles.form}>
-              <Text style={styles.fieldLabel}>Username</Text>
               <TextInput
                 value={chessUsername}
                 onChangeText={setChessUsername}
                 autoCapitalize="none"
                 autoCorrect={false}
-                placeholder="chess.com username"
+                placeholder="Chess.com username"
                 placeholderTextColor={colors.textDim}
                 style={styles.input}
               />
-              <Text style={styles.fieldLabel}>Email</Text>
               <TextInput
                 value={chessEmail}
                 onChangeText={setChessEmail}
                 autoCapitalize="none"
                 autoCorrect={false}
                 keyboardType="email-address"
-                placeholder="contact email for API User-Agent"
+                placeholder="Contact email (API user agent)"
                 placeholderTextColor={colors.textDim}
                 style={styles.input}
               />
               <BrutalButton
-                label={busy ? "Signing in…" : "Save Chess.com account"}
+                label={busy ? "Signing in…" : "Continue"}
                 onPress={() => void onChesscomLogin()}
                 disabled={busy}
-                style={styles.button}
               />
             </View>
           ) : (
             <View style={styles.form}>
-              <Text style={styles.help}>
+              <Caption>
                 Lichess OAuth requests email:read and study:write so the app can
                 load your games and add positions to a study.
-              </Text>
+              </Caption>
               <BrutalButton
                 label={busy ? "Opening Lichess…" : "Continue with Lichess"}
                 onPress={() => void onLichessLogin()}
                 disabled={busy}
-                style={styles.button}
               />
             </View>
           )}
           {busy ? (
-            <ActivityIndicator color={colors.cream} style={{ marginTop: spacing.sm }} />
+            <ActivityIndicator color={colors.textMuted} style={styles.spinner} />
           ) : null}
         </View>
       )}
 
-      <BrutalButton
-        label={clearing ? "Clearing…" : "Clear cache"}
-        onPress={() => void onClearCache()}
-        disabled={clearing}
-        style={styles.button}
-      />
+      <View style={styles.section}>
+        <SectionLabel>Settings</SectionLabel>
+        <SettingsRow
+          label={clearing ? "Clearing cache…" : "Clear cached data"}
+          icon="trash-outline"
+          onPress={() => void onClearCache()}
+          showChevron={false}
+        />
+        <Divider />
+        <SettingsRow
+          label="Report a bug"
+          icon="bug-outline"
+          value="Placeholder"
+          onPress={() => {
+            setFailed(false);
+            setStatus(BUG_REPORT_PLACEHOLDER);
+          }}
+        />
+        <Divider />
+        <SettingsRow
+          label="Donate"
+          icon="heart-outline"
+          value="Placeholder"
+          onPress={() => {
+            setFailed(false);
+            setStatus(DONATE_PLACEHOLDER);
+          }}
+        />
+        {auth.isLoggedIn ? (
+          <>
+            <Divider />
+            <SettingsRow
+              label={busy ? "Signing out…" : "Log out"}
+              icon="log-out-outline"
+              tone={colors.red}
+              onPress={() => void onLogout()}
+              showChevron={false}
+            />
+          </>
+        ) : null}
+      </View>
+
       {status ? (
-        <Text
-          style={[styles.status, failed ? styles.statusErr : styles.statusOk]}
-        >
-          {status}
-        </Text>
-      ) : null}
-      {!auth.isLoggedIn ? (
-        <Pressable onPress={() => undefined}>
-          <Text style={styles.footerHint}>
-            Sign in to ingest games on-device. Explorer / masters still use the API.
+        <View style={styles.statusRow}>
+          <Ionicons
+            name={failed ? "alert-circle-outline" : "checkmark-circle-outline"}
+            size={16}
+            color={failed ? result.loss : colors.sage}
+          />
+          <Text
+            style={[
+              styles.status,
+              { color: failed ? result.loss : colors.sage },
+            ]}
+          >
+            {status}
           </Text>
-        </Pressable>
+        </View>
       ) : null}
-    </View>
+
+      <View style={styles.section}>
+        <SectionLabel>About</SectionLabel>
+        <SettingsRow label="Version" value="Placeholder" showChevron={false} />
+        <Divider />
+        <SettingsRow label="Terms & privacy" value="Placeholder" />
+      </View>
+    </ScrollView>
   );
 }
 
 const styles = StyleSheet.create({
-  container: {
+  scroll: {
     flex: 1,
     backgroundColor: colors.bg,
-    padding: spacing.md,
   },
-  muted: {
-    marginTop: spacing.md,
-    marginBottom: spacing.md,
-    color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 14,
+  content: {
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.lg,
+    paddingBottom: 120,
   },
-  card: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.surface,
-    padding: spacing.md,
-    marginBottom: spacing.md,
-    gap: spacing.sm,
+  identity: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.md,
+    marginTop: spacing.lg,
+    marginBottom: spacing.sm,
   },
-  label: {
-    color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 11,
-    textTransform: "uppercase",
-    letterSpacing: 1,
+  avatar: {
+    width: 64,
+    height: 64,
+    borderRadius: radius.pill,
+    backgroundColor: colors.mutedAlt,
+    alignItems: "center",
+    justifyContent: "center",
   },
-  value: {
+  avatarInitial: {
+    ...type.title,
+    color: colors.textSoft,
+  },
+  identityText: {
+    flex: 1,
+    minWidth: 0,
+  },
+  identityName: {
+    ...type.heading,
     color: colors.text,
-    fontFamily: font.displayMedium,
-    fontSize: 22,
   },
-  meta: {
+  identityMeta: {
+    ...type.caption,
     color: colors.textDim,
-    fontFamily: font.mono,
-    fontSize: 12,
+    marginTop: 2,
+  },
+  signInBlock: {
+    marginTop: spacing.xl,
+    gap: spacing.sm,
   },
   toggleRow: {
     flexDirection: "row",
     gap: spacing.sm,
     flexWrap: "wrap",
+    marginTop: spacing.xs,
   },
   form: {
     gap: spacing.sm,
-    marginTop: spacing.xs,
-  },
-  fieldLabel: {
-    color: colors.textMuted,
-    fontFamily: font.mono,
-    fontSize: 11,
+    marginTop: spacing.sm,
   },
   input: {
-    borderWidth: 1,
-    borderColor: colors.border,
-    backgroundColor: colors.charcoal,
+    borderRadius: radius.pill,
+    backgroundColor: colors.muted,
     color: colors.text,
-    fontFamily: font.mono,
-    fontSize: 14,
-    paddingHorizontal: spacing.sm,
-    paddingVertical: 10,
-  },
-  help: {
-    color: colors.textDim,
     fontFamily: font.sans,
-    fontSize: 13,
-    lineHeight: 18,
+    fontSize: 15,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 13,
   },
-  button: {
-    alignSelf: "stretch",
-    marginTop: spacing.xs,
+  spinner: {
+    marginTop: spacing.sm,
+  },
+  section: {
+    marginTop: spacing.xl,
+  },
+  statusRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 6,
+    marginTop: spacing.md,
   },
   status: {
-    marginTop: spacing.sm,
-    fontFamily: font.mono,
-    fontSize: 12,
-  },
-  statusOk: {
-    color: colors.sage,
-  },
-  statusErr: {
-    color: result.loss,
-  },
-  footerHint: {
-    marginTop: spacing.md,
-    color: colors.textDim,
-    fontFamily: font.sans,
-    fontSize: 12,
-    lineHeight: 17,
+    ...type.caption,
+    flex: 1,
   },
 });

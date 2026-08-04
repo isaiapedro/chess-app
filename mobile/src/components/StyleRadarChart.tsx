@@ -8,7 +8,7 @@ type Props = {
   axes: StyleRadarAxis[];
 };
 
-const RINGS = 4;
+const RINGS = 3;
 const LABEL_PAD = 28;
 
 function polar(
@@ -77,7 +77,7 @@ export function StyleRadarChart({ axes }: Props) {
               key={`ring-${idx}`}
               points={points}
               fill="none"
-              stroke={withAlpha("#ffffff", idx === RINGS - 1 ? 0.22 : 0.1)}
+              stroke={withAlpha("#ffffff", idx === RINGS - 1 ? 0.16 : 0.07)}
               strokeWidth={1}
             />
           ))}
@@ -88,15 +88,16 @@ export function StyleRadarChart({ axes }: Props) {
               y1={cy}
               x2={p.x}
               y2={p.y}
-              stroke={withAlpha("#ffffff", 0.14)}
+              stroke={withAlpha("#ffffff", 0.07)}
               strokeWidth={1}
             />
           ))}
           <Polygon
             points={valuePoints}
-            fill={withAlpha(colors.cream, 0.22)}
-            stroke={colors.cream}
+            fill={withAlpha(colors.blue, 0.28)}
+            stroke={colors.blue}
             strokeWidth={2}
+            strokeLinejoin="round"
           />
           {axes.map((axis, i) => {
             const t = Math.max(0, Math.min(100, axis.score)) / 100;
@@ -106,8 +107,8 @@ export function StyleRadarChart({ axes }: Props) {
                 key={`dot-${axis.key}`}
                 cx={p.x}
                 cy={p.y}
-                r={3.5}
-                fill={colors.cream}
+                r={3}
+                fill={colors.blue}
               />
             );
           })}
@@ -116,9 +117,9 @@ export function StyleRadarChart({ axes }: Props) {
               key={`label-${label.key}`}
               x={label.x}
               y={label.y}
-              fill={colors.text}
+              fill={colors.textMuted}
               fontSize={11}
-              fontFamily={font.mono}
+              fontFamily={font.sansMedium}
               textAnchor="middle"
               alignmentBaseline="middle"
             >
