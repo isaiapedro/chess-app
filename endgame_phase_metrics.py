@@ -157,7 +157,7 @@ def _only_b(s: dict[str, Any]) -> bool:
 
 
 def _sq_color(sq: int) -> int:
-    return chess.square_color(sq)
+    return (chess.square_rank(sq) + chess.square_file(sq)) % 2
 
 
 def _find_strong_side(w: dict, b: dict, pred) -> chess.Color | None:

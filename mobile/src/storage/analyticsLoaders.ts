@@ -73,6 +73,7 @@ import {
   studyFiltersKey,
   studyHeuristicsStoreCacheKey,
   relatedPeriodFilters,
+  withoutSpeedFilter,
 } from "./studyCacheKeys";
 
 type HeuristicGameEntry = {
@@ -237,28 +238,41 @@ async function tryRemeshSessionFromRelated(
   return null;
 }
 
+function filterStudyGamesByView(
+  games: StudyGame[],
+  filters: QueryFilters
+): StudyGame[] {
+  if (!filters.speed && !filters.color && !filters.result) {
+    return games;
+  }
+  return toStudyGameList(
+    filterNormalizedGames(games as NormalizedGame[], filters)
+  );
+}
+
 export async function ensureSession(
   filters: QueryFilters,
   forceNetwork = false
 ): Promise<SessionBundle> {
-  const fk = filtersKey(filters);
+  const period = withoutSpeedFilter(filters);
+  const fk = filtersKey(period);
   const mode = forceNetwork ? "force" : "soft";
   return takeInflight(`session:${fk}:${mode}`, async () => {
-    const gamesKey = analyticsStudyGamesCacheKey(filters);
-    const recapKey = analyticsRecapCacheKey(filters);
-    const insightsKey = analyticsInsightsCacheKey(filters);
+    const gamesKey = analyticsStudyGamesCacheKey(period);
+    const recapKey = analyticsRecapCacheKey(period);
+    const insightsKey = analyticsInsightsCacheKey(period);
 
-    if (!filters.username.trim()) {
+    if (!period.username.trim()) {
       const bundle: SessionBundle = {
         games: [],
-        recap: emptyRecap(filters),
-        insights: emptyInsights(filters),
+        recap: emptyRecap(period),
+        insights: emptyInsights(period),
       };
       return bundle;
     }
 
     if (!forceNetwork) {
-      const analyticsTtl = analyticsTtlMs(filters);
+      const analyticsTtl = analyticsTtlMs(period);
       const [games, recap, insights] = await Promise.all([
         readCache<StudyGame[]>(gamesKey, GAMES_TTL_MS),
         readCache<RecapResponse>(recapKey, analyticsTtl),
@@ -267,29 +281,26 @@ export async function ensureSession(
       if (games != null && recap && insights) {
         return { games, recap, insights };
       }
-      const remeshed = await tryRemeshSessionFromRelated(filters);
+      const remeshed = await tryRemeshSessionFromRelated(period);
       if (remeshed) return remeshed;
     }
 
     await yieldForUi({ heavy: true });
-    const page = await loadLocalGamesPage(filters, {
+    const page = await loadLocalGamesPage(period, {
       force: forceNetwork,
       limit: GAMES_FIRST_PAGE_SIZE,
       offset: 0,
     });
-    await yieldForUi({ heavy: true });
     const allFiltered: NormalizedGame[] = page.allFiltered;
     const periodGames = toStudyGameList(allFiltered);
-    await yieldForUi({ heavy: true });
-    const recap = buildLocalRecap(filters, allFiltered);
-    await yieldForUi({ heavy: true });
-    const insights = buildLocalInsights(filters, allFiltered);
+    const recap = buildLocalRecap(period, allFiltered);
+    const insights = buildLocalInsights(period, allFiltered);
     const bundle: SessionBundle = {
       games: periodGames,
       recap,
       insights,
     };
-    await writeSessionCaches(filters, bundle);
+    await writeSessionCaches(period, bundle);
     return bundle;
   });
 }
@@ -298,16 +309,21 @@ export async function ensureStudyGames(
   filters: QueryFilters,
   forceNetwork = false
 ): Promise<StudyGame[]> {
-  const key = analyticsStudyGamesCacheKey(filters);
+  const period = withoutSpeedFilter(filters);
   const fk = filtersKey(filters);
   return takeInflight(`games:${fk}`, async () => {
     if (!filters.username.trim()) return [];
     if (!forceNetwork) {
-      const cached = await readCache<StudyGame[]>(key, GAMES_TTL_MS);
-      if (cached?.length) return cached;
+      const cached = await readCache<StudyGame[]>(
+        analyticsStudyGamesCacheKey(period),
+        GAMES_TTL_MS
+      );
+      if (cached?.length) {
+        return filterStudyGamesByView(cached, filters);
+      }
     }
-    const session = await ensureSession(filters, forceNetwork);
-    return session.games;
+    const session = await ensureSession(period, forceNetwork);
+    return filterStudyGamesByView(session.games, filters);
   });
 }
 
@@ -316,15 +332,19 @@ export async function ensureStudyGamesUpTo(
   maxGames = GLOBAL_MAX_GAMES,
   forceNetwork = false
 ): Promise<StudyGame[]> {
-  const key = analyticsStudyGamesCacheKey(filters);
+  const period = withoutSpeedFilter(filters);
   const fk = filtersKey(filters);
   const cap = Math.max(0, Math.min(maxGames, GAMES_PAGE_SIZE));
   return takeInflight(`games-up-to:${fk}:${cap}:${forceNetwork}`, async () => {
     if (!filters.username.trim()) return [];
     if (!forceNetwork) {
-      const cached = await readCache<StudyGame[]>(key, GAMES_TTL_MS);
-      if (cached && cached.length >= cap) {
-        return cached.slice(0, cap);
+      const cached = await readCache<StudyGame[]>(
+        analyticsStudyGamesCacheKey(period),
+        GAMES_TTL_MS
+      );
+      if (cached) {
+        const filtered = filterStudyGamesByView(cached, filters);
+        if (filtered.length >= cap) return filtered.slice(0, cap);
       }
     }
     const page = await loadLocalGamesPage(filters, {
@@ -333,7 +353,9 @@ export async function ensureStudyGamesUpTo(
       offset: 0,
     });
     const games = toStudyGameList(page.allFiltered.slice(0, cap));
-    await writeCache(key, games);
+    if (!filters.speed && !filters.color && !filters.result) {
+      await writeCache(analyticsStudyGamesCacheKey(period), games);
+    }
     return games;
   });
 }
@@ -812,17 +834,25 @@ export async function ensureRecap(
   filters: QueryFilters,
   forceNetwork = false
 ): Promise<RecapResponse> {
-  const key = analyticsRecapCacheKey(filters);
+  const period = withoutSpeedFilter(filters);
+  const key = analyticsRecapCacheKey(period);
   return takeInflight(`recap:${filtersKey(filters)}:${forceNetwork}`, async () => {
-    if (!forceNetwork) {
-      const cached = await readCache<RecapResponse>(
-        key,
-        analyticsTtlMs(filters)
-      );
-      if (cached) return cached;
+    const session = await ensureSession(period, forceNetwork);
+    if (!filters.speed && !filters.color && !filters.result) {
+      if (!forceNetwork) {
+        const cached = await readCache<RecapResponse>(
+          key,
+          analyticsTtlMs(period)
+        );
+        if (cached) return cached;
+      }
+      return session.recap;
     }
-    const session = await ensureSession(filters, forceNetwork);
-    return session.recap;
+    const filtered = filterNormalizedGames(
+      session.games as NormalizedGame[],
+      filters
+    );
+    return buildLocalRecap(filters, filtered);
   });
 }
 
@@ -830,19 +860,27 @@ export async function ensureInsights(
   filters: QueryFilters,
   forceNetwork = false
 ): Promise<InsightsResponse> {
-  const key = analyticsInsightsCacheKey(filters);
+  const period = withoutSpeedFilter(filters);
+  const key = analyticsInsightsCacheKey(period);
   return takeInflight(
     `insights:${filtersKey(filters)}:${forceNetwork}`,
     async () => {
-      if (!forceNetwork) {
-        const cached = await readCache<InsightsResponse>(
-          key,
-          analyticsTtlMs(filters)
-        );
-        if (cached) return cached;
+      const session = await ensureSession(period, forceNetwork);
+      if (!filters.speed && !filters.color && !filters.result) {
+        if (!forceNetwork) {
+          const cached = await readCache<InsightsResponse>(
+            key,
+            analyticsTtlMs(period)
+          );
+          if (cached) return cached;
+        }
+        return session.insights;
       }
-      const session = await ensureSession(filters, forceNetwork);
-      return session.insights;
+      const filtered = filterNormalizedGames(
+        session.games as NormalizedGame[],
+        filters
+      );
+      return buildLocalInsights(filters, filtered);
     }
   );
 }

@@ -4,11 +4,13 @@ import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
 import PagerView from "react-native-pager-view";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import { useFilters } from "../context/FilterContext";
 import { useTabSwipe } from "../context/TabSwipeContext";
 import { RecapScreen } from "../screens/RecapScreen";
 import { InsightsScreen } from "../screens/InsightsScreen";
 import { StudyScreen } from "../screens/StudyScreen";
 import { ProfileScreen } from "../screens/ProfileScreen";
+import { studyFiltersKey } from "../storage/studyCacheKeys";
 import { colors } from "../theme";
 
 const TAB_ORDER = ["Wrapped", "Insights", "Study", "Profile"] as const;
@@ -18,8 +20,7 @@ const TAB_PILL_SCALE = 0.945;
 const TAB_PILL_HEIGHT = 43.47;
 const TAB_PILL_RADIUS = 24.57;
 const TAB_SLOT_HEIGHT = 46;
-const TAB_PILL_DELAY_MS = 36;
-const TAB_PILL_DURATION_MS = 71;
+const TAB_PILL_DURATION_MS = 40;
 
 type TabName = (typeof TAB_ORDER)[number];
 
@@ -37,14 +38,67 @@ const TAB_ICONS: Record<TabName, keyof typeof Ionicons.glyphMap> = {
   Profile: "person-outline",
 };
 
+function TabFadePage({
+  active,
+  visitKey,
+  children,
+}: {
+  active: boolean;
+  visitKey: string;
+  children: React.ReactNode;
+}) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  const visitedKeyRef = useRef<string | null>(null);
+  const animRef = useRef<Animated.CompositeAnimation | null>(null);
+
+  useEffect(() => {
+    if (!active) return;
+
+    if (visitedKeyRef.current === visitKey) {
+      animRef.current?.stop();
+      opacity.setValue(1);
+      return;
+    }
+
+    visitedKeyRef.current = visitKey;
+    animRef.current?.stop();
+    opacity.setValue(0);
+    const frame = requestAnimationFrame(() => {
+      animRef.current = Animated.timing(opacity, {
+        toValue: 1,
+        duration: 240,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      });
+      animRef.current.start();
+    });
+    return () => {
+      cancelAnimationFrame(frame);
+      animRef.current?.stop();
+    };
+  }, [active, visitKey, opacity]);
+
+  return (
+    <View style={styles.page}>
+      <Animated.View style={[styles.pageFade, { opacity }]}>
+        {children}
+      </Animated.View>
+    </View>
+  );
+}
+
 export function TabNavigator() {
   const pagerRef = useRef<PagerView>(null);
   const [activeIndex, setActiveIndex] = useState(0);
   const [tabFrames, setTabFrames] = useState<TabFrame[]>([]);
   const pillX = useRef(new Animated.Value(0)).current;
+  const pillAnimRef = useRef<Animated.CompositeAnimation | null>(null);
   const readyRef = useRef(false);
   const insets = useSafeAreaInsets();
   const { setActiveTabIndex, pageProgress } = useTabSwipe();
+  const { queryFilters, refreshToken } = useFilters();
+  const visitKey = `${studyFiltersKey(queryFilters)}:${refreshToken}`;
+
   const openPage = (index: number) => {
     setActiveIndex(index);
     setActiveTabIndex(index);
@@ -56,7 +110,10 @@ export function TabNavigator() {
   }, [activeIndex, setActiveTabIndex]);
 
   const activeFrame = tabFrames[activeIndex];
-  const pillWidth = activeFrame ? activeFrame.width * TAB_PILL_SCALE : 0;
+  const pillWidth =
+    activeFrame && activeFrame.width > 0
+      ? activeFrame.width * TAB_PILL_SCALE
+      : 0;
   const pillTop = activeFrame
     ? activeFrame.y + (activeFrame.height - TAB_PILL_HEIGHT) / 2
     : TAB_BAR_PADDING + (TAB_SLOT_HEIGHT - TAB_PILL_HEIGHT) / 2;
@@ -71,17 +128,15 @@ export function TabNavigator() {
       return;
     }
 
-    const animation = Animated.sequence([
-      Animated.delay(TAB_PILL_DELAY_MS),
-      Animated.timing(pillX, {
-        toValue: target,
-        duration: TAB_PILL_DURATION_MS,
-        easing: Easing.linear,
-        useNativeDriver: true,
-      }),
-    ]);
-    animation.start();
-    return () => animation.stop();
+    pillAnimRef.current?.stop();
+    const anim = Animated.timing(pillX, {
+      toValue: target,
+      duration: TAB_PILL_DURATION_MS,
+      easing: Easing.out(Easing.quad),
+      useNativeDriver: true,
+    });
+    pillAnimRef.current = anim;
+    anim.start();
   }, [activeFrame, activeIndex, pillWidth, pillX]);
 
   const onTabLayout = (
@@ -102,7 +157,10 @@ export function TabNavigator() {
       ) {
         return prev;
       }
-      const next = prev.slice();
+      const next = Array.from(
+        { length: TAB_ORDER.length },
+        (_, i) => prev[i] ?? { x: 0, y: 0, width: 0, height: 0 }
+      );
       next[index] = { x, y, width, height };
       return next;
     });
@@ -126,17 +184,25 @@ export function TabNavigator() {
           pageProgress.setValue(position);
         }}
       >
-        <View key="Wrapped" style={styles.page}>
-          <RecapScreen />
+        <View key="Wrapped" collapsable={false}>
+          <TabFadePage active={activeIndex === 0} visitKey={visitKey}>
+            <RecapScreen />
+          </TabFadePage>
         </View>
-        <View key="Insights" style={styles.page}>
-          <InsightsScreen />
+        <View key="Insights" collapsable={false}>
+          <TabFadePage active={activeIndex === 1} visitKey={visitKey}>
+            <InsightsScreen />
+          </TabFadePage>
         </View>
-        <View key="Study" style={styles.page}>
-          <StudyScreen />
+        <View key="Study" collapsable={false}>
+          <TabFadePage active={activeIndex === 2} visitKey={visitKey}>
+            <StudyScreen />
+          </TabFadePage>
         </View>
-        <View key="Profile" style={styles.page}>
-          <ProfileScreen />
+        <View key="Profile" collapsable={false}>
+          <TabFadePage active={activeIndex === 3} visitKey={visitKey}>
+            <ProfileScreen />
+          </TabFadePage>
         </View>
       </PagerView>
 
@@ -208,6 +274,10 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   page: {
+    flex: 1,
+    backgroundColor: colors.bg,
+  },
+  pageFade: {
     flex: 1,
     backgroundColor: colors.bg,
   },

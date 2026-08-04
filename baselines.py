@@ -18,11 +18,72 @@ from middlegame_phase_metrics import (
 
 ROOT = Path(__file__).resolve().parent
 BASELINES_DIR = ROOT / ".cache" / "baselines"
+RUNS_DIR = BASELINES_DIR / "runs"
 DEFAULT_BASELINE_PATH = BASELINES_DIR / "opening_mix_lichess_v1.parquet"
 DEFAULT_BASELINE_JSON = BASELINES_DIR / "opening_mix_lichess_v1.json"
 MOBILE_BASELINE_JSON = (
     ROOT / "mobile" / "assets" / "baselines" / "opening_mix_lichess_v1.json"
 )
+
+
+def default_run_dir(source_month: str) -> Path:
+    return RUNS_DIR / source_month
+
+
+def cell_file_stem(band: str, speed: str) -> str:
+    return f"{band}__{speed}"
+
+
+def parse_cell_stem(stem: str) -> tuple[str, str]:
+    band, speed = stem.split("__", 1)
+    return band, speed
+
+
+def activity_rows_from_bucket(
+    by_user: dict[str, list[float]],
+) -> list[dict[str, float | str]]:
+    rows: list[dict[str, float | str]] = []
+    for name, vals in by_user.items():
+        rows.append(
+            {
+                "username": name,
+                "games": float(vals[0]),
+                "est_seconds": float(vals[1]),
+            }
+        )
+    return rows
+
+
+def activity_bucket_from_rows(
+    rows: list[dict],
+) -> dict[str, list[float]]:
+    by_user: dict[str, list[float]] = {}
+    for row in rows:
+        name = str(row.get("username") or "").strip()
+        if not name:
+            continue
+        by_user[name] = [
+            float(row.get("games") or 0),
+            float(row.get("est_seconds") or 0),
+        ]
+    return by_user
+
+
+def estimate_game_seconds_from_tc(tc: str) -> float:
+    raw = (tc or "").strip()
+    if not raw or raw == "-":
+        return 0.0
+    try:
+        if "+" in raw:
+            base_s, inc_s = raw.split("+", 1)
+            base = int(base_s)
+            inc = int(inc_s)
+        else:
+            base = int(raw)
+            inc = 0
+    except ValueError:
+        return 0.0
+    return float(base + inc * 40)
 LICHESS_MONTHLY_URL = (
     "https://database.lichess.org/standard/"
     "lichess_db_standard_rated_{month}.pgn.zst"
@@ -51,6 +112,7 @@ SECONDS_PER_MOVE = {
 }
 
 PLAYER_ACTIVITY_SAMPLE_MOD = 32
+ACTIVITY_MIN_GAMES = 5
 
 ACTIVITY_METRIC_KEYS = (
     "avg_games_per_player_month",
@@ -255,6 +317,17 @@ def baselines_payload(df: pd.DataFrame | None = None) -> dict:
             raw = row.get(key)
             if raw is not None and pd.notna(raw):
                 entry[key] = float(raw)
+        raw_values = row.get("values")
+        if raw_values is not None and not (
+            isinstance(raw_values, float) and pd.isna(raw_values)
+        ):
+            if isinstance(raw_values, (list, tuple)):
+                entry["values"] = [float(v) for v in raw_values]
+            else:
+                try:
+                    entry["values"] = [float(v) for v in list(raw_values)]
+                except TypeError:
+                    pass
         bucket[metric] = entry
     return {
         "meta": {
@@ -593,19 +666,28 @@ def player_activity_from_rows(
 def player_activity_metric_fields(
     by_user: dict[str, list[float]],
     source_month: str,
+    min_games: int = ACTIVITY_MIN_GAMES,
 ) -> dict[str, object]:
     empty: dict[str, object] = {key: None for key in ACTIVITY_METRIC_KEYS}
     empty["players_n"] = 0
     if not by_user:
         return empty
-    games = [vals[0] for vals in by_user.values()]
-    secs = [vals[1] for vals in by_user.values()]
+    active = {
+        name: vals
+        for name, vals in by_user.items()
+        if float(vals[0]) >= min_games
+    }
+    if not active:
+        return empty
+    games = [vals[0] for vals in active.values()]
+    secs = [vals[1] for vals in active.values()]
     n = len(games)
     days = max(1, days_in_source_month(source_month))
     weeks = days / 7.0
 
-    def dist(values: list[float], digits: int) -> dict[str, float | None]:
-        ordered = sorted(values)
+    def dist(values: list[float], digits: int) -> dict[str, object]:
+        ordered = sorted(float(v) for v in values)
+        rounded = [round(v, digits) for v in ordered]
         return {
             "mean": round(sum(ordered) / len(ordered), digits),
             "p10": percentile_at(ordered, 10),
@@ -613,6 +695,7 @@ def player_activity_metric_fields(
             "p50": percentile_at(ordered, 50),
             "p75": percentile_at(ordered, 75),
             "p90": percentile_at(ordered, 90),
+            "values": rounded,
         }
 
     games_week = [g / weeks for g in games]

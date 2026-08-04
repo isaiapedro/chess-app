@@ -64,10 +64,27 @@ function useEntranceAnimation() {
 
 function sampleSeries(points: RatingPoint[], limit = 40): RatingPoint[] {
   if (points.length <= limit) return points;
+  let peakIdx = 0;
+  let troughIdx = 0;
+  for (let i = 1; i < points.length; i += 1) {
+    if (points[i].user_rating > points[peakIdx].user_rating) peakIdx = i;
+    if (points[i].user_rating < points[troughIdx].user_rating) troughIdx = i;
+  }
+  const chosen = new Set<number>([0, points.length - 1, peakIdx, troughIdx]);
   const step = (points.length - 1) / (limit - 1);
-  return Array.from({ length: limit }, (_, index) => {
-    return points[Math.round(index * step)];
-  });
+  for (let index = 0; index < limit; index += 1) {
+    chosen.add(Math.round(index * step));
+    if (chosen.size >= limit) break;
+  }
+  if (chosen.size < limit) {
+    for (let i = 0; i < points.length && chosen.size < limit; i += 1) {
+      chosen.add(i);
+    }
+  }
+  return [...chosen]
+    .sort((a, b) => a - b)
+    .slice(0, limit)
+    .map((index) => points[index]);
 }
 
 function hourTick(hour: number): string {

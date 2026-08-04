@@ -11,15 +11,25 @@ function isoDateLocal(d: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+export function withoutSpeedFilter(filters: QueryFilters): QueryFilters {
+  return { ...filters, speed: null };
+}
+
+export function analyticsPeriodKey(filters: QueryFilters): string {
+  return studyFiltersKey(withoutSpeedFilter(filters));
+}
+
 export function relatedPeriodFilters(filters: QueryFilters): QueryFilters[] {
   const out: QueryFilters[] = [];
   const seen = new Set<string>();
-  const selfKey = studyFiltersKey(filters);
+  const period = withoutSpeedFilter(filters);
+  const selfKey = studyFiltersKey(period);
   const push = (next: QueryFilters) => {
-    const key = studyFiltersKey(next);
+    const candidate = withoutSpeedFilter(next);
+    const key = studyFiltersKey(candidate);
     if (key === selfKey || seen.has(key)) return;
     seen.add(key);
-    out.push(next);
+    out.push(candidate);
   };
 
   const now = new Date();
@@ -30,27 +40,27 @@ export function relatedPeriodFilters(filters: QueryFilters): QueryFilters[] {
   yearStart.setFullYear(yearStart.getFullYear() - 1);
   yearStart.setHours(0, 0, 0, 0);
 
-  if (filters.timeframe === "1 month" && filters.dateFrom && filters.dateTo) {
+  if (period.timeframe === "1 month" && period.dateFrom && period.dateTo) {
     push({
-      ...filters,
+      ...period,
       timeframe: "1 month",
       dateFrom: isoDateLocal(monthStart),
       dateTo: isoDateLocal(now),
     });
   }
 
-  if (filters.timeframe === "1 month" || filters.timeframe === "1 year") {
+  if (period.timeframe === "1 month" || period.timeframe === "1 year") {
     push({
-      ...filters,
+      ...period,
       timeframe: "1 year",
       dateFrom: isoDateLocal(yearStart),
       dateTo: isoDateLocal(now),
     });
   }
 
-  if (filters.timeframe !== "all") {
+  if (period.timeframe !== "all") {
     push({
-      ...filters,
+      ...period,
       timeframe: "all",
       dateFrom: null,
       dateTo: null,
@@ -71,6 +81,18 @@ export function studyFiltersKey(filters: QueryFilters): string {
     part(filters.dateFrom),
     part(filters.dateTo),
   ].join("|");
+}
+
+export function studySolvedMistakesCacheKey(
+  filters: Pick<QueryFilters, "username" | "platform">
+): string {
+  return `study:solved-mistakes:v1:${part(filters.username).toLowerCase()}|${part(
+    filters.platform
+  )}`;
+}
+
+export function studyMistakesSessionCacheKey(filters: QueryFilters): string {
+  return `study:mistakes-session:v1:${studyFiltersKey(filters)}`;
 }
 
 export function studyMistakesCacheKey(filters: QueryFilters): string {
@@ -120,15 +142,15 @@ export function analyticsVaultHeuristicsCacheKey(filters: QueryFilters): string 
 }
 
 export function analyticsStudyGamesCacheKey(filters: QueryFilters): string {
-  return `analytics:study-games:v2:${studyFiltersKey(filters)}`;
+  return `analytics:study-games:v3:${analyticsPeriodKey(filters)}`;
 }
 
 export function analyticsRecapCacheKey(filters: QueryFilters): string {
-  return `analytics:recap:v1:${studyFiltersKey(filters)}`;
+  return `analytics:recap:v2:${analyticsPeriodKey(filters)}`;
 }
 
 export function analyticsInsightsCacheKey(filters: QueryFilters): string {
-  return `analytics:insights:v1:${studyFiltersKey(filters)}`;
+  return `analytics:insights:v2:${analyticsPeriodKey(filters)}`;
 }
 
 export function analyticsEndgamePhaseCacheKey(filters: QueryFilters): string {

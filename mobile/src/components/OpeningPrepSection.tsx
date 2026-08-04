@@ -16,6 +16,7 @@ import {
 } from "../storage/analyticsLoaders";
 import { ChessBoard } from "../components/ChessBoard";
 import {
+  FadeFromBlank,
   OpeningChoiceSkeleton,
   PageLoadingTransition,
 } from "../components/LoadingSkeletons";
@@ -437,8 +438,8 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
         baselineAvailableRef.current = Boolean(cached.baselineAvailable);
         const filtered = filterGamesByOpening(allGames, color, opening);
         filteredGamesRef.current = filtered;
-        setPhase("quiz");
-        setAnalyzeStatus(null);
+        completionTargetRef.current = "quiz";
+        setAnalysisComplete(true);
         void syncOpeningReservoir(
           allGames,
           filtered.map((g) => String(g.id)),
@@ -497,8 +498,8 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
             setRemainingGames(cached.remaining);
             thresholdPassRef.current = cached.thresholdPass || "strict";
             baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-            setPhase("quiz");
-            setAnalyzeStatus(null);
+            completionTargetRef.current = "quiz";
+            setAnalysisComplete(true);
             completed = true;
             void syncOpeningReservoir(
               allGames,
@@ -633,7 +634,6 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
         baselineAvailable: batch.baselineAvailable,
       } satisfies OpeningCachePayload);
       completed = true;
-      setPhase("quiz");
     } catch (e) {
       if (signal.cancelled) return;
       setError(e instanceof Error ? e.message : "Opening analysis failed");
@@ -1182,32 +1182,43 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
   }, [allGames, color]);
 
   if (loadingGames) {
-    return <OpeningChoiceSkeleton />;
+    return (
+      <FadeFromBlank contentKey="loading" ready style={styles.flowFade}>
+        <OpeningChoiceSkeleton />
+      </FadeFromBlank>
+    );
   }
 
   if (phase === "color") {
     return (
-      <View>
-        {error ? <Text style={styles.error}>{error}</Text> : null}
-        <Text style={styles.prompt}>Which side do you want to study?</Text>
-        <View style={styles.choiceRow}>
-          <BrutalButton
-            label="White"
-            onPress={() => chooseColor("white")}
-            style={{ flex: 1 }}
-          />
-          <BrutalButton
-            label="Black"
-            onPress={() => chooseColor("black")}
-            style={{ flex: 1 }}
-          />
+      <FadeFromBlank contentKey="color" ready style={styles.flowFade}>
+        <View>
+          {error ? <Text style={styles.error}>{error}</Text> : null}
+          <Text style={styles.prompt}>Which side do you want to study?</Text>
+          <View style={styles.choiceRow}>
+            <BrutalButton
+              label="White"
+              onPress={() => chooseColor("white")}
+              style={{ flex: 1 }}
+            />
+            <BrutalButton
+              label="Black"
+              onPress={() => chooseColor("black")}
+              style={{ flex: 1 }}
+            />
+          </View>
         </View>
-      </View>
+      </FadeFromBlank>
     );
   }
 
   if (phase === "opening" && color) {
     return (
+      <FadeFromBlank
+        contentKey={`opening:${color}`}
+        ready
+        style={styles.flowFade}
+      >
       <KeyboardAvoidingView
         behavior={Platform.OS === "ios" ? "padding" : undefined}
         keyboardVerticalOffset={Platform.OS === "ios" ? 96 : 0}
@@ -1316,6 +1327,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
           style={{ marginTop: spacing.md }}
         />
       </KeyboardAvoidingView>
+      </FadeFromBlank>
     );
   }
 
@@ -1616,6 +1628,11 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     }
 
     return (
+      <FadeFromBlank
+        contentKey={`study:${color || "_"}:${selectedOpening?.key || "_"}`}
+        ready
+        style={styles.flowFade}
+      >
       <PageLoadingTransition
         active={phase === "analyze" || scanningMore}
         contentKey={
@@ -1648,11 +1665,13 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       >
         {content}
       </PageLoadingTransition>
+      </FadeFromBlank>
     );
   }
 }
 
 const styles = StyleSheet.create({
+  flowFade: { flexGrow: 1 },
   center: { alignItems: "center", paddingVertical: spacing.lg, gap: spacing.sm },
   prompt: {
     ...type.heading,

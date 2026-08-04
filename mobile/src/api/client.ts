@@ -178,6 +178,22 @@ export async function fetchBaselines(
   );
 }
 
+export async function registerServerUser(payload: {
+  platform: Platform;
+  username: string;
+  email: string;
+}): Promise<void> {
+  try {
+    await fetch(`${API_BASE}/api/v1/users/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    /* registry is best-effort; device auth still works offline */
+  }
+}
+
 const EXPLORER_MAX_INFLIGHT = 3;
 let explorerInflight = 0;
 const explorerWaiters: Array<() => void> = [];

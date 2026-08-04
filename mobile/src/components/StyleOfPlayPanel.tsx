@@ -26,6 +26,7 @@ import type { StyleMetricsAggregate } from "../engine/styleMetrics";
 import {
   lookupBaseline,
   normalizeSpeed,
+  peerDeltaLabel,
   ratingBand,
   type BaselineMetricHit,
 } from "../data/baselines";
@@ -959,15 +960,37 @@ export function StyleOfPlayPanel() {
             const scaleMax = scale
               ? resolveScaleMax(scale, hit)
               : null;
+            const deltaLabel =
+              metric.baselineKey && hit?.mean != null
+                ? peerDeltaLabel(metric.userNum, hit.mean, metric.unit)
+                : null;
+            const deltaPositive =
+              metric.userNum != null &&
+              hit?.mean != null &&
+              metric.userNum >= hit.mean;
             return (
               <EdgeCard key={metric.name} style={styles.card}>
                 <View style={styles.cardRow}>
                   <View style={styles.cardBody}>
                     <Text style={styles.name}>{metric.name}</Text>
-                    <Text style={styles.value}>
-                      {metric.value}
-                      <Text style={styles.unit}> {metric.unit}</Text>
-                    </Text>
+                    <View style={styles.valueRow}>
+                      <Text style={styles.value}>
+                        {metric.value}
+                        <Text style={styles.unit}> {metric.unit}</Text>
+                      </Text>
+                      {deltaLabel ? (
+                        <Text
+                          style={[
+                            styles.peerDelta,
+                            {
+                              color: deltaPositive ? result.win : result.loss,
+                            },
+                          ]}
+                        >
+                          {deltaLabel}
+                        </Text>
+                      ) : null}
+                    </View>
                     {scaleMax != null ? (
                       <MetricBulletGraph
                         value={metric.userNum}
@@ -1060,11 +1083,21 @@ const styles = StyleSheet.create({
   value: {
     ...type.numberSm,
     color: colors.text,
+  },
+  valueRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: spacing.sm,
     marginBottom: 2,
+    flexWrap: "wrap",
   },
   unit: {
     ...type.caption,
     color: colors.textMuted,
+  },
+  peerDelta: {
+    ...type.caption,
+    fontFamily: font.sansMedium,
   },
   bulletWrap: {
     marginTop: 10,
@@ -1096,12 +1129,14 @@ const styles = StyleSheet.create({
   },
   bulletPeer: {
     position: "absolute",
-    top: -3,
-    bottom: -3,
-    width: 2,
-    marginLeft: -1,
+    top: -4,
+    bottom: -4,
+    width: 3,
+    marginLeft: -1.5,
     borderRadius: radius.pill,
-    backgroundColor: colors.rim,
+    backgroundColor: colors.cream,
+    borderWidth: 1,
+    borderColor: withAlpha("#000000", 0.35),
   },
   bulletZero: {
     position: "absolute",

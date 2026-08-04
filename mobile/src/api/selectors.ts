@@ -169,6 +169,15 @@ function buildEvenRatingSeries(
     return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`;
   };
 
+  let peak = sorted[0];
+  let trough = sorted[0];
+  for (const point of sorted) {
+    if (point.user_rating > peak.user_rating) peak = point;
+    if (point.user_rating < trough.user_rating) trough = point;
+  }
+  const peakKey = bucketKey(new Date(peak.created_at));
+  const troughKey = bucketKey(new Date(trough.created_at));
+
   const lastRatingByBucket = new Map<string, number>();
   for (const point of sorted) {
     lastRatingByBucket.set(bucketKey(new Date(point.created_at)), point.user_rating);
@@ -176,9 +185,15 @@ function buildEvenRatingSeries(
 
   let carried = sorted[0].user_rating;
   return buckets.map((date) => {
-    const rating = lastRatingByBucket.get(bucketKey(date));
-    if (rating != null) carried = rating;
-    return { created_at: date.toISOString(), user_rating: carried };
+    const key = bucketKey(date);
+    const rating = lastRatingByBucket.get(key);
+    if (rating != null) {
+      carried = rating;
+    }
+    let value = carried;
+    if (key === peakKey) value = peak.user_rating;
+    else if (key === troughKey) value = trough.user_rating;
+    return { created_at: date.toISOString(), user_rating: value };
   });
 }
 
@@ -220,6 +235,15 @@ function buildAlignedRatingCurves(
   };
 
   return entries.map((entry) => {
+    let peak = entry.sorted[0];
+    let trough = entry.sorted[0];
+    for (const point of entry.sorted) {
+      if (point.user_rating > peak.user_rating) peak = point;
+      if (point.user_rating < trough.user_rating) trough = point;
+    }
+    const peakKey = bucketKey(new Date(peak.created_at));
+    const troughKey = bucketKey(new Date(trough.created_at));
+
     const lastRatingByBucket = new Map<string, number>();
     for (const point of entry.sorted) {
       lastRatingByBucket.set(
@@ -236,9 +260,12 @@ function buildAlignedRatingCurves(
         carried = rating;
         started = true;
       }
+      let value = started ? carried : entry.sorted[0].user_rating;
+      if (started && key === peakKey) value = peak.user_rating;
+      else if (started && key === troughKey) value = trough.user_rating;
       return {
         created_at: bucket.created_at,
-        user_rating: started ? carried : entry.sorted[0].user_rating,
+        user_rating: value,
       };
     });
     return {

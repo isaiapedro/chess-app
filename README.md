@@ -1,15 +1,25 @@
 # Chess Wrapped Analytics
 
-Expo mobile client (on-device ingest + metrics) and a thin FastAPI VPC for opening explorer / masters / peer baselines.
+Expo mobile client (on-device ingest + metrics) and a thin FastAPI VPC for
+peer baselines, opening explorer/masters proxy, and a username/email registry.
+
+## Data residency
+
+| Location | Allowed data |
+|----------|----------------|
+| **Server / VPC** | Usernames + emails (`.cache/users/`), peer baseline metrics (`.cache/baselines/`) |
+| **Mobile device** | Auth tokens, user games, Stockfish vault, Recap/Insights/Study caches |
+
+User games and other bulk personal analytics must not persist on the server.
+Server-side `user_games*` / `session_stats` disk caches stay off unless
+`ALLOW_SERVER_USER_GAMES_CACHE=1` (scripts only; never for the API happy path).
 
 ## Architecture
 
 | Layer | Owns |
 |-------|------|
-| **Mobile** | Auth (Lichess OAuth PKCE or Chess.com username+email), user-game ingest from Chess.com/Lichess, Recap + Insights factors, Study Stockfish vault |
-| **API (VPC)** | Opening explorer, masters PGN, peer baselines — not user games / session / recap / insights on the happy path |
-
-Scripts and legacy routes under `/api/v1/games`, `/session`, `/stats/*` may still exist for offline tooling; the Expo app does not call them.
+| **Mobile** | Auth (Lichess OAuth PKCE or Chess.com username+email), user-game ingest from Chess.com/Lichess, Recap + Insights, Study Stockfish vault |
+| **API (VPC)** | `POST /users/register`, peer baselines, opening explorer, masters PGN |
 
 ## Setup
 
@@ -42,27 +52,30 @@ Copy `.env.example` → `.env`. Useful env vars (process-local only; no Redis):
 |----------|---------|------|
 | `LICHESS_TOKEN` | _(empty)_ | Opening explorer reliability |
 | `API_SEM_STUDY` | `6` | Cap concurrent explorer / masters work |
-| `API_SEM_CHEAP` | `32` | Cap cheap endpoints (health, baselines, …) |
-| `GAMES_FETCH_TTL_SEC` | `86400` | Only for optional/legacy server-side game stores (min 24h) |
-| `STATS_DISK_TTL_SEC` | `86400` | Only for optional/legacy server-side stats (min 24h) |
+| `API_SEM_CHEAP` | `32` | Cap cheap endpoints (health, baselines, users) |
+| `ALLOW_SERVER_USER_GAMES_CACHE` | off | Must stay off on API hosts |
 
-### Endpoints (mobile happy path)
+### Endpoints
 
 | Method | Path | Description |
 |--------|------|-------------|
 | GET | `/health` | Health check |
-| GET | `/api/v1/baselines` | Peer baseline bands (cached permanently on device) |
+| POST | `/api/v1/users/register` | Upsert username + email (no tokens, no games) |
+| GET | `/api/v1/users` | List registered usernames/emails |
+| GET | `/api/v1/baselines` | Peer baseline means (also bundled on device) |
 | GET | `/api/v1/study/explorer` | Lichess/masters/player opening explorer |
 | GET | `/api/v1/study/masters-pgn/{game_id}` | Masters game PGN by id |
 
-Legacy (scripts / optional): `/api/v1/games/{username}`, `/api/v1/session/{username}`, `/api/v1/stats/recap`, `/api/v1/stats/insights`.
+Legacy `/api/v1/games`, `/session`, `/stats/*` are removed from the API surface.
 
 ### Examples
 
 ```bash
 curl "http://localhost:8000/health"
+curl -X POST "http://localhost:8000/api/v1/users/register" \
+  -H 'content-type: application/json' \
+  -d '{"platform":"chesscom","username":"alice","email":"alice@example.com"}'
 curl "http://localhost:8000/api/v1/baselines"
-curl "http://localhost:8000/api/v1/study/explorer?fen=rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR%20w%20KQkq%20-%200%201&source=lichess"
 ```
 
 Optional for opening explorer: set `LICHESS_TOKEN` (see `.env.example`). Without it, explorer requests may return empty move lists.

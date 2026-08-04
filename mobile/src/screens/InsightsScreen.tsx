@@ -11,11 +11,14 @@ import {
 import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
 import { selectFactors } from "../api/selectors";
-import type { FactorItem, Period } from "../api/types";
-import { EvalPendingWarning } from "../components/AnalyticsScanBanner";
+import type { FactorItem } from "../api/types";
 import {
+  AnalyticsScanBanner,
+  EvalPendingWarning,
+} from "../components/AnalyticsScanBanner";
+import {
+  AnalyticsPageShell,
   InsightsSkeleton,
-  PageLoadingTransition,
 } from "../components/LoadingSkeletons";
 import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui";
 import { useAnalytics } from "../context/AnalyticsContext";
@@ -24,12 +27,6 @@ import { useInsightsNav } from "../context/InsightsNavContext";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 import { agentLog } from "../debug/agentLog";
 import { CatalogScreen } from "./CatalogScreen";
-
-const FIXED_LOADER_MS = 2000;
-
-function usesFixedLoader(period: Period): boolean {
-  return period === "month";
-}
 
 export function InsightsScreen() {
   const { queryFilters, refreshToken, period } = useFilters();
@@ -43,22 +40,25 @@ export function InsightsScreen() {
     requestVaultMetrics,
   } = useAnalytics();
   const [error, setError] = useState<string | null>(null);
-  const [minLoaderDone, setMinLoaderDone] = useState(!usesFixedLoader(period));
   const [refreshing, setRefreshing] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
   const insightsOpacity = useRef(new Animated.Value(1)).current;
   const { setDepth, registerPopHandler } = useInsightsNav();
 
+  const loadKey = `${sessionKey || "x"}:${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`;
+  const contentReady = metricsReady && !!data;
+
   useEffect(() => {
+    if (period === "all") return;
     // #region agent log
     agentLog("F", "InsightsScreen.tsx:mount", "request vault metrics on insights focus", {});
     // #endregion
     requestVaultMetrics(false);
-  }, [requestVaultMetrics, sessionKey, refreshToken]);
+  }, [requestVaultMetrics, sessionKey, refreshToken, period]);
 
   useEffect(() => {
-    if (!metricsReady && showCatalog) setShowCatalog(false);
-  }, [metricsReady, showCatalog]);
+    if (period === "all" && showCatalog) setShowCatalog(false);
+  }, [period, showCatalog]);
 
   useEffect(() => {
     if (!showCatalog) {
@@ -68,7 +68,7 @@ export function InsightsScreen() {
   }, [showCatalog, setDepth, registerPopHandler]);
 
   const openCatalog = useCallback(() => {
-    if (!metricsReady) return;
+    if (period === "all" || !data) return;
     Animated.timing(insightsOpacity, {
       toValue: 0,
       duration: 160,
@@ -78,7 +78,7 @@ export function InsightsScreen() {
       if (!finished) return;
       setShowCatalog(true);
     });
-  }, [insightsOpacity, metricsReady]);
+  }, [insightsOpacity, data, period]);
 
   const closeCatalog = useCallback(() => {
     setShowCatalog(false);
@@ -95,13 +95,10 @@ export function InsightsScreen() {
 
   useEffect(() => {
     setError(null);
-    setMinLoaderDone(!usesFixedLoader(period));
-    if (!usesFixedLoader(period)) return;
-    const t = setTimeout(() => setMinLoaderDone(true), FIXED_LOADER_MS);
-    return () => clearTimeout(t);
-  }, [sessionKey, refreshToken, period]);
+  }, [loadKey]);
 
   const onRefresh = useCallback(async () => {
+    if (period === "all") return;
     setRefreshing(true);
     setError(null);
     try {
@@ -111,20 +108,7 @@ export function InsightsScreen() {
     } finally {
       setRefreshing(false);
     }
-  }, [refreshAnalytics]);
-
-  const showPieceLoader =
-    usesFixedLoader(period) && (!minLoaderDone || !data);
-  const showSkeleton = !usesFixedLoader(period) && !data;
-  const contentKey = showPieceLoader
-    ? `loader:${period}:${refreshToken}`
-    : showSkeleton
-      ? `skeleton:${period}:${refreshToken}`
-      : error && !data
-        ? "error"
-        : data
-          ? `${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
-          : "empty";
+  }, [refreshAnalytics, period]);
 
   const factors = data ? selectFactors(data) : null;
   const results = recap?.results || {
@@ -142,24 +126,54 @@ export function InsightsScreen() {
       metricsReady,
       hasData: !!data,
       gamesLoading,
-      showPieceLoader,
-      showSkeleton,
+      contentReady,
+      period,
     });
     // #endregion
-  }, [metricsReady, data, gamesLoading, showPieceLoader, showSkeleton]);
+  }, [metricsReady, data, gamesLoading, contentReady, period]);
+
+  if (period === "all") {
+    return (
+      <View style={styles.stack}>
+        <View style={styles.allTimeGate}>
+          <Eyebrow>Performance analysis</Eyebrow>
+          <DisplayTitle size={34}>
+            Insights need{"\n"}a shorter window
+          </DisplayTitle>
+          <Text style={styles.allTimeMessage}>
+            All-time is only available on Recap. For Insights, the maximum
+            filter is one year.
+          </Text>
+        </View>
+      </View>
+    );
+  }
+
+  if (!metricsReady) {
+    return (
+      <View style={[styles.stack, styles.metricsWait]}>
+        <AnalyticsScanBanner />
+      </View>
+    );
+  }
 
   return (
     <View style={styles.stack}>
       <EvalPendingWarning />
       <Animated.View style={[styles.insightsLayer, { opacity: insightsOpacity }]}>
-      <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
-        {showSkeleton ? (
-          <InsightsSkeleton />
-        ) : showPieceLoader ? null : error && !data ? (
+      <AnalyticsPageShell
+        loadKey={loadKey}
+        contentReady={!!data}
+        period={period}
+        error={!!(error && !data)}
+        skeleton={<InsightsSkeleton />}
+        errorNode={
           <View style={styles.center}>
             <Text style={styles.error}>{error}</Text>
           </View>
-        ) : data && factors ? (
+        }
+      >
+        {data && factors ? (
           <ScrollView
             style={styles.scroll}
             contentContainerStyle={styles.content}
@@ -268,14 +282,15 @@ export function InsightsScreen() {
               <BrutalButton
                 label="Explore all metrics"
                 onPress={openCatalog}
+                disabled={!data}
               />
             </View>
           </ScrollView>
         ) : null}
-      </PageLoadingTransition>
+      </AnalyticsPageShell>
       </Animated.View>
 
-      {showCatalog && data && metricsReady ? (
+      {showCatalog && data ? (
         <View style={styles.overlay}>
           <CatalogScreen data={data} onBack={closeCatalog} />
         </View>
@@ -369,6 +384,26 @@ function FactorCard({
 const styles = StyleSheet.create({
   stack: { flex: 1, backgroundColor: colors.bg },
   insightsLayer: { flex: 1 },
+  metricsWait: {
+    flex: 1,
+    justifyContent: "center",
+    alignItems: "center",
+    paddingHorizontal: spacing.md,
+    paddingBottom: 80,
+  },
+  allTimeGate: {
+    flex: 1,
+    justifyContent: "center",
+    paddingHorizontal: spacing.lg,
+    paddingBottom: 100,
+    gap: spacing.md,
+  },
+  allTimeMessage: {
+    ...type.body,
+    color: colors.textMuted,
+    marginTop: spacing.sm,
+    maxWidth: 320,
+  },
   overlay: {
     ...StyleSheet.absoluteFillObject,
     backgroundColor: colors.bg,

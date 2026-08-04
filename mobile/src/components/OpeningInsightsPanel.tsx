@@ -12,7 +12,7 @@ import { useFilters } from "../context/FilterContext";
 import {
   lookupBaseline,
   normalizeSpeed,
-  peerCaption,
+  peerDeltaLabel,
   ratingBand,
   type BaselineMetricHit,
   type BaselineStore,
@@ -20,7 +20,7 @@ import {
 import type { OpeningSideCard } from "../engine/openingPhase";
 import { Ionicons } from "@expo/vector-icons";
 import { EdgeCard, SectionLabel } from "./ui";
-import { colors, radius, result, spacing, type, withAlpha } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
   | { kind: "fixed"; max: number }
@@ -337,24 +337,30 @@ function MetricBanner({
       ? lookupBaseline(baselines, baselineKey, peerBand, peerSpeed)
       : null;
   const scaleMax = resolveScaleMax(scale, hit);
-  const caption = peerCaption(
-    baselines,
-    baselineKey,
-    peerBand,
-    peerSpeed,
-    userNum,
-    unit
-  );
+  const deltaLabel = peerDeltaLabel(userNum, hit?.mean, unit);
+  const deltaPositive =
+    userNum != null && hit?.mean != null && userNum >= hit.mean;
   return (
     <EdgeCard style={styles.card}>
       <View style={styles.cardRow}>
         <View style={styles.cardBody}>
           <Text style={styles.name}>{name}</Text>
-          <Text style={styles.value}>
-            {value}
-            {unit ? <Text style={styles.unit}> {unit}</Text> : null}
-          </Text>
-          {caption ? <Text style={styles.caption}>{caption}</Text> : null}
+          <View style={styles.valueRow}>
+            <Text style={styles.value}>
+              {value}
+              {unit ? <Text style={styles.unit}> {unit}</Text> : null}
+            </Text>
+            {deltaLabel ? (
+              <Text
+                style={[
+                  styles.peerDelta,
+                  { color: deltaPositive ? result.win : result.loss },
+                ]}
+              >
+                {deltaLabel}
+              </Text>
+            ) : null}
+          </View>
           <MetricBulletGraph
             value={userNum}
             peerMean={hit?.mean}
@@ -616,16 +622,21 @@ const styles = StyleSheet.create({
   value: {
     ...type.numberSm,
     color: colors.text,
+  },
+  valueRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: spacing.sm,
     marginBottom: 2,
+    flexWrap: "wrap",
   },
   unit: {
     ...type.caption,
     color: colors.textMuted,
   },
-  caption: {
+  peerDelta: {
     ...type.caption,
-    color: colors.textDim,
-    marginBottom: 4,
+    fontFamily: font.sansMedium,
   },
   bulletWrap: {
     marginTop: 10,
@@ -672,12 +683,14 @@ const styles = StyleSheet.create({
   },
   bulletPeer: {
     position: "absolute",
-    top: -3,
-    bottom: -3,
-    width: 2,
-    marginLeft: -1,
+    top: -4,
+    bottom: -4,
+    width: 3,
+    marginLeft: -1.5,
     borderRadius: radius.pill,
-    backgroundColor: colors.rim,
+    backgroundColor: colors.cream,
+    borderWidth: 1,
+    borderColor: withAlpha("#000000", 0.35),
   },
   helpBackdrop: {
     flex: 1,

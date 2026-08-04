@@ -50,6 +50,38 @@ export function clearInflightByPrefix(prefix: string): void {
   }
 }
 
+export function clearAllInflight(): void {
+  inflight.clear();
+}
+
+function yieldEventLoop(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+async function removeKeysChunked(keys: string[], chunkSize = 20): Promise<number> {
+  let removed = 0;
+  for (let i = 0; i < keys.length; i += chunkSize) {
+    const chunk = keys.slice(i, i + chunkSize);
+    try {
+      await AsyncStorage.multiRemove(chunk);
+      removed += chunk.length;
+    } catch {
+      for (const key of chunk) {
+        try {
+          await AsyncStorage.removeItem(key);
+          removed += 1;
+        } catch {
+          /* keep going */
+        }
+      }
+    }
+    if (i + chunkSize < keys.length) {
+      await yieldEventLoop();
+    }
+  }
+  return removed;
+}
+
 function debugClearLog(message: string, data: Record<string, unknown>) {
   // #region agent log
   const hostUri =
@@ -156,64 +188,29 @@ export async function getCacheAge(key: string): Promise<number | null> {
 }
 
 export async function clearAppCache(): Promise<number> {
+  clearAllInflight();
   const keys = await AsyncStorage.getAllKeys();
-  const appKeys = keys.filter((key) => key.startsWith(PREFIX));
-  const vaultKeys = appKeys.filter(
+  const appKeys = keys.filter(
     (key) =>
-      key.includes("study:game-evals") ||
-      key.includes("study:style") ||
-      key.includes("game-evals")
+      key.startsWith("@chess-wrapped:user-games:v1:") ||
+      (key.startsWith(PREFIX) && !key.includes("baselines"))
   );
   debugClearLog("clearAppCache start", {
     totalKeys: keys.length,
     appKeys: appKeys.length,
-    vaultKeys: vaultKeys.length,
-    vaultSample: vaultKeys.slice(0, 8),
   });
 
-  let removed = 0;
-  for (const key of vaultKeys) {
-    try {
-      await AsyncStorage.removeItem(key);
-      removed += 1;
-    } catch (err) {
-      debugClearLog("vault key remove failed", {
-        key,
-        err: err instanceof Error ? err.message : String(err),
-      });
-    }
-  }
-
-  const remainingApp = (await AsyncStorage.getAllKeys()).filter((key) =>
-    key.startsWith(PREFIX)
-  );
-  if (remainingApp.length) {
-    try {
-      await AsyncStorage.multiRemove(remainingApp);
-      removed += remainingApp.length;
-    } catch {
-      for (const key of remainingApp) {
-        try {
-          await AsyncStorage.removeItem(key);
-          removed += 1;
-        } catch {
-          /* keep going */
-        }
-      }
-    }
-  }
+  const removed = await removeKeysChunked(appKeys);
 
   const after = await AsyncStorage.getAllKeys();
-  const leftoverVault = after.filter(
-    (key) =>
-      key.startsWith(PREFIX) &&
-      (key.includes("study:game-evals") || key.includes("study:style"))
+  const leftoverApp = after.filter(
+    (k) =>
+      k.startsWith("@chess-wrapped:user-games:v1:") ||
+      (k.startsWith(PREFIX) && !k.includes("baselines"))
   );
   debugClearLog("clearAppCache done", {
     removed,
-    leftoverApp: after.filter((k) => k.startsWith(PREFIX)).length,
-    leftoverVault: leftoverVault.length,
-    leftoverVaultSample: leftoverVault.slice(0, 8),
+    leftoverApp: leftoverApp.length,
   });
   return removed;
 }

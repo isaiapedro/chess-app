@@ -24,6 +24,7 @@ import { TabSwipeProvider } from "./src/context/TabSwipeContext";
 import { DayHangSquare } from "./src/components/DayHangSquare";
 import { FilterHeader } from "./src/components/FilterHeader";
 import { BootSkeleton } from "./src/components/LoadingSkeletons";
+import { AppColdGate } from "./src/navigation/AppColdGate";
 import { TabNavigator } from "./src/navigation/TabNavigator";
 import { StockfishProvider } from "./src/engine/StockfishProvider";
 import { StudyPrefetch } from "./src/engine/StudyPrefetch";
@@ -89,7 +90,11 @@ export default function App() {
   }, [fontsLoaded]);
 
   if (!fontsLoaded) {
-    return <BootSkeleton />;
+    return (
+      <SafeAreaProvider>
+        <BootSkeleton />
+      </SafeAreaProvider>
+    );
   }
 
   return (
@@ -105,15 +110,17 @@ export default function App() {
                     {!DEBUG_DISABLE_BACKGROUND_JOBS ? <StudyPrefetch /> : null}
                     <SafeAreaView style={styles.safe} edges={["top", "left", "right"]}>
                       <StatusBar barStyle="light-content" />
-                      <View style={styles.shell}>
-                        <FilterHeader />
-                        <View style={styles.navLayer}>
-                          <NavigationContainer theme={navTheme}>
-                            <TabNavigator />
-                          </NavigationContainer>
+                      <AppColdGate>
+                        <View style={styles.shell}>
+                          <FilterHeader />
+                          <View style={styles.navLayer}>
+                            <NavigationContainer theme={navTheme}>
+                              <TabNavigator />
+                            </NavigationContainer>
+                          </View>
+                          <DayHangSquare />
                         </View>
-                        <DayHangSquare />
-                      </View>
+                      </AppColdGate>
                     </SafeAreaView>
                   </StockfishProvider>
                 </InsightsNavProvider>

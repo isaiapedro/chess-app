@@ -10,7 +10,72 @@ import {
   type ViewStyle,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
+import type { Period } from "../api/types";
 import { colors, radius, spacing, withAlpha } from "../theme";
+
+export const PAGE_FADE_WAIT_MS = 3000;
+export const PAGE_LONG_LOADER_MIN_MS = 4000;
+
+export type PageLongLoaderKind = "pawn" | "skeleton";
+
+export function longLoaderKindForPeriod(period: Period): PageLongLoaderKind {
+  return period === "year" || period === "all" ? "skeleton" : "pawn";
+}
+
+export function useSmartPageLoad({
+  loadKey,
+  contentReady,
+}: {
+  loadKey: string;
+  contentReady: boolean;
+}): {
+  showLongLoader: boolean;
+  revealContent: boolean;
+} {
+  const [phase, setPhase] = useState<"blank" | "loader" | "done">(
+    contentReady ? "done" : "blank"
+  );
+  const [loaderMinDone, setLoaderMinDone] = useState(false);
+  const phaseRef = useRef(phase);
+  phaseRef.current = phase;
+
+  useEffect(() => {
+    setLoaderMinDone(false);
+    if (contentReady) {
+      setPhase("done");
+      return;
+    }
+    setPhase("blank");
+    const t = setTimeout(() => {
+      if (phaseRef.current === "done") return;
+      setPhase("loader");
+    }, PAGE_FADE_WAIT_MS);
+    return () => clearTimeout(t);
+  }, [loadKey]);
+
+  useEffect(() => {
+    if (!contentReady) return;
+    if (phaseRef.current === "loader") return;
+    setPhase("done");
+  }, [contentReady]);
+
+  useEffect(() => {
+    if (phase !== "loader") return;
+    setLoaderMinDone(false);
+    const t = setTimeout(() => setLoaderMinDone(true), PAGE_LONG_LOADER_MIN_MS);
+    return () => clearTimeout(t);
+  }, [phase, loadKey]);
+
+  useEffect(() => {
+    if (phase !== "loader") return;
+    if (contentReady && loaderMinDone) setPhase("done");
+  }, [phase, contentReady, loaderMinDone]);
+
+  return {
+    showLongLoader: phase === "loader",
+    revealContent: phase === "done" && contentReady,
+  };
+}
 
 type BoneProps = {
   width?: DimensionValue;
@@ -173,22 +238,21 @@ export function OpeningChoiceSkeleton() {
 }
 
 export function BootSkeleton() {
-  const pulse = usePulse();
-  return (
-    <View style={styles.boot}>
-      <Bone pulse={pulse} width={54} height={54} />
-      <Bone pulse={pulse} width={150} height={18} style={styles.gapMd} />
-      <Bone pulse={pulse} width={210} height={10} style={styles.gapSm} />
-    </View>
-  );
+  return <ChessPieceLoader fullscreen />;
 }
 
 const TAB_BAR_BODY = 58;
 
-export function ChessPieceLoader() {
+export function ChessPieceLoader({
+  fullscreen = false,
+}: {
+  fullscreen?: boolean;
+}) {
   const rotation = useRef(new Animated.Value(0)).current;
   const insets = useSafeAreaInsets();
-  const tabClearance = TAB_BAR_BODY + Math.max(insets.bottom, 12);
+  const tabClearance = fullscreen
+    ? 0
+    : TAB_BAR_BODY + Math.max(insets.bottom, 12);
 
   useEffect(() => {
     const loop = Animated.loop(
@@ -209,9 +273,11 @@ export function ChessPieceLoader() {
       <View
         style={[
           styles.pieceLoaderTrack,
-          {
-            marginTop: -tabClearance / 2,
-          },
+          tabClearance
+            ? {
+                marginTop: -tabClearance / 2,
+              }
+            : null,
         ]}
       >
         <Animated.View
@@ -236,6 +302,65 @@ export function ChessPieceLoader() {
   );
 }
 
+export function FadeFromBlank({
+  contentKey,
+  ready = true,
+  children,
+  style,
+  fadeInMs = 240,
+}: {
+  contentKey: string | number | null;
+  ready?: boolean;
+  children: React.ReactNode;
+  style?: ViewStyle;
+  fadeInMs?: number;
+}) {
+  const opacity = useRef(new Animated.Value(0)).current;
+  const [paintKey, setPaintKey] = useState<string | number | null>(null);
+  const genRef = useRef(0);
+  const animRef = useRef<Animated.CompositeAnimation | null>(null);
+
+  useEffect(() => {
+    const gen = ++genRef.current;
+    animRef.current?.stop();
+    opacity.setValue(0);
+    setPaintKey(null);
+
+    if (!ready || contentKey == null) return;
+
+    let frame2 = 0;
+    const frame1 = requestAnimationFrame(() => {
+      if (genRef.current !== gen) return;
+      setPaintKey(contentKey);
+      frame2 = requestAnimationFrame(() => {
+        if (genRef.current !== gen) return;
+        animRef.current = Animated.timing(opacity, {
+          toValue: 1,
+          duration: fadeInMs,
+          easing: Easing.out(Easing.cubic),
+          useNativeDriver: true,
+        });
+        animRef.current.start();
+      });
+    });
+
+    return () => {
+      cancelAnimationFrame(frame1);
+      if (frame2) cancelAnimationFrame(frame2);
+      animRef.current?.stop();
+    };
+  }, [contentKey, ready, fadeInMs, opacity]);
+
+  return (
+    <Animated.View
+      style={[styles.pageTransition, style, { opacity }]}
+      pointerEvents={ready && paintKey != null ? "auto" : "none"}
+    >
+      {paintKey != null && ready ? children : null}
+    </Animated.View>
+  );
+}
+
 export function PageLoadingTransition({
   active,
   children,
@@ -249,123 +374,82 @@ export function PageLoadingTransition({
   contentKey?: string | number | null;
   style?: ViewStyle;
 }) {
-  const opacity = useRef(new Animated.Value(active ? 0 : 1)).current;
-  const [phase, setPhase] = useState<"loader" | "content">(
-    active ? "loader" : "content"
-  );
-  const [frozenChildren, setFrozenChildren] = useState<React.ReactNode | null>(
-    null
-  );
-  const childrenRef = useRef(children);
-  const contentKeyRef = useRef(contentKey);
-  const fadingRef = useRef(false);
-  childrenRef.current = children;
-
-  useEffect(() => {
-    let animation: Animated.CompositeAnimation | null = null;
-
-    if (active && phase === "content") {
-      fadingRef.current = false;
-      setFrozenChildren(null);
-      opacity.setValue(0);
-      setPhase("loader");
-      return;
-    }
-
-    if (!active && phase === "loader") {
-      fadingRef.current = true;
-      animation = Animated.timing(opacity, {
-        toValue: 0,
-        duration: 180,
-        easing: Easing.out(Easing.quad),
-        useNativeDriver: true,
-      });
-      animation.start(({ finished }) => {
-        fadingRef.current = false;
-        if (!finished) return;
-        contentKeyRef.current = contentKey;
-        setPhase("content");
-      });
-    } else if (phase === "loader") {
-      animation = Animated.timing(opacity, {
-        toValue: 1,
-        duration: 220,
-        easing: Easing.inOut(Easing.quad),
-        useNativeDriver: true,
-      });
-      animation.start();
-    } else {
-      opacity.setValue(0);
-      contentKeyRef.current = contentKey;
-      animation = Animated.timing(opacity, {
-        toValue: 1,
-        duration: 220,
-        easing: Easing.inOut(Easing.quad),
-        useNativeDriver: true,
-      });
-      animation.start();
-    }
-
-    return () => animation?.stop();
-  }, [active, phase, opacity]);
-
-  useEffect(() => {
-    if (active || phase !== "content" || fadingRef.current) return;
-    if (contentKey == null || contentKey === contentKeyRef.current) return;
-
-    fadingRef.current = true;
-    setFrozenChildren(childrenRef.current);
-    const out = Animated.timing(opacity, {
-      toValue: 0,
-      duration: 180,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: true,
-    });
-    out.start(({ finished }) => {
-      setFrozenChildren(null);
-      if (!finished) {
-        fadingRef.current = false;
-        return;
-      }
-      contentKeyRef.current = contentKey;
-      const fadeIn = Animated.timing(opacity, {
-        toValue: 1,
-        duration: 220,
-        easing: Easing.inOut(Easing.quad),
-        useNativeDriver: true,
-      });
-      fadeIn.start(() => {
-        fadingRef.current = false;
-      });
-    });
-
-    return () => {
-      out.stop();
-      fadingRef.current = false;
-      setFrozenChildren(null);
-    };
-  }, [contentKey, active, phase, opacity]);
+  const showLoader = active && loader != null;
+  const ready = showLoader || !active;
+  const key = showLoader
+    ? `loader:${contentKey ?? "x"}`
+    : contentKey == null
+      ? "content"
+      : contentKey;
 
   return (
-    <Animated.View style={[styles.pageTransition, style, { opacity }]}>
-      {phase === "loader"
-        ? loader ?? <ChessPieceLoader />
-        : frozenChildren ?? children}
-    </Animated.View>
+    <FadeFromBlank contentKey={key} ready={ready} style={style}>
+      {showLoader ? loader : children}
+    </FadeFromBlank>
+  );
+}
+
+export function AnalyticsPageShell({
+  loadKey,
+  contentReady,
+  period,
+  error,
+  errorNode,
+  skeleton,
+  children,
+}: {
+  loadKey: string;
+  contentReady: boolean;
+  period: Period;
+  error?: boolean;
+  errorNode?: React.ReactNode;
+  skeleton: React.ReactNode;
+  children: React.ReactNode;
+}) {
+  const { showLongLoader, revealContent } = useSmartPageLoad({
+    loadKey,
+    contentReady: contentReady && !error,
+  });
+  const kind = longLoaderKindForPeriod(period);
+  const waiting = !revealContent && !error;
+  const loader =
+    showLongLoader
+      ? kind === "pawn"
+        ? <ChessPieceLoader />
+        : skeleton
+      : undefined;
+
+  const contentKey = error
+    ? `error:${loadKey}`
+    : revealContent
+      ? `ready:${loadKey}`
+      : showLongLoader
+        ? `loader:${kind}:${loadKey}`
+        : `wait:${loadKey}`;
+
+  return (
+    <PageLoadingTransition
+      active={waiting}
+      contentKey={contentKey}
+      loader={loader}
+    >
+      {error ? errorNode : revealContent ? children : null}
+    </PageLoadingTransition>
   );
 }
 
 const INTRO_END = 0.3;
 const MID_END = 0.9;
 const INTRO_MS = 8640;
-const MIDDLE_MS = 12000;
+const MIDDLE_MS = 4200;
 const FINISH_MS = 720;
-const MIDDLE_STEP_MS = 500;
-const MIDDLE_MIN_SPEED = 0.003;
-const MIDDLE_MAX_SPEED = 0.018;
+const MIDDLE_MIN_SPEED = 0.055;
+const MIDDLE_MAX_SPEED = 0.085;
 const MIDDLE_RUNNING_LIMIT = MID_END - 0.002;
-const MIDDLE_FRONT_WEIGHT = 1.85;
-const MIDDLE_BACK_WEIGHT = 0.45;
+const MIDDLE_BUFFER_SMOOTH = 2.2;
+const MIDDLE_START_BOOST = 1.85;
+const MIDDLE_END_BOOST = 0.8;
+const MIDDLE_SEED_BUFFER = 0.55;
 const RIBBON_WIDTH = 16;
 const RIBBON_GAP = 16;
 const RIBBON_PITCH = RIBBON_WIDTH + RIBBON_GAP;
@@ -384,10 +468,13 @@ function bufferProgress(
 }
 
 function middlePaceWeight(fill: number): number {
-  const span = MID_END - INTRO_END;
-  if (span <= 0) return 1;
+  const span = MIDDLE_RUNNING_LIMIT - INTRO_END;
+  if (span <= 0) return MIDDLE_START_BOOST;
   const t = Math.max(0, Math.min(1, (fill - INTRO_END) / span));
-  return t < 0.5 ? MIDDLE_FRONT_WEIGHT : MIDDLE_BACK_WEIGHT;
+  const eased = t * t;
+  return (
+    MIDDLE_START_BOOST + (MIDDLE_END_BOOST - MIDDLE_START_BOOST) * eased
+  );
 }
 
 export function AnalysisLoadingBars({
@@ -408,6 +495,8 @@ export function AnalysisLoadingBars({
   const fill = useRef(new Animated.Value(0)).current;
   const ribbon = useRef(new Animated.Value(0)).current;
   const bufferRef = useRef(0);
+  const bufferSmoothRef = useRef(0);
+  const fillCursorRef = useRef(0);
   const onCompleteRef = useRef(onComplete);
   const [introDone, setIntroDone] = useState(false);
   const useLinearProgress = progressRatio != null;
@@ -435,7 +524,10 @@ export function AnalysisLoadingBars({
       useNativeDriver: false,
     });
     animation.start(({ finished }) => {
-      if (finished) setIntroDone(true);
+      if (finished) {
+        fillCursorRef.current = INTRO_END;
+        setIntroDone(true);
+      }
     });
     return () => animation.stop();
   }, [fill, useLinearProgress]);
@@ -452,11 +544,13 @@ export function AnalysisLoadingBars({
       if (to <= from + 0.0005) return;
       animation = Animated.timing(fill, {
         toValue: to,
-        duration: MIDDLE_STEP_MS,
-        easing: Easing.out(Easing.quad),
+        duration: 500,
+        easing: Easing.linear,
         useNativeDriver: false,
       });
-      animation.start();
+      animation.start(({ finished }) => {
+        if (finished) fillCursorRef.current = to;
+      });
     });
     return () => {
       animation?.stop();
@@ -466,35 +560,44 @@ export function AnalysisLoadingBars({
   useEffect(() => {
     if (!introDone || complete || useLinearProgress) return;
     let stopped = false;
-    let animation: Animated.CompositeAnimation | null = null;
+    let raf = 0;
+    let lastTs = 0;
+    bufferSmoothRef.current = Math.max(bufferRef.current, MIDDLE_SEED_BUFFER);
+    fill.stopAnimation((current) => {
+      fillCursorRef.current = Math.max(INTRO_END, Number(current) || INTRO_END);
+    });
 
-    const step = () => {
+    const tick = (ts: number) => {
       if (stopped) return;
-      fill.stopAnimation((current) => {
-        if (stopped) return;
-        const from = Math.max(INTRO_END, Number(current) || 0);
-        const speed =
-          (MIDDLE_MIN_SPEED +
-            (MIDDLE_MAX_SPEED - MIDDLE_MIN_SPEED) * bufferRef.current) *
-          middlePaceWeight(from);
-        const distance = speed * (MIDDLE_STEP_MS / 1000);
-        const to = Math.min(MIDDLE_RUNNING_LIMIT, from + distance);
-        animation = Animated.timing(fill, {
-          toValue: to,
-          duration: MIDDLE_STEP_MS,
-          easing: Easing.linear,
-          useNativeDriver: false,
-        });
-        animation.start(({ finished }) => {
-          if (finished && !stopped) step();
-        });
-      });
+      if (!lastTs) lastTs = ts;
+      const dt = Math.min(0.05, Math.max(0, (ts - lastTs) / 1000));
+      lastTs = ts;
+
+      const targetBuffer = Math.max(bufferRef.current, MIDDLE_SEED_BUFFER * 0.35);
+      const smooth = bufferSmoothRef.current;
+      bufferSmoothRef.current =
+        smooth + (targetBuffer - smooth) * Math.min(1, dt * MIDDLE_BUFFER_SMOOTH);
+
+      const speed =
+        (MIDDLE_MIN_SPEED +
+          (MIDDLE_MAX_SPEED - MIDDLE_MIN_SPEED) * bufferSmoothRef.current) *
+        middlePaceWeight(fillCursorRef.current);
+      const next = Math.min(
+        MIDDLE_RUNNING_LIMIT,
+        fillCursorRef.current + speed * dt
+      );
+      fillCursorRef.current = next;
+      fill.setValue(next);
+
+      if (next < MIDDLE_RUNNING_LIMIT) {
+        raf = requestAnimationFrame(tick);
+      }
     };
 
-    step();
+    raf = requestAnimationFrame(tick);
     return () => {
       stopped = true;
-      animation?.stop();
+      cancelAnimationFrame(raf);
     };
   }, [introDone, complete, fill, useLinearProgress]);
 

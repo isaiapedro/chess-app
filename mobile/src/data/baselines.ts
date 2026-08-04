@@ -16,6 +16,8 @@ export type BaselineMetricHit = {
   p50?: number | null;
   p75?: number | null;
   p90?: number | null;
+  /** Sorted sample values for exact percentile rank (activity metrics). */
+  values?: number[] | null;
 };
 
 export type BaselineRow = {
@@ -31,6 +33,7 @@ export type BaselineRow = {
   p50?: number | null;
   p75?: number | null;
   p90?: number | null;
+  values?: number[] | null;
 };
 
 export type BaselineStore = {
@@ -159,7 +162,7 @@ export const ACTIVITY_BASELINE_METRICS = [
   "avg_est_seconds_per_player_day",
 ] as const;
 
-const BASELINES_CACHE_KEY = "baselines:store:v1";
+const BASELINES_CACHE_KEY = "baselines:store:v5";
 
 let bundledRows: BaselineRow[] | null = null;
 let cachedStore: BaselineStore | null = null;
@@ -217,6 +220,9 @@ function indexRows(rows: BaselineRow[]): BaselineStore {
       p50: row.p50 ?? null,
       p75: row.p75 ?? null,
       p90: row.p90 ?? null,
+      values: Array.isArray(row.values)
+        ? row.values.map((v) => Number(v)).filter((v) => Number.isFinite(v))
+        : null,
     };
   }
   return {
@@ -289,12 +295,43 @@ export function formatPeerDelta(
   return `${sign}${delta.toFixed(1)}`;
 }
 
+export function peerDeltaLabel(
+  userVal: number | null | undefined,
+  mean: number | null | undefined,
+  unit = ""
+): string | null {
+  const delta = formatPeerDelta(userVal, mean);
+  if (!delta) return null;
+  return `${delta}${unit} vs peers`;
+}
+
+/** Exact share of peers strictly below `userVal` from sorted sample values. */
+export function exactPercentileRank(
+  userVal: number,
+  values: number[] | null | undefined
+): number | null {
+  if (!Number.isFinite(userVal) || !values || values.length === 0) return null;
+  let lo = 0;
+  let hi = values.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (values[mid] < userVal) lo = mid + 1;
+    else hi = mid;
+  }
+  const below = lo;
+  const pct = (100 * below) / values.length;
+  return Math.max(0, Math.min(99.99, Math.round(pct * 100) / 100));
+}
+
 /** Approx share of peers below `userVal` from stored percentile breakpoints. */
 export function approxPercentileRank(
   userVal: number,
   hit: BaselineMetricHit | null | undefined
 ): number | null {
   if (!hit || !Number.isFinite(userVal)) return null;
+  const exact = exactPercentileRank(userVal, hit.values);
+  if (exact != null) return exact;
+
   const points = (
     [
       [10, hit.p10],
@@ -308,30 +345,52 @@ export function approxPercentileRank(
     .map(([p, v]) => ({ p, v: Number(v) }));
 
   if (points.length >= 2) {
+    let raw: number | null = null;
     if (userVal <= points[0].v) {
-      return Math.max(1, Math.min(points[0].p, 99));
-    }
-    const last = points[points.length - 1];
-    if (userVal >= last.v) {
-      return Math.max(1, Math.min(99, last.p));
-    }
-    for (let i = 0; i < points.length - 1; i += 1) {
-      const a = points[i];
-      const b = points[i + 1];
-      if (userVal >= a.v && userVal <= b.v) {
-        const span = b.v - a.v || 1;
-        const t = (userVal - a.v) / span;
-        return Math.max(
-          1,
-          Math.min(99, Math.round(a.p + t * (b.p - a.p)))
-        );
+      raw = points[0].p;
+    } else {
+      const last = points[points.length - 1];
+      if (userVal >= last.v) {
+        raw = last.p;
+      } else {
+        for (let i = 0; i < points.length - 1; i += 1) {
+          const a = points[i];
+          const b = points[i + 1];
+          if (userVal >= a.v && userVal <= b.v) {
+            const span = b.v - a.v || 1;
+            const t = (userVal - a.v) / span;
+            raw = a.p + t * (b.p - a.p);
+            break;
+          }
+        }
       }
+    }
+    if (raw != null) {
+      return Math.max(0, Math.min(99.99, Math.round(raw * 100) / 100));
     }
   }
 
   if (hit.mean == null) return null;
   if (userVal >= hit.mean) return 60;
   return 40;
+}
+
+export function formatPeerPercent(rank: number): string {
+  const pct = Math.max(0, Math.min(99.99, rank));
+  if (pct < 90) {
+    return String(Math.round(pct));
+  }
+  if (pct < 98) {
+    return (Math.round(pct * 10) / 10).toFixed(1);
+  }
+  return (Math.round(pct * 100) / 100).toFixed(2);
+}
+
+export function peerShareCaption(rank: number): string {
+  const pct = Math.max(0, Math.min(99.99, rank));
+  const label = formatPeerPercent(pct);
+  if (pct < 50) return `Less than ${label}% of players`;
+  return `More than ${label}% of players`;
 }
 
 export function peerWinRateCaption(
@@ -345,7 +404,7 @@ export function peerWinRateCaption(
   if (!hit || hit.mean == null) return null;
   const rank = approxPercentileRank(userWinRate, hit);
   if (rank != null) {
-    return `More than ${rank}% of players`;
+    return peerShareCaption(rank);
   }
   const delta = formatPeerDelta(userWinRate, hit.mean);
   return `Peers ${hit.mean}% · Δ ${delta}%`;
@@ -371,20 +430,6 @@ function activityComparableTotal(
   return total;
 }
 
-function moreThanPlayersCaption(
-  store: BaselineStore | null | undefined,
-  metric: string,
-  userVal: number,
-  band: string | null | undefined,
-  speed: string | null | undefined
-): string | null {
-  const hit = lookupBaseline(store, metric, band, speed);
-  if (!hit || hit.mean == null) return null;
-  const rank = approxPercentileRank(userVal, hit);
-  if (rank == null) return null;
-  return `More than ${rank}% of players`;
-}
-
 export function peerGamesPlayedCaption(
   store: BaselineStore | null | undefined,
   userGames: number | null | undefined,
@@ -395,16 +440,21 @@ export function peerGamesPlayedCaption(
   if (userGames == null || !Number.isFinite(userGames) || userGames < 0) {
     return null;
   }
+  if (!band || !speed) return null;
   const bucket = activityBucketForPeriod(period);
   const metric = `avg_games_per_player_${bucket}`;
+  const hit = lookupBaseline(store, metric, band, speed);
+  if (!hit) return null;
   const comparable = activityComparableTotal(userGames, period);
-  return moreThanPlayersCaption(store, metric, comparable, band, speed);
+  const rank = approxPercentileRank(comparable, hit);
+  if (rank == null) return null;
+  return peerShareCaption(rank);
 }
 
 export function peerTimeInvestedCaption(
   store: BaselineStore | null | undefined,
   userHours: number | null | undefined,
-  games: number | null | undefined,
+  _games: number | null | undefined,
   band: string | null | undefined,
   speed: string | null | undefined,
   period: string | null | undefined = "month"
@@ -412,25 +462,15 @@ export function peerTimeInvestedCaption(
   if (userHours == null || !Number.isFinite(userHours) || userHours < 0) {
     return null;
   }
+  if (!band || !speed) return null;
   const bucket = activityBucketForPeriod(period);
   const metric = `avg_est_seconds_per_player_${bucket}`;
+  const hit = lookupBaseline(store, metric, band, speed);
+  if (!hit) return null;
   const userSeconds = activityComparableTotal(userHours * 3600, period);
-  const activityCaption = moreThanPlayersCaption(
-    store,
-    metric,
-    userSeconds,
-    band,
-    speed
-  );
-  if (activityCaption) return activityCaption;
-
-  if (games == null || games <= 0) return null;
-  const hit = lookupBaseline(store, "est_seconds_per_game", band, speed);
-  if (!hit || hit.mean == null) return null;
-  const peerHours = (hit.mean * games) / 3600;
-  const delta = userHours - peerHours;
-  const sign = delta >= 0 ? "+" : "";
-  return `Peers ~${peerHours.toFixed(1)}h · Δ ${sign}${delta.toFixed(1)}h`;
+  const rank = approxPercentileRank(userSeconds, hit);
+  if (rank == null) return null;
+  return peerShareCaption(rank);
 }
 
 export function peerCaption(
@@ -457,19 +497,59 @@ export function baselinesFromBundledAsset(): BaselineStore {
   return indexRows(loadBundledRows());
 }
 
+function storeHasActivityMetrics(store: BaselineStore | null | undefined): boolean {
+  if (!store?.available) return false;
+  return store.rows.some(
+    (row) => row.metric === "avg_games_per_player_month"
+  );
+}
+
+function storeMetricCount(store: BaselineStore | null | undefined): number {
+  if (!store?.available) return 0;
+  return new Set(store.rows.map((row) => row.metric)).size;
+}
+
+function preferFresherStore(
+  a: BaselineStore,
+  b: BaselineStore | null
+): BaselineStore {
+  if (!b || !storeHasActivityMetrics(b)) return a;
+  if (!storeHasActivityMetrics(a)) return b;
+  const aCount = storeMetricCount(a);
+  const bCount = storeMetricCount(b);
+  if (aCount !== bCount) return aCount > bCount ? a : b;
+  const aMonth = String(a.source_month || "");
+  const bMonth = String(b.source_month || "");
+  if (aMonth !== bMonth) return aMonth > bMonth ? a : b;
+  return a;
+}
+
 export async function loadBaselineStore(
   forceNetwork = false
 ): Promise<BaselineStore> {
   return takeInflight(`baselines:${forceNetwork ? "force" : "soft"}`, async () => {
-    if (!forceNetwork && cachedStore) return cachedStore;
-
+    const bundled = baselinesFromBundledAsset();
     const disk = await readCache<BaselineStore>(
       BASELINES_CACHE_KEY,
       PERMANENT_CACHE_TTL_MS
     );
-    if (!forceNetwork && disk) {
-      cachedStore = disk;
+
+    if (!forceNetwork && cachedStore && storeHasActivityMetrics(cachedStore)) {
+      const best = preferFresherStore(bundled, cachedStore);
+      if (best !== cachedStore) {
+        cachedStore = best;
+        await writeCache(BASELINES_CACHE_KEY, best);
+      }
       return cachedStore;
+    }
+
+    if (!forceNetwork) {
+      const best = preferFresherStore(bundled, disk);
+      if (storeHasActivityMetrics(best)) {
+        cachedStore = best;
+        await writeCache(BASELINES_CACHE_KEY, best);
+        return cachedStore;
+      }
     }
 
     if (!forceNetwork) {
@@ -478,16 +558,9 @@ export async function loadBaselineStore(
         PERMANENT_CACHE_TTL_MS
       );
       const migrated = legacy ? storeFromPayload(legacy) : null;
-      if (migrated) {
-        cachedStore = migrated;
-        await writeCache(BASELINES_CACHE_KEY, migrated);
-        return cachedStore;
-      }
-
-      const bundled = baselinesFromBundledAsset();
-      if (bundled.available) {
-        cachedStore = bundled;
-        await writeCache(BASELINES_CACHE_KEY, bundled);
+      if (migrated && storeHasActivityMetrics(migrated)) {
+        cachedStore = preferFresherStore(bundled, migrated);
+        await writeCache(BASELINES_CACHE_KEY, cachedStore);
         return cachedStore;
       }
     }
@@ -495,20 +568,25 @@ export async function loadBaselineStore(
     try {
       const payload = await fetchBaselines(true);
       const store = storeFromPayload(payload);
-      if (store) {
-        cachedStore = store;
-        await writeCache(BASELINES_CACHE_KEY, store);
+      if (store && (forceNetwork || storeHasActivityMetrics(store) || !bundled.available)) {
+        cachedStore = preferFresherStore(store, bundled);
+        await writeCache(BASELINES_CACHE_KEY, cachedStore);
         return cachedStore;
       }
     } catch {
       /* fall through */
     }
 
+    if (storeHasActivityMetrics(bundled)) {
+      cachedStore = bundled;
+      await writeCache(BASELINES_CACHE_KEY, cachedStore);
+      return cachedStore;
+    }
     if (disk?.available) {
       cachedStore = disk;
       return cachedStore;
     }
-    cachedStore = baselinesFromBundledAsset();
+    cachedStore = bundled;
     await writeCache(BASELINES_CACHE_KEY, cachedStore);
     return cachedStore;
   });
@@ -516,4 +594,8 @@ export async function loadBaselineStore(
 
 export function getCachedBaselineStore(): BaselineStore | null {
   return cachedStore;
+}
+
+export function resetBaselineMemoryCache(): void {
+  cachedStore = null;
 }

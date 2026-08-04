@@ -1,0 +1,23 @@
+[Event "Sicilian sample (SF continuation)"]
+[Site "Local"]
+[Date "2026.08.03"]
+[Round "?"]
+[White "SampleWhite"]
+[Black "SampleBlack"]
+[Result "*"]
+[WhiteElo "1820"]
+[BlackElo "1795"]
+[TimeControl "600"]
+[ECO "B90"]
+[Opening "Sicilian Defense: Najdorf Variation"]
+[Termination "Normal"]
+
+1. e4 c5 2. Nf3 d6 3. d4 cxd4 4. Nxd4 Nf6 5. Nc3 a6 6. Be3 e5
+7. Nb3 Be6 8. f3 Be7 9. Qd2 O-O 10. O-O-O Nbd7 11. g4 b5 12. Kb1 b4
+13. Nd5 Bxd5 14. exd5 Nb6 15. Qxb4 Nfxd5 16. Bxb6 Nxb6 17. Qe4 d5
+18. Qxe5 Re8 19. c3 Bg5 20. Qf5 g6 21. Qc2 Na4 22. Bc4 Nb6 23. h4 Bf4
+24. Bd3 Na4 25. h5 Qb6 26. Be2 Qc6 27. Rd4 Be5 28. f4 Bxd4 29. Nxd4 Qd7
+30. Bd1 Nc5 31. hxg6 fxg6 32. f5 Qd6 33. Qc1 Ra7 34. fxg6 Qxg6+
+35. Nf5 Qe6 36. Bc2 Ne4 37. a3 Rb7 38. Ka1 Qf6 39. Rh6 Qe5 40. Qe3 Reb8
+41. Bxe4 dxe4 42. Rd6 Kh8 43. Qd2 Re8 44. Rd5 Qf6 45. g5 e3
+46. Qxe3 Rxe3 47. gxf6 Re1+ 48. Ka2 Rb8 49. b4 Re6 50. f7 h5 *

@@ -69,6 +69,7 @@ import {
   periodCandidatePools,
   selectRecentPeriodCandidates,
 } from "./candidateBucket";
+import { loadSolvedMistakeKeys } from "./mistakeSession";
 import {
   applyUciMove,
   canonicalUci,
@@ -494,10 +495,8 @@ async function scanOneGame(
       };
     }
     evalCalls += 1;
-    if (evalCalls % 8 === 0) {
+    if (evalCalls % 4 === 0) {
       await yieldForUi({ heavy: true });
-    } else {
-      await waitForPuzzleIdle();
     }
     const raw = await evaluate(fen, SCAN_DEPTH, GLOBAL_MULTIPV, 0);
     const bestUci = raw.bestUci ? canonicalUci(fen, raw.bestUci) : null;
@@ -684,10 +683,13 @@ export async function periodReservoirStatus(
 }> {
   const state = await loadGlobalAnalysisState(filters, games);
   const periodIds = options?.periodGameIds ?? games.map((g) => String(g.id));
+  const solved =
+    kind === "mistake" ? await loadSolvedMistakeKeys(filters) : new Set<string>();
   const pools = periodCandidatePools({
     candidates:
       kind === "mistake" ? state.mistakeCandidates : state.openingCandidates,
     periodGameIds: periodIds,
+    consumedKeys: solved,
     batchLimit: options?.batchLimit ?? 0,
   });
   const pending = options?.pendingCount ?? 0;
@@ -739,6 +741,14 @@ export function getActiveGlobalScan(): {
     sessionKey: activeGlobalScan.sessionKey,
     signal: activeGlobalScan.signal,
   };
+}
+
+export function cancelActiveGlobalScan(): void {
+  if (!activeGlobalScan) return;
+  const previous = activeGlobalScan;
+  previous.signal.cancelled = true;
+  activeGlobalScan = null;
+  notifyScanWaiters(previous);
 }
 
 export function isGlobalScanActiveFor(sessionKey: string): boolean {

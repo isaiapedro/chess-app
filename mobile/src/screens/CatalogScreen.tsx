@@ -34,7 +34,6 @@ type Props = {
   onBack: () => void;
 };
 
-const FADE_OUT_MS = 160;
 const FADE_IN_MS = 240;
 
 function debugNavLog(message: string, data: Record<string, unknown>) {
@@ -126,38 +125,27 @@ export function CatalogScreen({ data, onBack }: Props) {
   ) => {
     if (transitioningRef.current) return false;
     transitioningRef.current = true;
-    Animated.timing(contentOpacity, {
-      toValue: 0,
-      duration: FADE_OUT_MS,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: true,
-    }).start(({ finished }) => {
-      if (!finished) {
+    contentOpacity.setValue(0);
+    apply();
+    if (options.leave || !options.fadeIn) {
+      transitioningRef.current = false;
+      return true;
+    }
+    requestAnimationFrame(() => {
+      Animated.timing(contentOpacity, {
+        toValue: 1,
+        duration: FADE_IN_MS,
+        easing: Easing.out(Easing.cubic),
+        useNativeDriver: true,
+      }).start(() => {
         transitioningRef.current = false;
-        return;
-      }
-      apply();
-      if (options.leave || !options.fadeIn) {
-        transitioningRef.current = false;
-        return;
-      }
-      contentOpacity.setValue(0);
-      requestAnimationFrame(() => {
-        Animated.timing(contentOpacity, {
-          toValue: 1,
-          duration: FADE_IN_MS,
-          easing: Easing.out(Easing.cubic),
-          useNativeDriver: true,
-        }).start(() => {
-          transitioningRef.current = false;
-        });
       });
     });
     return true;
   };
 
-  const finishPopRef = useRef(() => false);
-  finishPopRef.current = () => {
+  const finishPopRef = useRef((): boolean => false);
+  finishPopRef.current = (): boolean => {
     if (activeSectionRef.current) {
       debugNavLog("pop to metrics catalog", {
         from: activeSectionRef.current,
@@ -179,8 +167,8 @@ export function CatalogScreen({ data, onBack }: Props) {
     );
   };
 
-  const animatePopRef = useRef(() => false);
-  animatePopRef.current = () => finishPopRef.current();
+  const animatePopRef = useRef((): boolean => false);
+  animatePopRef.current = (): boolean => finishPopRef.current();
 
   useEffect(() => {
     const depth = activeSection ? 2 : 1;

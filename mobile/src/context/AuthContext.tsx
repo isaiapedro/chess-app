@@ -10,6 +10,7 @@ import * as AuthSession from "expo-auth-session";
 import * as SecureStore from "expo-secure-store";
 import * as WebBrowser from "expo-web-browser";
 import type { Platform } from "../api/types";
+import { registerServerUser } from "../api/client";
 import { setPlatformGamesAuth } from "../data/platformGames";
 
 WebBrowser.maybeCompleteAuthSession();
@@ -135,6 +136,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         setEmail(persisted.email || "");
         setLichessAccessToken(persisted.lichessAccessToken || null);
         applyGamesAuth(persisted);
+        void registerServerUser({
+          platform: persisted.platform,
+          username: persisted.username,
+          email: persisted.email || "",
+        });
       } else {
         applyGamesAuth(null);
       }
@@ -152,6 +158,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setEmail(data.email || "");
     setLichessAccessToken(data.lichessAccessToken || null);
     applyGamesAuth(data);
+    void registerServerUser({
+      platform: data.platform,
+      username: data.username,
+      email: data.email || "",
+    });
   }, []);
 
   const loginChesscom = useCallback(

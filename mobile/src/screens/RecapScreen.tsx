@@ -17,7 +17,7 @@ import {
   RatingChart,
 } from "../components/AnalyticsCharts";
 import {
-  PageLoadingTransition,
+  AnalyticsPageShell,
   RecapSkeleton,
 } from "../components/LoadingSkeletons";
 import {
@@ -96,12 +96,6 @@ const HERO_PIECES = [
   require("../../assets/chess_set/pawn.png"),
 ] as const;
 
-const FIXED_LOADER_MS = 2000;
-
-function usesFixedLoader(period: Period): boolean {
-  return period === "month";
-}
-
 export function RecapScreen() {
   const { queryFilters, refreshToken, speed, period, periodLabel } = useFilters();
   const {
@@ -112,7 +106,6 @@ export function RecapScreen() {
     refreshAnalytics,
   } = useAnalytics();
   const [error, setError] = useState<string | null>(null);
-  const [minLoaderDone, setMinLoaderDone] = useState(!usesFixedLoader(period));
   const [refreshing, setRefreshing] = useState(false);
   const [activeBadge, setActiveBadge] = useState(0);
   const heroPiece = useMemo(() => {
@@ -120,26 +113,18 @@ export function RecapScreen() {
     return HERO_PIECES[idx];
   }, [period, refreshToken, queryFilters.username]);
 
+  const loadKey = `${sessionKey || "x"}:${period}:${periodLabel}:${speed || "all"}:${refreshToken}`;
+  const contentReady = !!data;
+
   useEffect(() => {
     setActiveBadge(0);
     setError(null);
-    setMinLoaderDone(!usesFixedLoader(period));
-    if (!usesFixedLoader(period)) return;
-    const startedAt = Date.now();
     debugRecapLog("recap load start", "H2", {
       period,
       forceNetwork: false,
       user: queryFilters.username,
     });
-    const t = setTimeout(() => {
-      setMinLoaderDone(true);
-      debugRecapLog("recap load end", "H2", {
-        totalMs: Date.now() - startedAt,
-        period,
-      });
-    }, FIXED_LOADER_MS);
-    return () => clearTimeout(t);
-  }, [sessionKey, refreshToken, period, queryFilters.username]);
+  }, [loadKey, period, queryFilters.username]);
 
   useEffect(() => {
     if (!data) return;
@@ -160,19 +145,6 @@ export function RecapScreen() {
       setRefreshing(false);
     }
   }, [refreshAnalytics]);
-
-  const showPieceLoader =
-    usesFixedLoader(period) && (!minLoaderDone || !data);
-  const showSkeleton = !usesFixedLoader(period) && !data;
-  const contentKey = showPieceLoader
-    ? `loader:${period}:${periodLabel}`
-    : showSkeleton
-      ? `skeleton:${period}:${refreshToken}`
-      : error && !data
-        ? "error"
-        : data
-          ? `${period}:${periodLabel}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`
-          : "empty";
 
   const view = useMemo(() => {
     if (!data) return null;
@@ -229,19 +201,22 @@ export function RecapScreen() {
   const periodNoun = PERIOD_NOUN[period];
 
   return (
-    <PageLoadingTransition active={showPieceLoader} contentKey={contentKey}>
-      {showSkeleton ? (
-        <View style={{ flex: 1 }}>
-          <RecapSkeleton />
-        </View>
-      ) : error && !data ? (
+    <AnalyticsPageShell
+      loadKey={loadKey}
+      contentReady={contentReady}
+      period={period}
+      error={!!(error && !data)}
+      skeleton={<RecapSkeleton />}
+      errorNode={
         <View style={styles.center}>
           <Text style={styles.error}>{error}</Text>
           <Text style={styles.muted}>
             Cached analytics load automatically offline.
           </Text>
         </View>
-      ) : view ? (
+      }
+    >
+      {view ? (
       <ScrollView
         style={styles.scroll}
         contentContainerStyle={styles.content}
@@ -375,7 +350,7 @@ export function RecapScreen() {
       </View>
       </ScrollView>
       ) : null}
-    </PageLoadingTransition>
+    </AnalyticsPageShell>
   );
 }
 

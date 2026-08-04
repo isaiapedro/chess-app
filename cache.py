@@ -236,9 +236,22 @@ def lichess_get(url: str, params: dict, label: str):
 
 
 def disk_cache(subdir: str, is_stale=None):
+    user_bulk_subdirs = {
+        "user_games",
+        "user_games_chesscom",
+        "user_games_lichess",
+        "session_stats",
+    }
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
+            allow_user_bulk = os.environ.get(
+                "ALLOW_SERVER_USER_GAMES_CACHE", ""
+            ).strip().lower() in {"1", "true", "yes"}
+            if subdir in user_bulk_subdirs and not allow_user_bulk:
+                return func(*args, **kwargs)
+
             cache_dir = CACHE_BASE / subdir
             cache_dir.mkdir(parents=True, exist_ok=True)
 

@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import {
   ActivityIndicator,
+  InteractionManager,
   ScrollView,
   StyleSheet,
   Text,
@@ -17,10 +18,14 @@ import {
   SectionLabel,
   SettingsRow,
 } from "../components/ui";
+import { FadeFromBlank } from "../components/LoadingSkeletons";
 import { useAuth } from "../context/AuthContext";
 import { useFilters } from "../context/FilterContext";
+import { resetBackgroundWork } from "../engine/backgroundWork";
+import { cancelActiveGlobalScan } from "../engine/globalAnalysis";
 import { resetPrefetchMemory } from "../engine/studyPrefetch";
 import { clearAppCache } from "../storage/cache";
+import { resetBaselineMemoryCache } from "../data/baselines";
 import type { Platform } from "../api/types";
 import { colors, font, radius, result, spacing, type } from "../theme";
 
@@ -45,14 +50,19 @@ export function ProfileScreen() {
     setStatus(null);
     setFailed(false);
     try {
+      cancelActiveGlobalScan();
       resetPrefetchMemory();
+      resetBackgroundWork();
+      resetBaselineMemoryCache();
       const removed = await clearAppCache();
-      refresh();
       setStatus(
         removed
           ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"}.`
           : "Nothing cached."
       );
+      InteractionManager.runAfterInteractions(() => {
+        refresh();
+      });
     } catch (e) {
       setFailed(true);
       setStatus(e instanceof Error ? e.message : "Failed to clear cache");
@@ -116,6 +126,11 @@ export function ProfileScreen() {
     auth.platform === "lichess" ? "Lichess" : "Chess.com";
 
   return (
+    <FadeFromBlank
+      contentKey={`profile:${auth.isLoggedIn ? auth.username || "in" : "out"}`}
+      ready
+      style={styles.fade}
+    >
     <ScrollView
       style={styles.scroll}
       contentContainerStyle={styles.content}
@@ -273,10 +288,15 @@ export function ProfileScreen() {
         <SettingsRow label="Terms & privacy" value="Placeholder" />
       </View>
     </ScrollView>
+    </FadeFromBlank>
   );
 }
 
 const styles = StyleSheet.create({
+  fade: {
+    flex: 1,
+    backgroundColor: colors.bg,
+  },
   scroll: {
     flex: 1,
     backgroundColor: colors.bg,

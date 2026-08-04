@@ -130,7 +130,7 @@ export function EvalPendingWarning() {
   const { phase, gamesDone, gamesTotal, status, lines } = useScanLog();
   const { games, metricsReady } = useAnalytics();
   const evalComplete = phase === "done" || phase === "error";
-  if (evalComplete || !metricsReady) return null;
+  if (!metricsReady || evalComplete) return null;
   const known =
     gamesTotal > 0
       ? gamesTotal

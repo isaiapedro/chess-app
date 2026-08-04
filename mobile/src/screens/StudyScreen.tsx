@@ -17,7 +17,7 @@ import {
 import { ChessBoard } from "../components/ChessBoard";
 import { OpeningPrepSection } from "../components/OpeningPrepSection";
 import { StudyAnalyzeStatus } from "../components/StudyAnalyzeStatus";
-import { PageLoadingTransition } from "../components/LoadingSkeletons";
+import { FadeFromBlank, PageLoadingTransition } from "../components/LoadingSkeletons";
 import {
   BrutalButton,
   DisplayTitle,
@@ -45,7 +45,17 @@ import {
   type ThresholdPass,
 } from "../engine/analyzeMistakes";
 import { applyUciMove } from "../engine/chessMoves";
-import { consumeCandidates } from "../engine/candidateBucket";
+import { consumeCandidates, candidateKey } from "../engine/candidateBucket";
+import {
+  capMistakeMoments,
+  filterUnsolvedMoments,
+  loadMistakesSession,
+  loadSolvedMistakeKeys,
+  markMistakesSolved,
+  mergeSessionMoments,
+  mistakesSessionId,
+  saveMistakesSession,
+} from "../engine/mistakeSession";
 import {
   createEvalLookup,
   getActiveGlobalScan,
@@ -55,12 +65,13 @@ import {
   runGlobalPeriodAnalysis,
   waitForActiveGlobalScan,
 } from "../engine/globalAnalysis";
-import { isStudyPrefetchActive } from "../engine/studyPrefetch";
+import { isStudyPrefetchActive, prioritizeRecentMistakesInCache } from "../engine/studyPrefetch";
 import { useStockfish } from "../engine/StockfishProvider";
 import { formatGmGameLabel } from "../engine/resolveContinuation";
 import {
   readCache,
   STUDY_ANALYSIS_TTL_MS,
+  PERMANENT_CACHE_TTL_MS,
   writeCache,
 } from "../storage/cache";
 import { readMistakesCacheForPeriod } from "../storage/periodCacheReuse";
@@ -297,10 +308,167 @@ export function StudyScreen() {
     [queryFilters]
   );
 
+  const completedKeysRef = useRef<Set<string>>(new Set());
+  const sessionIdRef = useRef(mistakesSessionId());
+
+  const persistSessionMoments = useCallback(
+    async (moments: MistakeItem[]) => {
+      const capped = capMistakeMoments(moments);
+      await saveMistakesSession(queryFilters, {
+        sessionId: mistakesSessionId(),
+        moments: capped,
+        completedKeys: [...completedKeysRef.current],
+      });
+      return capped;
+    },
+    [queryFilters]
+  );
+
+  const markCurrentSolved = useCallback(
+    async (item: MistakeItem | null | undefined) => {
+      if (!item) return;
+      const key = candidateKey(item);
+      if (completedKeysRef.current.has(key)) return;
+      completedKeysRef.current.add(key);
+      const solved = await markMistakesSolved(queryFilters, [item]);
+      await consumeCandidates(queryFilters, "mistake", [item]);
+      pendingCandidatesRef.current = filterUnsolvedMoments(
+        pendingCandidatesRef.current,
+        solved
+      );
+      deferredCandidatesRef.current = filterUnsolvedMoments(
+        deferredCandidatesRef.current,
+        solved
+      );
+      setPendingCount(pendingCandidatesRef.current.length);
+      await persistSessionMoments(mistakesRef.current);
+      const cached = parseMistakesCache(
+        await readCache(mistakesCacheKey, PERMANENT_CACHE_TTL_MS)
+      );
+      if (cached) {
+        await writeCache(mistakesCacheKey, {
+          ...cached,
+          moments: capMistakeMoments(mistakesRef.current),
+          pendingCandidates: pendingCandidatesRef.current,
+          deferredCandidates: deferredCandidatesRef.current,
+        } satisfies MistakesCachePayload);
+      }
+    },
+    [queryFilters, persistSessionMoments, mistakesCacheKey]
+  );
+
   const loadMistakes = useCallback(async (force = false) => {
+    const applyCachedPayload = async (
+      cached: MistakesCachePayload,
+      games: StudyGame[],
+      options?: { resetIdx?: boolean; replaceSession?: boolean }
+    ) => {
+      const resetIdx = options?.resetIdx ?? true;
+      const replaceSession = options?.replaceSession ?? false;
+      const solved = await loadSolvedMistakeKeys(queryFilters);
+      let moments = capMistakeMoments(cached.moments);
+      if (!replaceSession) {
+        const session = await loadMistakesSession(queryFilters);
+        if (session?.moments.length) {
+          completedKeysRef.current = new Set(session.completedKeys || []);
+          moments = mergeSessionMoments(
+            session.moments,
+            moments,
+            solved
+          );
+        } else {
+          moments = filterUnsolvedMoments(moments, solved);
+          moments = capMistakeMoments(moments);
+          completedKeysRef.current = new Set();
+        }
+      } else {
+        moments = filterUnsolvedMoments(moments, solved);
+        moments = capMistakeMoments(moments);
+        completedKeysRef.current = new Set();
+      }
+      sessionIdRef.current = mistakesSessionId();
+      setMistakes(moments);
+      if (resetIdx) setIdx(0);
+      visibleBatchStartRef.current = 0;
+      pendingBatchRef.current = null;
+      setPendingReady(false);
+      secondPagePrefetchKeyRef.current = null;
+      scannedIdsRef.current = cached.scannedGameIds;
+      pendingCandidatesRef.current = filterUnsolvedMoments(
+        cached.pendingCandidates || [],
+        solved
+      );
+      deferredCandidatesRef.current = filterUnsolvedMoments(
+        cached.deferredCandidates || [],
+        solved
+      );
+      setPendingCount(pendingCandidatesRef.current.length);
+      setRemainingGames(cached.remaining);
+      thresholdPassRef.current = cached.thresholdPass || "strict";
+      baselineAvailableRef.current = Boolean(cached.baselineAvailable);
+      setShowScanMore(false);
+      setMistakesError(null);
+      loadedCacheKeyRef.current = mistakesCacheKey;
+      setAnalyzeStatus(null);
+      setAnalyzeProgress(null);
+      await persistSessionMoments(moments);
+      void syncMistakeReservoir(
+        games,
+        pendingCandidatesRef.current.length
+      );
+    };
+
     const hydrateFromCache = async () => {
       const games = await ensureStudyGames(queryFilters, false);
       studyGamesRef.current = games;
+      const session = await loadMistakesSession(queryFilters);
+      if (session?.moments.length) {
+        completedKeysRef.current = new Set(session.completedKeys || []);
+        sessionIdRef.current = session.sessionId;
+        const cached = parseMistakesCache(
+          await readMistakesCacheForPeriod(
+            queryFilters,
+            games.map((game) => String(game.id))
+          )
+        );
+        setMistakes(capMistakeMoments(session.moments));
+        setIdx(0);
+        loadedCacheKeyRef.current = mistakesCacheKey;
+        setMistakesError(null);
+        if (cached) {
+          const solvedKeys = await loadSolvedMistakeKeys(queryFilters);
+          scannedIdsRef.current = cached.scannedGameIds;
+          pendingCandidatesRef.current = filterUnsolvedMoments(
+            cached.pendingCandidates || [],
+            solvedKeys
+          );
+          deferredCandidatesRef.current = filterUnsolvedMoments(
+            cached.deferredCandidates || [],
+            solvedKeys
+          );
+          setPendingCount(pendingCandidatesRef.current.length);
+          setRemainingGames(cached.remaining);
+          thresholdPassRef.current = cached.thresholdPass || "strict";
+          baselineAvailableRef.current = Boolean(cached.baselineAvailable);
+          void syncMistakeReservoir(
+            games,
+            pendingCandidatesRef.current.length
+          );
+        }
+        if (engineReady && !force && session.moments.length < TARGET_MISTAKE_MOMENTS) {
+          void prioritizeRecentMistakesInCache({
+            filters: queryFilters,
+            games,
+            evaluate,
+            sessionMoments: session.moments,
+          }).then((updated) => {
+            if (!updated?.moments.length) return;
+            if (loadedCacheKeyRef.current !== mistakesCacheKey) return;
+            void applyCachedPayload(updated, games, { resetIdx: false });
+          });
+        }
+        return true;
+      }
       const cached = parseMistakesCache(
         await readMistakesCacheForPeriod(
           queryFilters,
@@ -308,34 +476,28 @@ export function StudyScreen() {
         )
       );
       if (!cached?.moments.length) return false;
-      setMistakes(cached.moments);
-      setIdx(0);
-      visibleBatchStartRef.current = 0;
-      pendingBatchRef.current = null;
-      setPendingReady(false);
-      secondPagePrefetchKeyRef.current = null;
-      scannedIdsRef.current = cached.scannedGameIds;
-      pendingCandidatesRef.current = cached.pendingCandidates || [];
-      deferredCandidatesRef.current = cached.deferredCandidates || [];
-      setPendingCount((cached.pendingCandidates || []).length);
-      setRemainingGames(cached.remaining);
-      thresholdPassRef.current = cached.thresholdPass || "strict";
-      baselineAvailableRef.current = Boolean(cached.baselineAvailable);
-      setShowScanMore(false);
-      setMistakesError(null);
-      loadedCacheKeyRef.current = mistakesCacheKey;
-      setLoadingMistakes(false);
-      setAnalyzeStatus(null);
-      setAnalyzeProgress(null);
-      void syncMistakeReservoir(
-        games,
-        (cached.pendingCandidates || []).length
-      );
+      await applyCachedPayload(cached, games, { replaceSession: true });
+      if (engineReady && !force) {
+        void prioritizeRecentMistakesInCache({
+          filters: queryFilters,
+          games,
+          evaluate,
+          sessionMoments: mistakesRef.current,
+        }).then((updated) => {
+          if (!updated?.moments.length) return;
+          if (loadedCacheKeyRef.current !== mistakesCacheKey) return;
+          void applyCachedPayload(updated, games, { resetIdx: false });
+        });
+      }
       return true;
     };
 
     if (!engineReady && !force) {
-      if (await hydrateFromCache()) return;
+      if (await hydrateFromCache()) {
+        setLoadingMistakes(true);
+        setAnalysisComplete(true);
+        return;
+      }
     }
     if (!engineReady) {
       setMistakesError(engineError || "Waiting for on-device Stockfish…");
@@ -345,10 +507,27 @@ export function StudyScreen() {
       !force &&
       loadedCacheKeyRef.current === mistakesCacheKey
     ) {
+      const games = studyGamesRef.current;
+      if (engineReady && games.length && mistakesRef.current.length < TARGET_MISTAKE_MOMENTS) {
+        void prioritizeRecentMistakesInCache({
+          filters: queryFilters,
+          games,
+          evaluate,
+          sessionMoments: mistakesRef.current,
+        }).then((updated) => {
+          if (!updated?.moments.length) return;
+          if (loadedCacheKeyRef.current !== mistakesCacheKey) return;
+          void applyCachedPayload(updated, games, { resetIdx: false });
+        });
+      }
       return;
     }
     if (!force) {
-      if (await hydrateFromCache()) return;
+      if (await hydrateFromCache()) {
+        setLoadingMistakes(true);
+        setAnalysisComplete(true);
+        return;
+      }
     }
 
     cancelRef.current.cancelled = true;
@@ -410,31 +589,9 @@ export function StudyScreen() {
             )
           );
           if (afterPrefetch?.moments.length) {
-            setMistakes(afterPrefetch.moments);
-            setIdx(0);
-            visibleBatchStartRef.current = 0;
-            pendingBatchRef.current = null;
-            setPendingReady(false);
-            secondPagePrefetchKeyRef.current = null;
-            scannedIdsRef.current = afterPrefetch.scannedGameIds;
-            pendingCandidatesRef.current = afterPrefetch.pendingCandidates || [];
-            deferredCandidatesRef.current = afterPrefetch.deferredCandidates || [];
-            setPendingCount((afterPrefetch.pendingCandidates || []).length);
-            setRemainingGames(afterPrefetch.remaining);
-            thresholdPassRef.current = afterPrefetch.thresholdPass || "strict";
-            baselineAvailableRef.current = Boolean(afterPrefetch.baselineAvailable);
-            setShowScanMore(false);
-            setMistakesError(null);
-            loadedCacheKeyRef.current = mistakesCacheKey;
-            setLoadingMistakes(false);
-            setAnalyzeStatus(null);
-            setAnalyzeProgress(null);
+            await applyCachedPayload(afterPrefetch, games);
             setAnalysisComplete(true);
             completed = true;
-            void syncMistakeReservoir(
-              games,
-              (afterPrefetch.pendingCandidates || []).length
-            );
             return;
           }
         }
@@ -449,31 +606,9 @@ export function StudyScreen() {
             )
           );
           if (late?.moments.length) {
-            setMistakes(late.moments);
-            setIdx(0);
-            visibleBatchStartRef.current = 0;
-            pendingBatchRef.current = null;
-            setPendingReady(false);
-            secondPagePrefetchKeyRef.current = null;
-            scannedIdsRef.current = late.scannedGameIds;
-            pendingCandidatesRef.current = late.pendingCandidates || [];
-            deferredCandidatesRef.current = late.deferredCandidates || [];
-            setPendingCount((late.pendingCandidates || []).length);
-            setRemainingGames(late.remaining);
-            thresholdPassRef.current = late.thresholdPass || "strict";
-            baselineAvailableRef.current = Boolean(late.baselineAvailable);
-            setShowScanMore(false);
-            setMistakesError(null);
-            loadedCacheKeyRef.current = mistakesCacheKey;
-            setLoadingMistakes(false);
-            setAnalyzeStatus(null);
-            setAnalyzeProgress(null);
+            await applyCachedPayload(late, games);
             setAnalysisComplete(true);
             completed = true;
-            void syncMistakeReservoir(
-              games,
-              (late.pendingCandidates || []).length
-            );
             return;
           }
         }
@@ -506,35 +641,46 @@ export function StudyScreen() {
       ) => {
         await consumeCandidates(queryFilters, "mistake", candidates);
         if (signal.cancelled) return;
+        const solved = await loadSolvedMistakeKeys(queryFilters);
+        const moments = capMistakeMoments(
+          filterUnsolvedMoments(batch.moments, solved)
+        );
         scannedIdsRef.current = batch.scannedGameIds;
-        pendingCandidatesRef.current = batch.pendingCandidates;
-        deferredCandidatesRef.current = batch.deferredCandidates;
-        setPendingCount(batch.pendingCandidates.length);
+        pendingCandidatesRef.current = filterUnsolvedMoments(
+          batch.pendingCandidates,
+          solved
+        );
+        deferredCandidatesRef.current = filterUnsolvedMoments(
+          batch.deferredCandidates || [],
+          solved
+        );
+        setPendingCount(pendingCandidatesRef.current.length);
         thresholdPassRef.current = batch.thresholdPass;
         baselineAvailableRef.current = batch.baselineAvailable;
         const reservoir = await syncMistakeReservoir(
           games,
-          batch.pendingCandidates.length
+          pendingCandidatesRef.current.length
         );
-        setMistakes(batch.moments);
+        setMistakes(moments);
         setIdx(0);
         visibleBatchStartRef.current = 0;
         pendingBatchRef.current = null;
         setPendingReady(false);
         secondPagePrefetchKeyRef.current = null;
         loadedCacheKeyRef.current = mistakesCacheKey;
-        if (batch.moments.length) {
+        completedKeysRef.current = new Set();
+        await persistSessionMoments(moments);
+        if (moments.length) {
           await writeCache(mistakesCacheKey, {
-            moments: batch.moments,
-            pendingCandidates: batch.pendingCandidates,
-            deferredCandidates: batch.deferredCandidates,
+            moments,
+            pendingCandidates: pendingCandidatesRef.current,
+            deferredCandidates: deferredCandidatesRef.current,
             scannedGameIds: batch.scannedGameIds,
             remaining: reservoir.remaining,
             thresholdPass: batch.thresholdPass,
             baselineAvailable: batch.baselineAvailable,
           } satisfies MistakesCachePayload);
           setMistakesError(null);
-          setLoadingMistakes(false);
           setAnalysisComplete(true);
           delivered = true;
           completed = true;
@@ -619,9 +765,10 @@ export function StudyScreen() {
     } finally {
       if (heldPuzzleSlot) endPuzzleBatch();
       if (!signal.cancelled) {
-        setLoadingMistakes(false);
         if (completed) {
           setAnalysisComplete(true);
+        } else {
+          setLoadingMistakes(false);
         }
       }
     }
@@ -633,6 +780,7 @@ export function StudyScreen() {
     mistakesCacheKey,
     pushProgress,
     syncMistakeReservoir,
+    persistSessionMoments,
   ]);
 
   const continueScanMistakes = useCallback(async (silent = false) => {
@@ -645,11 +793,19 @@ export function StudyScreen() {
     ) {
       return;
     }
+    const keptMoments = mistakesRef.current;
+    let slots = Math.max(0, TARGET_MISTAKE_MOMENTS - keptMoments.length);
+    let replaceBatch = false;
+    if (slots <= 0) {
+      if (silent) return;
+      replaceBatch = true;
+      slots = TARGET_MISTAKE_MOMENTS;
+    }
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
-    const keptMoments = mistakesRef.current;
     const carriedCandidates = pendingCandidatesRef.current;
+    const sessionBase = replaceBatch ? [] : keptMoments;
     if (!silent) {
       setShowScanMore(false);
       setAllDone(false);
@@ -690,12 +846,13 @@ export function StudyScreen() {
         studyGamesRef.current = games;
       }
 
+      const solved = await loadSolvedMistakeKeys(queryFilters);
       const refineOpts = {
         games,
         evaluate,
         signal,
-        limit: TARGET_MISTAKE_MOMENTS,
-        existingMoments: keptMoments,
+        limit: slots,
+        existingMoments: sessionBase,
         fetchMastersPgn: async (gameId: string) => fetchMastersPgn(gameId),
         fetchExplorer: async (fen: string, source: "masters" | "lichess") => {
           const res = await fetchExplorer(fen, source);
@@ -722,13 +879,18 @@ export function StudyScreen() {
         }
       );
 
-      if (vault.batch.length || carriedCandidates.length) {
+      const pool = filterUnsolvedMoments(
+        [...carriedCandidates, ...vault.batch],
+        solved
+      );
+
+      if (pool.length) {
         batch = await refineRecentMistakeCandidates({
           ...refineOpts,
-          candidates: [...carriedCandidates, ...vault.batch],
+          candidates: pool,
           lookupEval: createEvalLookup(vault.state),
         });
-        taken = batch.moments.slice(keptMoments.length);
+        taken = batch.moments.slice(sessionBase.length);
         await consumeCandidates(queryFilters, "mistake", taken);
       } else if (!vault.complete || isStudyPrefetchActive()) {
         if (!silent) {
@@ -751,13 +913,17 @@ export function StudyScreen() {
               batchLimit: Number.MAX_SAFE_INTEGER,
             }
           );
-          if (again.batch.length || carriedCandidates.length) {
+          const againPool = filterUnsolvedMoments(
+            [...carriedCandidates, ...again.batch],
+            solved
+          );
+          if (againPool.length) {
             batch = await refineRecentMistakeCandidates({
               ...refineOpts,
-              candidates: [...carriedCandidates, ...again.batch],
+              candidates: againPool,
               lookupEval: createEvalLookup(again.state),
             });
-            taken = batch.moments.slice(keptMoments.length);
+            taken = batch.moments.slice(sessionBase.length);
             await consumeCandidates(queryFilters, "mistake", taken);
             break;
           }
@@ -785,57 +951,78 @@ export function StudyScreen() {
       }
 
       if (signal.cancelled || !batch) return;
+      const nextSolved = await loadSolvedMistakeKeys(queryFilters);
+      const merged = replaceBatch
+        ? capMistakeMoments(
+            filterUnsolvedMoments(batch.moments, nextSolved)
+          )
+        : mergeSessionMoments(sessionBase, batch.moments, nextSolved);
       scannedIdsRef.current = [
         ...scannedIdsRef.current,
         ...batch.scannedGameIds,
       ];
-      pendingCandidatesRef.current = batch.pendingCandidates;
-      deferredCandidatesRef.current = batch.deferredCandidates;
-      setPendingCount(batch.pendingCandidates.length);
+      pendingCandidatesRef.current = filterUnsolvedMoments(
+        batch.pendingCandidates,
+        nextSolved
+      );
+      deferredCandidatesRef.current = filterUnsolvedMoments(
+        batch.deferredCandidates || [],
+        nextSolved
+      );
+      setPendingCount(pendingCandidatesRef.current.length);
       thresholdPassRef.current = batch.thresholdPass;
       baselineAvailableRef.current = batch.baselineAvailable;
       const reservoir = await syncMistakeReservoir(
         games,
-        batch.pendingCandidates.length
+        pendingCandidatesRef.current.length
       );
 
-      const hasNew = batch.moments.length > keptMoments.length;
+      const hasNew = replaceBatch
+        ? merged.length > 0
+        : merged.length > sessionBase.length;
+      await persistSessionMoments(merged);
       if (silent) {
         if (hasNew) {
           pendingBatchRef.current = {
-            moments: batch.moments,
-            pendingCandidates: batch.pendingCandidates,
-            deferredCandidates: batch.deferredCandidates,
+            moments: merged,
+            pendingCandidates: pendingCandidatesRef.current,
+            deferredCandidates: deferredCandidatesRef.current,
             scannedGameIds: scannedIdsRef.current,
             remaining: reservoir.remaining,
             thresholdPass: batch.thresholdPass,
             baselineAvailable: batch.baselineAvailable,
-            previousLength: keptMoments.length,
+            previousLength: replaceBatch ? 0 : sessionBase.length,
           };
           setPendingReady(true);
         }
         await writeCache(mistakesCacheKey, {
-          moments: keptMoments,
-          pendingCandidates: batch.pendingCandidates,
-          deferredCandidates: batch.deferredCandidates,
+          moments: replaceBatch ? merged : keptMoments,
+          pendingCandidates: pendingCandidatesRef.current,
+          deferredCandidates: deferredCandidatesRef.current,
           scannedGameIds: scannedIdsRef.current,
           remaining: reservoir.remaining,
           thresholdPass: batch.thresholdPass,
           baselineAvailable: batch.baselineAvailable,
         } satisfies MistakesCachePayload);
       } else {
-        setMistakes(batch.moments);
-        visibleBatchStartRef.current = hasNew ? keptMoments.length : 0;
+        setMistakes(merged);
+        visibleBatchStartRef.current = replaceBatch
+          ? 0
+          : hasNew
+            ? sessionBase.length
+            : 0;
         secondPagePrefetchKeyRef.current = null;
         setIdx(
-          hasNew
-            ? keptMoments.length
-            : Math.max(0, batch.moments.length - 1)
+          replaceBatch
+            ? 0
+            : hasNew
+              ? sessionBase.length
+              : Math.max(0, merged.length - 1)
         );
         await writeCache(mistakesCacheKey, {
-          moments: batch.moments,
-          pendingCandidates: batch.pendingCandidates,
-          deferredCandidates: batch.deferredCandidates,
+          moments: merged,
+          pendingCandidates: pendingCandidatesRef.current,
+          deferredCandidates: deferredCandidatesRef.current,
           scannedGameIds: scannedIdsRef.current,
           remaining: reservoir.remaining,
           thresholdPass: batch.thresholdPass,
@@ -867,7 +1054,9 @@ export function StudyScreen() {
           if (pending) {
             pendingBatchRef.current = null;
             setPendingReady(false);
-            setMistakes(pending.moments);
+            const capped = capMistakeMoments(pending.moments);
+            setMistakes(capped);
+            void persistSessionMoments(capped);
             visibleBatchStartRef.current = pending.previousLength;
             secondPagePrefetchKeyRef.current = null;
             setIdx(pending.previousLength);
@@ -876,7 +1065,7 @@ export function StudyScreen() {
             setMistakesError(null);
             resetQuizChrome();
             void writeCache(mistakesCacheKey, {
-              moments: pending.moments,
+              moments: capped,
               pendingCandidates: pending.pendingCandidates,
               deferredCandidates: pending.deferredCandidates,
               scannedGameIds: pending.scannedGameIds,
@@ -888,10 +1077,11 @@ export function StudyScreen() {
           setScanningMore(false);
         }
       } else {
-        setScanningMore(false);
-        setLoadingMistakes(false);
         if (!signal.cancelled && completed) {
           setAnalysisComplete(true);
+        } else if (!signal.cancelled) {
+          setScanningMore(false);
+          setLoadingMistakes(false);
         }
       }
     }
@@ -905,6 +1095,7 @@ export function StudyScreen() {
     pushProgress,
     resetQuizChrome,
     syncMistakeReservoir,
+    persistSessionMoments,
   ]);
 
   const applyPendingMistakesBatch = useCallback(() => {
@@ -912,16 +1103,24 @@ export function StudyScreen() {
     if (!pending) return false;
     pendingBatchRef.current = null;
     setPendingReady(false);
-    setMistakes(pending.moments);
+    const capped = capMistakeMoments(
+      mergeSessionMoments(
+        mistakesRef.current,
+        pending.moments,
+        completedKeysRef.current
+      )
+    );
+    setMistakes(capped);
+    void persistSessionMoments(capped);
     visibleBatchStartRef.current = pending.previousLength;
     secondPagePrefetchKeyRef.current = null;
-    setIdx(pending.previousLength);
+    setIdx(Math.min(pending.previousLength, Math.max(0, capped.length - 1)));
     setShowScanMore(false);
     setAllDone(false);
     setMistakesError(null);
     resetQuizChrome();
     void writeCache(mistakesCacheKey, {
-      moments: pending.moments,
+      moments: capped,
       pendingCandidates: pending.pendingCandidates,
       deferredCandidates: pending.deferredCandidates,
       scannedGameIds: pending.scannedGameIds,
@@ -930,7 +1129,7 @@ export function StudyScreen() {
       baselineAvailable: pending.baselineAvailable,
     } satisfies MistakesCachePayload);
     return true;
-  }, [mistakesCacheKey, resetQuizChrome]);
+  }, [mistakesCacheKey, resetQuizChrome, persistSessionMoments]);
 
   const requestScanMoreMistakes = useCallback(() => {
     if (applyPendingMistakesBatch()) return;
@@ -1030,6 +1229,7 @@ export function StudyScreen() {
       setHighlightUci(current.best_uci);
       setSequencePv(res.best_pv.length ? res.best_pv : current.best_uci ? [current.best_uci] : []);
       setSequencePlaying(false);
+      void markCurrentSolved(current);
     } catch (e) {
       setQuizFeedback(e instanceof Error ? e.message : "Validate failed");
       setPuzzleFen(current.fen);
@@ -1101,7 +1301,8 @@ export function StudyScreen() {
         ]}
       />
 
-      <View style={mode === "mistakes" ? undefined : styles.hiddenTab}>
+      <FadeFromBlank contentKey={mode} ready style={styles.sectionFade}>
+      {mode === "mistakes" ? (
         <PageLoadingTransition
           active={loadingMistakes || scanningMore}
           contentKey={
@@ -1191,9 +1392,11 @@ export function StudyScreen() {
                     {formatEval(evalAfter)} → {formatEval(evalBefore)}
                   </Text>
                   <Text style={styles.evalGain}>
-                    {Math.abs(evalBefore) > 2000 || Math.abs(evalAfter) > 2000
+                    {Math.abs(evalBefore) > 2000
                       ? "Mating attack"
-                      : `+${(Math.abs(displayCp(evalBefore) - displayCp(evalAfter)) / 100).toFixed(2)} improvement`}
+                      : Math.abs(evalAfter) > 2000
+                        ? "Escape mate"
+                        : `+${(Math.abs(displayCp(evalBefore) - displayCp(evalAfter)) / 100).toFixed(2)} improvement`}
                   </Text>
                   <View style={styles.evalAlign}>
                     <Pill
@@ -1328,6 +1531,7 @@ export function StudyScreen() {
                       setUserMoveEval(null);
                       setHighlightUci(current.best_uci);
                       setSequencePlaying(false);
+                      void markCurrentSolved(current);
                       try {
                         const res = await validateMoveLocal(
                           evaluate,
@@ -1373,10 +1577,10 @@ export function StudyScreen() {
             </View>
           ) : null}
         </PageLoadingTransition>
-      </View>
-      <View style={mode === "repertoire" ? undefined : styles.hiddenTab}>
+      ) : (
         <OpeningPrepSection active={mode === "repertoire"} />
-      </View>
+      )}
+      </FadeFromBlank>
     </ScrollView>
     </KeyboardAvoidingView>
   );
@@ -1384,7 +1588,7 @@ export function StudyScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: colors.bg },
-  hiddenTab: { display: "none" },
+  sectionFade: { flexGrow: 1 },
   content: { padding: spacing.md, paddingBottom: 120 },
   tabRow: { marginTop: spacing.lg, marginBottom: spacing.lg },
   center: { alignItems: "center", gap: spacing.sm, paddingVertical: spacing.lg },

@@ -61,15 +61,15 @@ export async function waitForPrefetchGate(timeoutMs = 20000): Promise<void> {
   ]);
 }
 
-export async function waitForPuzzleIdle(): Promise<void> {
+export async function waitForPuzzleIdle(timeoutMs = 8000): Promise<void> {
   if (puzzleDemand <= 0) return;
-  await waitUntil(() => puzzleDemand <= 0);
+  await Promise.race([
+    waitUntil(() => puzzleDemand <= 0),
+    new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+  ]);
 }
 
 export async function yieldForUi(options?: { heavy?: boolean }): Promise<void> {
-  if (puzzleDemand > 0) {
-    await waitForPuzzleIdle();
-  }
   const heavy = options?.heavy ?? false;
   const delayMs = heavy ? 4 : 0;
   if (typeof requestAnimationFrame === "function") {

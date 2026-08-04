@@ -29,7 +29,47 @@ def test_player_activity_month_week_day() -> None:
             "move_count": 40,
         },
         {
+            "username": "alice",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "alice",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "alice",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
             "username": "bob",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "bob",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "bob",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "bob",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "bob",
+            "speed": "blitz",
+            "move_count": 40,
+        },
+        {
+            "username": "carol",
             "speed": "blitz",
             "move_count": 40,
         },
@@ -41,21 +81,39 @@ def test_player_activity_month_week_day() -> None:
     assert fields["players_n"] == 2
     games_m = fields["avg_games_per_player_month"]
     assert isinstance(games_m, dict)
-    assert games_m["mean"] == 1.5
+    assert games_m["mean"] == 5.0
     assert games_m["p50"] is not None
+    assert isinstance(games_m.get("values"), list)
+    assert len(games_m["values"]) == 2
     games_d = fields["avg_games_per_player_day"]
     assert isinstance(games_d, dict)
-    assert games_d["mean"] == round(1.5 / 31, 3)
+    assert games_d["mean"] == round(5.0 / 31, 3)
     games_w = fields["avg_games_per_player_week"]
     assert isinstance(games_w, dict)
-    assert games_w["mean"] == round(1.5 / (31 / 7), 2)
+    assert games_w["mean"] == round(5.0 / (31 / 7), 2)
     secs_m = fields["avg_est_seconds_per_player_month"]
     assert isinstance(secs_m, dict)
-    assert secs_m["mean"] == round(((40 * 8) + (40 * 8) + (40 * 8)) / 2, 1)
+    assert secs_m["mean"] == round((5 * 40 * 8 + 5 * 40 * 8) / 2, 1)
     for key in ACTIVITY_METRIC_KEYS:
         dist = fields[key]
         assert isinstance(dist, dict)
         assert dist["mean"] is not None
+
+
+def test_activity_excludes_inactive_players() -> None:
+    by_user = {
+        "active": [5.0, 1000.0],
+        "also_active": [10.0, 2000.0],
+        "one_game": [1.0, 200.0],
+        "two_games": [2.0, 400.0],
+    }
+    fields = player_activity_metric_fields(
+        by_user, "lichess_db_standard_rated_2026-07"
+    )
+    assert fields["players_n"] == 2
+    games_m = fields["avg_games_per_player_month"]
+    assert isinstance(games_m, dict)
+    assert games_m["values"] == [5.0, 10.0]
 
 
 def test_hash_sample_accumulate() -> None:
@@ -80,5 +138,6 @@ def test_hash_sample_accumulate() -> None:
 if __name__ == "__main__":
     test_days_in_source_month()
     test_player_activity_month_week_day()
+    test_activity_excludes_inactive_players()
     test_hash_sample_accumulate()
     print("ok")
