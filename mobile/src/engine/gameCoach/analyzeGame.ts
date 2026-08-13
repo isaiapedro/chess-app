@@ -2,6 +2,7 @@ import { Chess, type Square } from "chess.js";
 import { GLOBAL_DEPTH } from "../analysisConfig";
 import { applyUciMove, uciFromMove } from "../chessMoves";
 import { toWhiteCp } from "../analyzeMistakes";
+import { variationEndPlyFromMap } from "../openingLines";
 import { classifyCoachMark, type CoachMark } from "./coachMarks";
 import { formatOpeningLabel } from "./ecoLabels";
 import {
@@ -15,7 +16,7 @@ import { assessPositionPov } from "./positionPov";
 import { retrieveKnowledgeNuggets } from "./retrieve";
 import {
   detectOpeningFamily,
-  detectStructureThemes,
+  StructureThemeTracker,
 } from "./structureDetect";
 import type { Platform } from "../../api/types";
 
@@ -85,8 +86,28 @@ export type AnalyzeProgress = {
   status: string;
 };
 
+const MATE_CP_THRESHOLD = 50000;
+const EVAL_CLAMP = 2000;
+const MATE_MOVE_SPAN = 100;
+
+function mateMovesFromCp(cp: number): number | null {
+  const abs = Math.abs(cp);
+  if (abs >= MATE_CP_THRESHOLD) {
+    return Math.max(0, Math.min(99, Math.round((100000 - abs) / 1000)));
+  }
+  if (abs > EVAL_CLAMP) {
+    return Math.max(0, Math.round(MATE_MOVE_SPAN - (abs - EVAL_CLAMP)));
+  }
+  return null;
+}
+
 function formatEval(cp: number | null): string {
   if (cp == null) return "n/a";
+  const moves = mateMovesFromCp(cp);
+  if (moves != null) {
+    if (moves === 0) return "Checkmate";
+    return `Mate in ${moves}`;
+  }
   return `${cp >= 0 ? "+" : ""}${(cp / 100).toFixed(2)}`;
 }
 
@@ -240,12 +261,18 @@ export async function analyzeSelectedGame(options: {
   const skeleton = parseGamePlies(source);
   const openingLabel = formatOpeningLabel(options.eco, options.opening);
   const openingTags = detectOpeningFamily(options.eco, options.opening);
+  const bookEndPly = variationEndPlyFromMap(
+    options.opening,
+    options.eco,
+    skeleton.map((s) => s.san)
+  );
   const userColor = normalizeUserColor(options.userColor);
   const usedKnowledge = new Set<string>();
   const usedTips = new Set<string>();
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
   let userPlyCount = 0;
+  const structureTracker = new StructureThemeTracker();
 
   let metrics = options.metrics || null;
   if (!metrics && options.platform && options.username) {
@@ -320,10 +347,11 @@ export async function analyzeSelectedGame(options: {
             })
           : null;
 
+      const structure = structureTracker.update(sk.fenAfter);
+
       if (sample) {
         const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
         const phase = phaseForPly(sk.ply, pieceCount);
-        const structure = detectStructureThemes(sk.fenAfter);
         const pov = assessPositionPov(sk.fenAfter, userColor);
         const moment = momentAtPly;
         const perspective = isUserPly ? "user" : "opponent";
@@ -435,6 +463,9 @@ export async function analyzeSelectedGame(options: {
             pov,
             playedBest,
             userPlyCount,
+            evalBeforeWhite: evalBefore,
+            evalAfterWhite: evalAfter,
+            opponentReplySan: skeleton[i + 1]?.san ?? null,
           });
         }
       }
@@ -442,6 +473,10 @@ export async function analyzeSelectedGame(options: {
       analyzed = false;
       note = "";
       mark = null;
+    }
+
+    if (bookEndPly != null && sk.ply <= bookEndPly) {
+      mark = "book";
     }
 
     prevEval = evalAfter ?? evalBefore ?? prevEval;

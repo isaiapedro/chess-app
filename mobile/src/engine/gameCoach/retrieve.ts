@@ -31,6 +31,7 @@ function fingerprint(text: string): string {
 const STRUCTURE_PRIORITY = new Set([
   "iqp",
   "hanging_pawns",
+  "doubled_pawns",
   "open_c_file",
   "open_file",
   "bishop_pair",
@@ -115,6 +116,15 @@ export function retrieveKnowledgeNuggets(
   const ranked = KNOWLEDGE_PACK.filter((card) => {
     const hit = card.requireThemes.some((t) => themeSet.has(t));
     if (!hit) return false;
+    const openingSpecific = card.requireThemes.filter(
+      (t) => t.startsWith("opening_") && t !== "opening_plan"
+    );
+    if (
+      openingSpecific.length &&
+      !openingSpecific.some((t) => themeSet.has(t))
+    ) {
+      return false;
+    }
     const phases = card.phases || ["any"];
     if (!(phases.includes("any") || phases.includes(phase))) return false;
     const score = cardScore(card, themeSet);

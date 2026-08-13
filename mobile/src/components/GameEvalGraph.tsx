@@ -130,6 +130,8 @@ export function GameEvalGraph({
   };
 
   const labelY = height - 4;
+  const topSign = flip === 1 ? "+" : "−";
+  const bottomSign = flip === 1 ? "−" : "+";
 
   return (
     <View style={styles.wrap}>
@@ -209,7 +211,7 @@ export function GameEvalGraph({
             fontFamily={font.sansMedium}
             opacity={0.5}
           >
-            +
+            {topSign}
           </SvgText>
           <SvgText
             x={padX + 6}
@@ -219,7 +221,7 @@ export function GameEvalGraph({
             fontFamily={font.sansMedium}
             opacity={0.5}
           >
-            −
+            {bottomSign}
           </SvgText>
 
           {phaseSplits ? (

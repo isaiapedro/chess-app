@@ -2,8 +2,7 @@ import { PERMANENT_CACHE_TTL_MS, readCache, writeCache } from "../../storage/cac
 import type { GameCoachResult } from "./analyzeGame";
 
 function cacheKey(platform: string, username: string, gameId: string): string {
-  // v20: modular moment-bit phrase dictionary (varied turning-point wording)
-  return `game-coach:v20:${platform}|${username.trim().toLowerCase()}|${gameId}`;
+  return `game-coach:v29:${platform}|${username.trim().toLowerCase()}|${gameId}`;
 }
 
 export async function loadCachedGameAnalysis(

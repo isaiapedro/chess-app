@@ -1,7 +1,20 @@
-import { Chess, type Square } from "chess.js";
+import { Chess, type Color, type Square } from "chess.js";
+import { HEURISTICS_DOUBLED_PERSIST_PLIES } from "../analysisConfig";
 import { resolveEcoFamily } from "../ecoFamilies";
+import {
+  hasDoubledPawns,
+  hasIsolatedQueenPawn,
+} from "../middlegamePhase";
 
 const FILES = "abcdefgh";
+
+/** Themes that must persist across plies (same idea as doubled-pawn metrics). */
+const PERSIST_STRUCTURE = new Set([
+  "iqp",
+  "doubled_pawns",
+  "hanging_pawns",
+  "passed_pawn",
+]);
 
 function filePawnCounts(board: Chess, file: number): { w: number; b: number } {
   let w = 0;
@@ -36,20 +49,7 @@ function countBishops(board: Chess, color: "w" | "b"): number {
   return n;
 }
 
-function dPawnIsolated(board: Chess, color: "w" | "b"): boolean {
-  // IQP: own pawn on d-file, no own pawns on c or e.
-  const d = filePawnCounts(board, 3); // d-file
-  const ownD = color === "w" ? d.w : d.b;
-  if (ownD !== 1) return false;
-  const c = filePawnCounts(board, 2);
-  const e = filePawnCounts(board, 4);
-  const ownC = color === "w" ? c.w : c.b;
-  const ownE = color === "w" ? e.w : e.b;
-  return ownC === 0 && ownE === 0;
-}
-
 function hangingCd(board: Chess, color: "w" | "b"): boolean {
-  // Hanging pawns: own pawns on c and d, none on b or e (classic).
   const b = filePawnCounts(board, 1);
   const c = filePawnCounts(board, 2);
   const d = filePawnCounts(board, 3);
@@ -96,19 +96,22 @@ function passedPawnPresent(board: Chess): boolean {
 }
 
 /**
- * Board-true structure tags only. No ECO/opening guessing.
+ * Instant board scan (may flicker). Prefer StructureThemeTracker for notes.
  */
 export function detectStructureThemes(fen: string): string[] {
   const themes: string[] = [];
   try {
     const board = new Chess(fen);
-    if (dPawnIsolated(board, "w") || dPawnIsolated(board, "b")) {
+    const colors: Color[] = ["w", "b"];
+    if (colors.some((c) => hasIsolatedQueenPawn(board, c))) {
       themes.push("iqp");
+    }
+    if (colors.some((c) => hasDoubledPawns(board, c))) {
+      themes.push("doubled_pawns");
     }
     if (hangingCd(board, "w") || hangingCd(board, "b")) {
       themes.push("hanging_pawns");
     }
-    // Fully open file (no pawns) with a major piece already on it
     for (let f = 0; f < 8; f++) {
       const { w, b } = filePawnCounts(board, f);
       if (w === 0 && b === 0) {
@@ -126,7 +129,6 @@ export function detectStructureThemes(fen: string): string[] {
     if (passedPawnPresent(board)) {
       themes.push("passed_pawn");
     }
-    // Space: crude — more advanced pawns
     let wAdv = 0;
     let bAdv = 0;
     for (let f = 0; f < 8; f++) {
@@ -146,8 +148,36 @@ export function detectStructureThemes(fen: string): string[] {
 }
 
 /**
+ * Only emit iqp / doubled / hanging / passer after they persist
+ * for HEURISTICS_DOUBLED_PERSIST_PLIES consecutive positions.
+ */
+export class StructureThemeTracker {
+  private streaks = new Map<string, number>();
+
+  update(fen: string): string[] {
+    const raw = detectStructureThemes(fen);
+    const rawSet = new Set(raw);
+    const out: string[] = [];
+
+    for (const theme of PERSIST_STRUCTURE) {
+      if (rawSet.has(theme)) {
+        const n = (this.streaks.get(theme) || 0) + 1;
+        this.streaks.set(theme, n);
+        if (n >= HEURISTICS_DOUBLED_PERSIST_PLIES) out.push(theme);
+      } else {
+        this.streaks.set(theme, 0);
+      }
+    }
+
+    for (const t of raw) {
+      if (!PERSIST_STRUCTURE.has(t)) out.push(t);
+    }
+    return out;
+  }
+}
+
+/**
  * Soft opening themes for RAG + phase plans (from ECO family / name).
- * Book archive cards match opening_* tags — not one-off local patches.
  */
 export function detectOpeningFamily(
   eco?: string | null,
@@ -218,4 +248,3 @@ export function detectOpeningFamily(
 
   return [...new Set(tags)];
 }
-

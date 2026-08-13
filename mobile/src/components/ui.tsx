@@ -59,6 +59,8 @@ export function Divider({ style }: { style?: ViewStyle }) {
 export function BrutalButton({
   label,
   onPress,
+  onPressIn,
+  onPressOut,
   disabled,
   ghost,
   tone,
@@ -66,6 +68,8 @@ export function BrutalButton({
 }: {
   label: string;
   onPress?: () => void;
+  onPressIn?: () => void;
+  onPressOut?: () => void;
   disabled?: boolean;
   ghost?: boolean;
   tone?: string;
@@ -76,6 +80,8 @@ export function BrutalButton({
     return (
       <Pressable
         onPress={onPress}
+        onPressIn={onPressIn}
+        onPressOut={onPressOut}
         disabled={disabled}
         hitSlop={8}
         style={({ pressed }) => [
@@ -99,6 +105,8 @@ export function BrutalButton({
   return (
     <Pressable
       onPress={onPress}
+      onPressIn={onPressIn}
+      onPressOut={onPressOut}
       disabled={disabled}
       style={({ pressed }) => [
         styles.pillButton,

@@ -22,8 +22,8 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     requireThemes: ["development"],
     weight: 2,
     rules: [
-      "Every early move should develop, fight the centre, or prepare castling — queen raids without backup usually lose tempo.",
-      "Connect the rooks before pawn storms; unfinished development becomes lasting pressure.",
+      "Every early move should develop, fight the centre, or prepare castling.",
+      "Finish developing the minors before starting a wing attack.",
       "Improve the piece with no job before a speculative pawn push.",
     ],
     phases: ["opening", "any"],
@@ -36,7 +36,7 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     rules: [
       "Whoever controls the centre directs the play — occupy it or pressure it from afar.",
       "A fixed centre invites wing plans; a fluid centre needs piece activity and timely breaks.",
-      "Before a wing attack, confirm the centre is stable — a central counterbreak often arrives first.",
+      "Before a wing attack, check that the centre is stable — a central counterbreak often arrives first.",
     ],
     phases: ["opening", "middlegame", "any"],
   },
@@ -60,7 +60,7 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     rules: [
       "Active pieces compensate for small structural flaws — ask which piece has no target.",
       "Improve the worst-placed piece before forcing tactics.",
-      "Do not trade your only active piece for a spectator unless the structure clearly improves.",
+      "Don't trade your only active piece for a spectator unless the structure clearly improves.",
     ],
     phases: ["middlegame", "any"],
   },
@@ -128,8 +128,8 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     requireThemes: ["missed_opportunity"],
     weight: 3,
     rules: [
-      "A missed opportunity is failing to punish a temporary weakness — uncastled king, loose piece, or open file — while it still exists.",
-      "When the opponent creates a target, ask what forcing move asks the hardest question before the chance closes.",
+      "A missed chance means failing to punish a temporary weakness — uncastled king, loose piece, or open file — while it still exists.",
+      "When they create a target, ask which forcing move asks the hardest question before the chance closes.",
       "Quiet improving moves are fine only after you check whether a concrete hit was available.",
     ],
     phases: ["opening", "middlegame", "any"],
@@ -140,9 +140,9 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     requireThemes: ["counterplay"],
     weight: 3,
     rules: [
-      "Against an opponent plan, either stop it at the source or race a clearer counter-threat.",
-      "Hit the base of their pawn chain or the piece that holds their idea together.",
-      "If they overextend on a wing, break in the centre or invade the newly soft squares.",
+      "If they have a plan, stop it early or hit back harder with your own threat.",
+      "Go after the piece or pawn that holds their idea together.",
+      "If they push too far on one wing, break in the centre or take the soft squares they left behind.",
     ],
     phases: ["middlegame", "opening", "any"],
   },
@@ -152,9 +152,9 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     requireThemes: ["weakness_exploitation"],
     weight: 3,
     rules: [
-      "After the opponent softens a square or file, occupy it or force further concessions before they repair it.",
-      "Fixed pawn weaknesses want blockade and pressure, not random piece trades that ease the defence.",
-      "Loose pieces and undefended entry squares are invitations — calculate the forcing sequence first.",
+      "After they soften a square or file, take it or force more weaknesses before they fix it.",
+      "Fixed weak pawns want blockade and pressure — do not trade the pieces that attack them.",
+      "Loose pieces and open entry squares are invitations — check forcing moves first.",
     ],
     phases: ["middlegame", "opening", "endgame", "any"],
   },
@@ -197,7 +197,7 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     requireThemes: ["defense"],
     weight: 2,
     rules: [
-      "In defence, exchange the opponent's most active attacker and contest open lines into your camp.",
+      "In defence, exchange their most active attacker and contest open lines into your camp.",
       "Create a clear counter-threat rather than only answering each check with a retreat.",
     ],
     phases: ["middlegame", "endgame", "any"],
@@ -209,7 +209,7 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
     weight: 2,
     rules: [
       "With a clear plus, remove counterplay first, then advance the winning plan.",
-      "Do not allow unnecessary complications when a simple technical path exists.",
+      "Don't invite needless complications when a simple technical path exists.",
     ],
     phases: ["middlegame", "endgame", "any"],
   },

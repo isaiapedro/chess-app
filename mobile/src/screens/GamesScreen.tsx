@@ -2,14 +2,18 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   ActivityIndicator,
   FlatList,
+  Image,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
   Text,
+  Vibration,
   View,
 } from "react-native";
 import { Chess } from "chess.js";
 import { Ionicons } from "@expo/vector-icons";
+import * as Haptics from "expo-haptics";
 import { ChessBoard } from "../components/ChessBoard";
 import { GameEvalGraph } from "../components/GameEvalGraph";
 import {
@@ -46,7 +50,19 @@ import { colors, font, radius, result, spacing, type } from "../theme";
 
 /** Matches TabNavigator order: Wrapped, Insights, Study, Games, Profile */
 const GAMES_TAB_INDEX = 3;
-const GAMES_PAGE_SIZE = 30;
+const GAMES_PAGE_SIZE = 20;
+
+function navHaptic() {
+  if (Platform.OS === "web") return;
+  if (Platform.OS === "android") {
+    Vibration.vibrate(18);
+  }
+  void Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy).catch(() => {
+    if (Platform.OS === "ios") {
+      Vibration.vibrate(18);
+    }
+  });
+}
 
 function formatGameDate(value?: string): string {
   if (!value) return "Unknown date";
@@ -355,9 +371,55 @@ export function GamesScreen() {
   const highlightUci =
     plyIndex >= 0 && plies[plyIndex] ? plies[plyIndex].uci : null;
 
-  const prevPly = () => setPlyIndex((i) => Math.max(-1, i - 1));
-  const nextPly = () =>
-    setPlyIndex((i) => Math.min(Math.max(plies.length - 1, 0), i + 1));
+  const holdTimers = useRef<{
+    delay: ReturnType<typeof setTimeout> | null;
+    interval: ReturnType<typeof setInterval> | null;
+  }>({ delay: null, interval: null });
+
+  const stopHoldNav = useCallback(() => {
+    if (holdTimers.current.delay) clearTimeout(holdTimers.current.delay);
+    if (holdTimers.current.interval) clearInterval(holdTimers.current.interval);
+    holdTimers.current.delay = null;
+    holdTimers.current.interval = null;
+  }, []);
+
+  const startHoldNav = useCallback(
+    (step: () => void) => {
+      stopHoldNav();
+      navHaptic();
+      step();
+      holdTimers.current.delay = setTimeout(() => {
+        holdTimers.current.interval = setInterval(step, 85);
+      }, 380);
+    },
+    [stopHoldNav]
+  );
+
+  useEffect(() => () => stopHoldNav(), [stopHoldNav]);
+
+  const prevPly = useCallback(() => {
+    setPlyIndex((i) => {
+      if (i <= -1) {
+        stopHoldNav();
+        return -1;
+      }
+      const next = i - 1;
+      if (next <= -1) stopHoldNav();
+      return next;
+    });
+  }, [stopHoldNav]);
+  const nextPly = useCallback(() => {
+    setPlyIndex((i) => {
+      const max = Math.max(plies.length - 1, 0);
+      if (i >= max) {
+        stopHoldNav();
+        return i;
+      }
+      const next = i + 1;
+      if (next >= max) stopHoldNav();
+      return next;
+    });
+  }, [plies.length, stopHoldNav]);
 
   if (selectedGame) {
     return (
@@ -401,22 +463,31 @@ export function GamesScreen() {
               <View style={styles.evalBarTrack}>
                 <View style={[styles.evalBarFill, { width: `${whiteShare}%` }]} />
               </View>
-              {liveLines.length ? (
-                <View style={styles.linesBox}>
-                  {liveLines.map((line) => (
+              <View style={styles.linesBox}>
+                {[0, 1, 2].map((i) => {
+                  const line = liveLines[i];
+                  return (
                     <Text
-                      key={line.rank}
+                      key={i}
                       style={styles.lineText}
                       numberOfLines={1}
                       ellipsizeMode="tail"
                     >
-                      <Text style={styles.lineRank}>{line.rank}. </Text>
-                      <Text style={styles.lineEval}>{formatEval(line.cpWhite)} </Text>
-                      {line.pvSan.join(" ")}
+                      {line ? (
+                        <>
+                          <Text style={styles.lineRank}>{line.rank}. </Text>
+                          <Text style={styles.lineEval}>
+                            {formatEval(line.cpWhite)}{" "}
+                          </Text>
+                          {line.pvSan.join(" ")}
+                        </>
+                      ) : (
+                        " "
+                      )}
                     </Text>
-                  ))}
-                </View>
-              ) : null}
+                  );
+                })}
+              </View>
             </View>
           ) : null}
 
@@ -437,7 +508,8 @@ export function GamesScreen() {
             <BrutalButton
               label="Previous"
               ghost
-              onPress={prevPly}
+              onPressIn={() => startHoldNav(prevPly)}
+              onPressOut={stopHoldNav}
               disabled={plyIndex < 0}
               style={{ flex: 1 }}
             />
@@ -451,7 +523,8 @@ export function GamesScreen() {
             <BrutalButton
               label="Next"
               ghost
-              onPress={nextPly}
+              onPressIn={() => startHoldNav(nextPly)}
+              onPressOut={stopHoldNav}
               disabled={!plies.length || plyIndex >= plies.length - 1}
               style={{ flex: 1 }}
             />
@@ -491,6 +564,7 @@ export function GamesScreen() {
             {plies.map((p, i) => {
               const active = i === plyIndex;
               const noted = Boolean(p.note);
+              const markSrc = p.mark ? COACH_MARK_SOURCES[p.mark] : null;
               return (
                 <Pressable
                   key={`${p.ply}-${p.san}`}
@@ -499,17 +573,23 @@ export function GamesScreen() {
                     styles.moveChip,
                     active && styles.moveChipActive,
                     noted && styles.moveChipNoted,
+                    p.mark === "book" && styles.moveChipBook,
                   ]}
                 >
-                  <Text
-                    style={[
-                      styles.moveChipText,
-                      active && styles.moveChipTextActive,
-                    ]}
-                  >
-                    {p.side === "white" ? `${p.fullmove}. ` : ""}
-                    {p.san}
-                  </Text>
+                  <View style={styles.moveChipInner}>
+                    {markSrc ? (
+                      <Image source={markSrc} style={styles.moveChipMark} />
+                    ) : null}
+                    <Text
+                      style={[
+                        styles.moveChipText,
+                        active && styles.moveChipTextActive,
+                      ]}
+                    >
+                      {p.side === "white" ? `${p.fullmove}. ` : ""}
+                      {p.san}
+                    </Text>
+                  </View>
                 </Pressable>
               );
             })}
@@ -593,20 +673,25 @@ export function GamesScreen() {
                   </Text>
                 </Pressable>
               )}
-              onEndReached={() => {
-                if (!hasMore || listLoading) return;
-                applyVisible(
-                  allGamesRef.current,
-                  visibleCount + GAMES_PAGE_SIZE
-                );
-              }}
-              onEndReachedThreshold={0.4}
               ListFooterComponent={
                 listLoading && games.length ? (
                   <ActivityIndicator
                     color={colors.cream}
                     style={{ marginVertical: 16 }}
                   />
+                ) : hasMore ? (
+                  <View style={styles.moreRow}>
+                    <BrutalButton
+                      label="More"
+                      ghost
+                      onPress={() =>
+                        applyVisible(
+                          allGamesRef.current,
+                          visibleCount + GAMES_PAGE_SIZE
+                        )
+                      }
+                    />
+                  </View>
                 ) : null
               }
             />
@@ -631,6 +716,10 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: spacing.md,
     paddingBottom: 120,
+  },
+  moreRow: {
+    alignItems: "center",
+    paddingVertical: spacing.md,
   },
   backRow: {
     flexDirection: "row",
@@ -682,10 +771,16 @@ const styles = StyleSheet.create({
     borderRadius: radius.pill,
     backgroundColor: result.win,
   },
-  linesBox: { gap: 4, marginBottom: spacing.sm },
+  linesBox: {
+    gap: 4,
+    marginBottom: spacing.sm,
+    height: 3 * 18 + 2 * 4,
+  },
   lineText: {
     fontFamily: font.mono,
     fontSize: type.caption.fontSize,
+    lineHeight: 18,
+    height: 18,
     color: colors.textSoft,
   },
   lineRank: { color: colors.textDim },
@@ -703,7 +798,7 @@ const styles = StyleSheet.create({
     minWidth: 72,
     textAlign: "center",
   },
-  analyzeRow: { alignItems: "flex-start", marginTop: spacing.xs },
+  analyzeRow: { alignItems: "center", marginTop: spacing.xs },
   progressText: {
     fontFamily: font.sans,
     fontSize: type.caption.fontSize,
@@ -737,6 +832,7 @@ const styles = StyleSheet.create({
     fontSize: type.body.fontSize,
     lineHeight: 22,
     color: colors.textSoft,
+    flexShrink: 0,
   },
   movesHeader: {
     fontFamily: font.sansMedium,
@@ -758,6 +854,13 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surfaceRaised,
   },
   moveChipNoted: { borderColor: "rgba(237,231,211,0.35)" },
+  moveChipBook: { borderColor: "rgba(237,231,211,0.45)" },
+  moveChipInner: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  moveChipMark: { width: 14, height: 14 },
   moveChipText: {
     fontFamily: font.mono,
     fontSize: type.caption.fontSize,

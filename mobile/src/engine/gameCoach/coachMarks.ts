@@ -5,9 +5,15 @@ import {
   type EvalDropKind,
 } from "../winProb";
 
-export type CoachMark = "best" | "inaccuracy" | "mistake" | "blunder";
+export type CoachMark =
+  | "book"
+  | "best"
+  | "inaccuracy"
+  | "mistake"
+  | "blunder";
 
 export const COACH_MARK_SOURCES: Record<CoachMark, ImageSourcePropType> = {
+  book: require("../../../assets/coach/textbook-chess.gif"),
   best: require("../../../assets/coach/chess-great-move.gif"),
   inaccuracy: require("../../../assets/coach/chess-inaccuracy.gif"),
   mistake: require("../../../assets/coach/chess-mistake.gif"),
