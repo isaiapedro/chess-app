@@ -1,9 +1,21 @@
 import { Chess, type Square } from "chess.js";
 import { GLOBAL_DEPTH } from "../analysisConfig";
-import { applyUciMove, uciFromMove } from "../chessMoves";
+import { applyUciMove, fenKey, uciFromMove } from "../chessMoves";
 import { toWhiteCp } from "../analyzeMistakes";
-import { variationEndPlyFromMap } from "../openingLines";
-import { classifyCoachMark, type CoachMark } from "./coachMarks";
+import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
+import {
+  getSharedGameRecord,
+  loadPermanentEvalStore,
+  upsertSharedGameEvals,
+  type PositionEval,
+} from "../globalAnalysis";
+import {
+  classifyCoachMark,
+  coachMissedFromPending,
+  isCoachMistakeOrWorse,
+  type CoachMark,
+} from "./coachMarks";
+import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
 import { formatOpeningLabel } from "./ecoLabels";
 import {
   emptyCoachGameMetrics,
@@ -11,21 +23,32 @@ import {
   type CoachGameMetrics,
 } from "./gameMetricsLookup";
 import { composeCoachNote, expandCoachThemes, classifyUserError, shouldComposeNote } from "./noteCompose";
+import { composeGameSummaryNote } from "./gameSummary";
 import { phasePlanSlotOpen } from "./phasePlans";
 import { assessPositionPov } from "./positionPov";
-import { retrieveKnowledgeNuggets } from "./retrieve";
+import {
+  mergeHybridKnowledgeNuggets,
+  type KnowledgeNugget,
+  type RetrieveContext,
+  type VectorRetrieveFn,
+} from "./retrieve";
+import { missedForcingLine } from "./tacticalFact";
 import {
   detectOpeningFamily,
   StructureThemeTracker,
 } from "./structureDetect";
 import type { Platform } from "../../api/types";
+import { claimNoteText } from "./noteRelevance";
+import { claimNoteTopic } from "./noteTopics";
 
 const KING_FILTER = new Set([
   "king_safety",
   "opp_king_exposed",
   "user_king_exposed",
-  "attack",
 ]);
+
+const MAX_PRO_THEORY_PLIES = 40;
+const BOOK_MIN_LOCAL_PCT = 2;
 
 function normalizeUserColor(raw?: string | null): "white" | "black" {
   const v = String(raw || "white").trim().toLowerCase();
@@ -43,6 +66,25 @@ export type EvalFn = (
   bestUci: string | null;
   bestPv?: string[];
   multipv?: Array<{ uci: string; cpWhite: number; pv?: string[] }>;
+}>;
+
+export type GameCoachExplorerFn = (
+  fen: string,
+  source: "lichess" | "masters",
+  ratings?: string
+) => Promise<{
+  moves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>;
+  white: number;
+  draws: number;
+  black: number;
+  opening?: { eco?: string; name?: string };
+  fallback?: boolean;
 }>;
 
 export type EngineLine = {
@@ -162,6 +204,210 @@ function pvToSan(fen: string, pv: string[] | undefined, max = 14): string[] {
   }
 }
 
+function explorerMoveGames(m: {
+  white?: number;
+  draws?: number;
+  black?: number;
+}): number {
+  return (m.white || 0) + (m.draws || 0) + (m.black || 0);
+}
+
+function explorerContainsMove(
+  moves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  uci: string,
+  san: string
+): boolean {
+  const normSan = san.replace(/[+#?!]+$/g, "");
+  const hit =
+    moves.find((m) => m.uci === uci) ||
+    moves.find((m) => (m.san || "").replace(/[+#?!]+$/g, "") === normSan);
+  return Boolean(hit && explorerMoveGames(hit) > 0);
+}
+
+function explorerMoveShare(
+  moves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  uci: string,
+  san: string
+): { games: number; pct: number; rank: number | null } {
+  const normSan = san.replace(/[+#?!]+$/g, "");
+  const total = moves.reduce((s, m) => s + explorerMoveGames(m), 0);
+  if (total <= 0) return { games: 0, pct: 0, rank: null };
+  const ranked = [...moves].sort(
+    (a, b) =>
+      explorerMoveGames(b) - explorerMoveGames(a) ||
+      String(a.san || "").localeCompare(String(b.san || ""))
+  );
+  const idx = ranked.findIndex(
+    (m) =>
+      m.uci === uci ||
+      (m.san || "").replace(/[+#?!]+$/g, "") === normSan
+  );
+  if (idx < 0) return { games: 0, pct: 0, rank: null };
+  const games = explorerMoveGames(ranked[idx]);
+  return {
+    games,
+    pct: (games / total) * 100,
+    rank: idx + 1,
+  };
+}
+
+function moveStillInBook(
+  lichessMoves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  mastersMoves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  uci: string,
+  san: string
+): boolean {
+  const li = explorerMoveShare(lichessMoves, uci, san);
+  const ma = explorerMoveShare(mastersMoves, uci, san);
+  const best = li.pct >= ma.pct ? li : ma;
+  if (best.games <= 0) return false;
+  if (best.pct + 1e-9 < BOOK_MIN_LOCAL_PCT) return false;
+  return true;
+}
+
+function evalSignCrosses(beforeCp: number, afterCp: number): boolean {
+  const eps = 25;
+  if (Math.abs(beforeCp) < eps || Math.abs(afterCp) < eps) return false;
+  return Math.sign(beforeCp) !== Math.sign(afterCp);
+}
+
+/**
+ * Opening-puzzle theory end (1-based ply), matching analyzeOpenings:
+ * map variation leaf, else explorer named-opening leaf, else frequency book.
+ */
+async function professionalTheoryEndPly(
+  skeleton: Array<{ ply: number; fenBefore: string; uci: string; san: string }>,
+  fetchExplorer: GameCoachExplorerFn,
+  openingName?: string | null,
+  signal?: { cancelled: boolean },
+  onProgress?: (status: string) => void
+): Promise<{
+  namedEndPly: number | null;
+  freqEndPly: number | null;
+  available: boolean;
+}> {
+  let namedEndPly: number | null = null;
+  let freqEndPly: number | null = null;
+  let explorerNamed = false;
+  let freqAlive = true;
+  const limit = Math.min(skeleton.length, MAX_PRO_THEORY_PLIES);
+  const gameOpeningName = String(openingName || "");
+  try {
+    for (let i = 0; i < limit; i += 1) {
+      if (signal?.cancelled) break;
+      const sk = skeleton[i];
+      onProgress?.(`Opening theory · move ${Math.ceil(sk.ply / 2)}`);
+      const [lichess, masters] = await Promise.all([
+        fetchExplorer(sk.fenBefore, "lichess"),
+        fetchExplorer(sk.fenBefore, "masters"),
+      ]);
+
+      if (gameOpeningName && !explorerNamed) {
+        const explorerOpeningName =
+          lichess.opening?.name || masters.opening?.name || null;
+        if (openingNamesMatch(explorerOpeningName, gameOpeningName)) {
+          // fenBefore already named leaf → last book move was previous ply
+          // (same as analyzeOpenings compoundStartPly = 0-based i → 1-based end = i)
+          namedEndPly = i > 0 ? i : null;
+          explorerNamed = true;
+        }
+      }
+
+      if (freqAlive) {
+        const known = moveStillInBook(
+          lichess.moves || [],
+          masters.moves || [],
+          sk.uci,
+          sk.san
+        );
+        if (!known) {
+          freqAlive = false;
+        } else {
+          freqEndPly = sk.ply;
+        }
+      }
+
+      if (explorerNamed && !freqAlive) break;
+    }
+    return {
+      namedEndPly,
+      freqEndPly,
+      available: true,
+    };
+  } catch {
+    return { namedEndPly: null, freqEndPly: null, available: false };
+  }
+}
+
+function resolveBookEndPly(args: {
+  mapEndPly: number | null;
+  namedEndPly: number | null;
+  freqEndPly: number | null;
+  proAvailable: boolean;
+}): number | null {
+  // Same priority as opening puzzles: named map/line first, then explorer name.
+  if (args.mapEndPly != null) return args.mapEndPly;
+  if (args.namedEndPly != null) return args.namedEndPly;
+  if (args.proAvailable && args.freqEndPly != null) return args.freqEndPly;
+  return null;
+}
+
+/**
+ * Book stays quiet: no +/- eval flip, no WP swing into the 5–10pp+ band.
+ */
+function trimBookEndByWinProb(
+  plies: GameCoachPly[],
+  theoryEndPly: number | null,
+  userIsWhite: boolean
+): number | null {
+  if (theoryEndPly == null || theoryEndPly <= 0) return null;
+  let end = theoryEndPly;
+  for (const p of plies) {
+    if (p.ply > theoryEndPly) break;
+    if (p.evalBeforeCp == null || p.evalAfterCp == null) continue;
+
+    const beforeUser = userIsWhite ? p.evalBeforeCp : -p.evalBeforeCp;
+    const afterUser = userIsWhite ? p.evalAfterCp : -p.evalAfterCp;
+    if (evalSignCrosses(beforeUser, afterUser)) {
+      end = p.ply - 1;
+      break;
+    }
+
+    const wpBefore = userWinProbability(p.evalBeforeCp, userIsWhite);
+    const wpAfter = userWinProbability(p.evalAfterCp, userIsWhite);
+    const absDelta = Math.abs(wpAfter - wpBefore);
+    if (absDelta + 1e-9 >= WP_INACCURACY_DROP) {
+      end = p.ply - 1;
+      break;
+    }
+  }
+  return end > 0 ? end : null;
+}
+
 export function linesFromEval(
   fen: string,
   result: {
@@ -186,6 +432,25 @@ export function linesFromEval(
       pvSan,
     };
   });
+}
+
+type EngineEvalResult = {
+  cpWhite: number;
+  bestUci: string | null;
+  bestPv?: string[];
+  multipv?: Array<{ uci: string; cpWhite: number; pv?: string[] }>;
+};
+
+function evalFromSharedPosition(hit: PositionEval): EngineEvalResult {
+  const pv = hit.bestUci ? [hit.bestUci] : [];
+  return {
+    cpWhite: hit.cpWhite,
+    bestUci: hit.bestUci,
+    bestPv: pv,
+    multipv: hit.bestUci
+      ? [{ uci: hit.bestUci, cpWhite: hit.cpWhite, pv }]
+      : [],
+  };
 }
 
 export function parseGamePlies(pgnOrMoves: string): Array<{
@@ -252,6 +517,9 @@ export async function analyzeSelectedGame(options: {
   evaluate: EvalFn;
   depth?: number;
   multiPv?: number;
+  fetchExplorer?: GameCoachExplorerFn;
+  /** Optional vector RAG (API). Soft-falls back to theme pack. */
+  retrieveKnowledge?: VectorRetrieveFn;
   onProgress?: (p: AnalyzeProgress) => void;
   signal?: { cancelled: boolean };
 }): Promise<GameCoachResult> {
@@ -261,7 +529,7 @@ export async function analyzeSelectedGame(options: {
   const skeleton = parseGamePlies(source);
   const openingLabel = formatOpeningLabel(options.eco, options.opening);
   const openingTags = detectOpeningFamily(options.eco, options.opening);
-  const bookEndPly = variationEndPlyFromMap(
+  const mapEndPly = variationEndPlyFromMap(
     options.opening,
     options.eco,
     skeleton.map((s) => s.san)
@@ -272,7 +540,10 @@ export async function analyzeSelectedGame(options: {
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
   let userPlyCount = 0;
+  let pendingOppChance = false;
+  let pendingOppWp: number | null = null;
   const structureTracker = new StructureThemeTracker();
+  const userIsWhite = userColor === "white";
 
   let metrics = options.metrics || null;
   if (!metrics && options.platform && options.username) {
@@ -288,6 +559,71 @@ export async function analyzeSelectedGame(options: {
     }
   }
   if (!metrics) metrics = emptyCoachGameMetrics();
+
+  const sharedPositions: Record<string, PositionEval> = {};
+  const collectedPositions: Record<string, PositionEval> = {};
+  if (options.platform && options.username) {
+    try {
+      const vault = await loadPermanentEvalStore({
+        platform: options.platform,
+        username: options.username,
+      });
+      const record = getSharedGameRecord(vault, options.gameId);
+      if (record?.positions) {
+        Object.assign(sharedPositions, record.positions);
+      }
+    } catch {
+      /* vault optional */
+    }
+  }
+
+  const resolveEval = async (
+    fen: string,
+    evalDepth: number,
+    evalMultiPv: number
+  ): Promise<EngineEvalResult> => {
+    const key = fenKey(fen);
+    const hit = sharedPositions[key] || collectedPositions[key];
+    if (hit) {
+      return evalFromSharedPosition(hit);
+    }
+    const raw = await options.evaluate(fen, evalDepth, evalMultiPv, 0);
+    const bestUci = raw.bestUci || null;
+    collectedPositions[key] = { cpWhite: raw.cpWhite, bestUci };
+    sharedPositions[key] = collectedPositions[key];
+    return {
+      cpWhite: raw.cpWhite,
+      bestUci,
+      bestPv: raw.bestPv,
+      multipv: raw.multipv,
+    };
+  };
+
+  let namedEndPly: number | null = null;
+  let freqEndPly: number | null = null;
+  let proAvailable = false;
+  if (options.fetchExplorer && skeleton.length) {
+    options.onProgress?.({
+      ply: 0,
+      total: skeleton.length,
+      status: "Checking opening theory…",
+    });
+    const pro = await professionalTheoryEndPly(
+      skeleton,
+      options.fetchExplorer,
+      options.opening,
+      options.signal,
+      (status) =>
+        options.onProgress?.({
+          ply: 0,
+          total: skeleton.length,
+          status,
+        })
+    );
+    proAvailable = pro.available;
+    namedEndPly = pro.namedEndPly;
+    freqEndPly = pro.freqEndPly;
+  }
 
   for (let i = 0; i < skeleton.length; i++) {
     if (options.signal?.cancelled) break;
@@ -316,14 +652,14 @@ export async function analyzeSelectedGame(options: {
 
     try {
       if (sample) {
-        const before = await options.evaluate(sk.fenBefore, depth, multiPv, 0);
+        const before = await resolveEval(sk.fenBefore, depth, multiPv);
         evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
         bestSan = sanFromUci(sk.fenBefore, before.bestUci);
         bestPvSan = pvToSan(sk.fenBefore, before.bestPv);
         lines = linesFromEval(sk.fenBefore, before);
       }
 
-      const after = await options.evaluate(sk.fenAfter, depth, 1, 0);
+      const after = await resolveEval(sk.fenAfter, depth, 1);
       evalAfter = toWhiteCp(sk.fenAfter, after.cpWhite);
       analyzed = true;
 
@@ -337,6 +673,29 @@ export async function analyzeSelectedGame(options: {
 
       const playedBest = Boolean(bestSan && bestSan === sk.san);
       if (isUserPly) userPlyCount += 1;
+
+      let missedOpportunity = false;
+      if (
+        isUserPly &&
+        pendingOppChance &&
+        pendingOppWp != null &&
+        evalBefore != null &&
+        evalAfter != null
+      ) {
+        const wpBeforeUser = userWinProbability(evalBefore, userIsWhite);
+        const wpAfterUser = userWinProbability(evalAfter, userIsWhite);
+        missedOpportunity = coachMissedFromPending({
+          wpBefore: wpBeforeUser,
+          wpAfter: wpAfterUser,
+          pendingPeakWp: pendingOppWp,
+        });
+        pendingOppChance = false;
+        pendingOppWp = null;
+      } else if (isUserPly && pendingOppChance) {
+        pendingOppChance = false;
+        pendingOppWp = null;
+      }
+
       mark =
         evalBefore != null && evalAfter != null
           ? classifyCoachMark({
@@ -344,10 +703,27 @@ export async function analyzeSelectedGame(options: {
               evalBeforeCp: evalBefore,
               evalAfterCp: evalAfter,
               playedBest,
+              lines,
+              fenBefore: sk.fenBefore,
+              playedSan: sk.san,
+              missedOpportunity,
             })
           : null;
 
-      const structure = structureTracker.update(sk.fenAfter);
+      if (
+        !isUserPly &&
+        evalBefore != null &&
+        evalAfter != null
+      ) {
+        const wpBeforeUser = userWinProbability(evalBefore, userIsWhite);
+        const wpAfterUser = userWinProbability(evalAfter, userIsWhite);
+        if (wpAfterUser - wpBeforeUser >= 0.1) {
+          pendingOppChance = true;
+          pendingOppWp = wpAfterUser;
+        }
+      }
+
+      const structure = structureTracker.update(sk.fenBefore, sk.fenAfter);
 
       if (sample) {
         const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
@@ -418,27 +794,49 @@ export async function analyzeSelectedGame(options: {
             if (!KING_FILTER.has(t)) return true;
             return (
               themes.includes("opp_king_exposed") ||
-              themes.includes("user_king_exposed")
+              themes.includes("user_king_exposed") ||
+              themes.includes("attack") ||
+              pov.kingMotifLive
             );
           });
+          const highLive =
+            pov.kingMotifLive ||
+            themes.some((t) =>
+              [
+                "attack",
+                "forcing_moves",
+                "tactics",
+                "missed_opportunity",
+                "imbalances",
+                "king_safety",
+              ].includes(t)
+            );
           const wantCount =
             noteWorthy &&
             ((!isUserPly && deltaCp >= 80) ||
               (isUserPly && (errorKind || moment || playedBest || deltaCp < 40)))
-              ? !isUserPly
+              ? !isUserPly || highLive
                 ? 2
                 : 1
               : 0;
-          const nuggets =
+          const retrieveCtx: RetrieveContext = {
+            themes: ragThemes.length ? ragThemes : themes,
+            phase,
+            wantCount,
+            strict: true,
+            fen: sk.fenBefore,
+            san: sk.san,
+            bestSan,
+            eco: options.eco,
+            opening: options.opening,
+            recentSans: skeleton.slice(0, i + 1).map((p) => p.san),
+          };
+          const nuggets: KnowledgeNugget[] =
             wantCount > 0
-              ? retrieveKnowledgeNuggets(
-                  {
-                    themes: ragThemes.length ? ragThemes : themes,
-                    phase,
-                    wantCount,
-                    strict: true,
-                  },
-                  usedKnowledge
+              ? await mergeHybridKnowledgeNuggets(
+                  retrieveCtx,
+                  usedKnowledge,
+                  options.retrieveKnowledge || null
                 )
               : [];
           note = composeCoachNote({
@@ -475,11 +873,33 @@ export async function analyzeSelectedGame(options: {
       mark = null;
     }
 
-    if (bookEndPly != null && sk.ply <= bookEndPly) {
-      mark = "book";
+    prevEval = evalAfter ?? evalBefore ?? prevEval;
+
+    // Opponent missed a forcing shot that existed because of the prior user
+    // blunder → put "walks into …" on the user move; opponent only "misses".
+    if (!isUserPly && plies.length) {
+      const forcing = missedForcingLine({
+        playedSan: sk.san,
+        bestSan,
+        bestPvSan,
+        deltaCp,
+      });
+      const prev = plies[plies.length - 1];
+      if (
+        forcing &&
+        prev &&
+        prev.side === userColor &&
+        isCoachMistakeOrWorse(prev.mark)
+      ) {
+        const walkIn = `${prev.san} walks into ${forcing}.`;
+        prev.note = walkIn;
+        claimNoteText(walkIn, usedTips);
+        claimNoteTopic(usedTips, "tactic");
+        // One tactic topic per game — teach it on the user blunder, not again on the miss.
+        note = "";
+      }
     }
 
-    prevEval = evalAfter ?? evalBefore ?? prevEval;
     plies.push({
       ...sk,
       evalBeforeCp: evalBefore,
@@ -494,6 +914,44 @@ export async function analyzeSelectedGame(options: {
     });
 
     await new Promise((r) => setTimeout(r, 0));
+  }
+
+  const theoryEndPly = resolveBookEndPly({
+    mapEndPly,
+    namedEndPly,
+    freqEndPly,
+    proAvailable,
+  });
+  const bookEndPly = trimBookEndByWinProb(plies, theoryEndPly, userIsWhite);
+  if (bookEndPly != null) {
+    for (const ply of plies) {
+      if (ply.ply <= bookEndPly) ply.mark = "book";
+    }
+  }
+
+  if (plies.length) {
+    plies[plies.length - 1].note = composeGameSummaryNote({
+      plies,
+      userColor,
+      metrics,
+      openingLabel,
+    });
+  }
+
+  if (
+    options.platform &&
+    options.username &&
+    Object.keys(collectedPositions).length
+  ) {
+    try {
+      await upsertSharedGameEvals(
+        { platform: options.platform, username: options.username },
+        options.gameId,
+        { positions: collectedPositions }
+      );
+    } catch {
+      /* vault write optional */
+    }
   }
 
   return {

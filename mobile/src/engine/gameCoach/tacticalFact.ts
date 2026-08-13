@@ -29,12 +29,15 @@ export type TacticalFact = {
     | "gave_piece"
     | "missed_capture"
     | "missed_tactic"
+    | "missed_mate"
+    | "hung_mate"
     | "bad_trade"
     | "sacrifice"
     | null;
   pieceLabel: string | null;
   captureSan: string | null;
   takenNext: boolean;
+  mateIn: number | null;
 };
 
 function colorOf(userColor: "white" | "black"): Color {
@@ -47,7 +50,47 @@ function emptyFact(): TacticalFact {
     pieceLabel: null,
     captureSan: null,
     takenNext: false,
+    mateIn: null,
   };
+}
+
+const MATE_CP = 50000;
+
+function mateMovesFromCp(cp: number): number | null {
+  const abs = Math.abs(cp);
+  if (abs < MATE_CP) return null;
+  if (abs >= 100000) return 0;
+  return Math.max(0, Math.min(99, Math.round((100000 - abs) / 1000)));
+}
+
+function moverHasMate(cpWhite: number, moverIsWhite: boolean): boolean {
+  return moverIsWhite ? cpWhite >= MATE_CP : cpWhite <= -MATE_CP;
+}
+
+export function forcingPrefix(pvSan: string[]): string {
+  const bits: string[] = [];
+  for (const san of pvSan.slice(0, 6)) {
+    bits.push(san);
+    if (!/[+#]$/.test(san) && !san.includes("x")) break;
+  }
+  return bits.join(" ");
+}
+
+/** Forcing miss: mover skipped a multi-move / check / capture line. */
+export function missedForcingLine(args: {
+  playedSan: string;
+  bestSan: string | null;
+  bestPvSan: string[];
+  deltaCp: number;
+}): string | null {
+  if (!args.bestSan || args.bestSan === args.playedSan) return null;
+  if (args.deltaCp < 120) return null;
+  const forcing = forcingPrefix(args.bestPvSan) || args.bestSan;
+  if (!forcing) return null;
+  if (/[+#]/.test(forcing) || forcing.includes("x") || forcing.split(" ").length >= 2) {
+    return forcing;
+  }
+  return null;
 }
 
 function labelForVal(val: number): string {
@@ -167,22 +210,62 @@ export function detectTacticalFact(args: {
   evalBeforeWhite?: number | null;
   evalAfterWhite?: number | null;
   opponentReplySan?: string | null;
+  side?: "white" | "black";
 }): TacticalFact {
   const empty = emptyFact();
-  if (args.deltaCp < 80) return empty;
+  const moverIsWhite = (args.side || args.userColor) === "white";
+  const before = args.evalBeforeWhite;
+  const after = args.evalAfterWhite;
+  const hasMateSignal =
+    (before != null && Math.abs(before) >= MATE_CP) ||
+    (after != null && Math.abs(after) >= MATE_CP);
+  if (args.deltaCp < 80 && !hasMateSignal) return empty;
 
   const user = colorOf(args.userColor);
   const userIsWhite = args.userColor === "white";
 
+  if (
+    before != null &&
+    after != null &&
+    moverHasMate(before, moverIsWhite) &&
+    args.bestSan &&
+    args.playedSan !== args.bestSan &&
+    !moverHasMate(after, moverIsWhite)
+  ) {
+    const mateIn = mateMovesFromCp(before);
+    const line = forcingPrefix(args.bestPvSan) || args.bestSan;
+    return {
+      kind: "missed_mate",
+      pieceLabel: null,
+      captureSan: line,
+      takenNext: false,
+      mateIn,
+    };
+  }
+
+  if (
+    after != null &&
+    moverHasMate(after, !moverIsWhite) &&
+    (before == null || !moverHasMate(before, !moverIsWhite))
+  ) {
+    return {
+      kind: "hung_mate",
+      pieceLabel: null,
+      captureSan: args.bestSan,
+      takenNext: Boolean(args.opponentReplySan),
+      mateIn: mateMovesFromCp(after),
+    };
+  }
+
   let dropKind: EvalDropKind = null;
   if (
-    args.evalBeforeWhite != null &&
-    args.evalAfterWhite != null &&
-    Number.isFinite(args.evalBeforeWhite) &&
-    Number.isFinite(args.evalAfterWhite)
+    before != null &&
+    after != null &&
+    Number.isFinite(before) &&
+    Number.isFinite(after)
   ) {
-    const wpBefore = userWinProbability(args.evalBeforeWhite, userIsWhite);
-    const wpAfter = userWinProbability(args.evalAfterWhite, userIsWhite);
+    const wpBefore = userWinProbability(before, userIsWhite);
+    const wpAfter = userWinProbability(after, userIsWhite);
     dropKind = classifyEvalDrop(wpBefore, wpAfter);
   } else if (args.deltaCp >= 200) {
     dropKind = "blunder";
@@ -204,6 +287,7 @@ export function detectTacticalFact(args: {
       pieceLabel: PIECE_NAME[winCap.type],
       captureSan: winCap.san,
       takenNext: false,
+      mateIn: null,
     };
   }
 
@@ -237,6 +321,7 @@ export function detectTacticalFact(args: {
           pieceLabel: PIECE_NAME[winCap.type],
           captureSan: winCap.san,
           takenNext: false,
+          mateIn: null,
         };
       }
       return empty;
@@ -252,6 +337,7 @@ export function detectTacticalFact(args: {
           pieceLabel: label,
           captureSan: null,
           takenNext,
+          mateIn: null,
         };
       }
       if (takenNext) {
@@ -260,6 +346,7 @@ export function detectTacticalFact(args: {
           pieceLabel: label,
           captureSan: null,
           takenNext: true,
+          mateIn: null,
         };
       }
     }
@@ -277,9 +364,27 @@ export function detectTacticalFact(args: {
           args.opponentReplySan,
           user
         ),
+        mateIn: null,
       };
     }
   } catch {
+  }
+
+  const forcing = forcingPrefix(args.bestPvSan);
+  if (
+    forcing &&
+    args.bestSan &&
+    args.playedSan !== args.bestSan &&
+    args.deltaCp >= 120 &&
+    (/[+#]/.test(forcing) || forcing.split(" ").length >= 2)
+  ) {
+    return {
+      kind: "missed_tactic",
+      pieceLabel: null,
+      captureSan: forcing,
+      takenNext: false,
+      mateIn: null,
+    };
   }
 
   try {
@@ -295,6 +400,7 @@ export function detectTacticalFact(args: {
         pieceLabel: winCap ? PIECE_NAME[winCap.type] : null,
         captureSan: args.bestSan,
         takenNext: false,
+        mateIn: null,
       };
     }
   } catch {

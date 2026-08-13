@@ -2,7 +2,10 @@ export { formatOpeningLabel } from "./ecoLabels";
 export {
   retrieveKnowledgeNugget,
   retrieveKnowledgeNuggets,
+  retrieveDerivedCoachNuggets,
+  mergeHybridKnowledgeNuggets,
 } from "./retrieve";
+export { DERIVED_COACH_PACK } from "./derivedCoachPack";
 export { composeCoachNote, expandCoachThemes, classifyUserError } from "./noteCompose";
 export {
   lookupCoachGameMetrics,
@@ -23,8 +26,9 @@ export {
 } from "./analyzeGame";
 export { KNOWLEDGE_PACK } from "./knowledgePack";
 export { BOOK_ARCHIVE } from "./bookArchive";
-export { phasePlanNote, phasePlanSlotOpen } from "./phasePlans";
+export { phasePlanNote, phasePlanSlotOpen, adaptCoachTipForSide } from "./phasePlans";
 
+export { composeGameSummaryNote } from "./gameSummary";
 export {
   loadCachedGameAnalysis,
   saveCachedGameAnalysis,

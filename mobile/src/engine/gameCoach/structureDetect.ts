@@ -14,7 +14,24 @@ const PERSIST_STRUCTURE = new Set([
   "doubled_pawns",
   "hanging_pawns",
   "passed_pawn",
+  "pawn_chain",
 ]);
+
+/** Board structures that must survive a ply window before notes cite them. */
+export const WINDOWED_STRUCTURE_THEMES = new Set([
+  "iqp",
+  "doubled_pawns",
+  "hanging_pawns",
+  "passed_pawn",
+  "pawn_chain",
+  "open_file",
+  "open_c_file",
+  "bishop_pair",
+  "space",
+  "minority_attack",
+]);
+
+const STRUCTURE_WINDOW = 3;
 
 function filePawnCounts(board: Chess, file: number): { w: number; b: number } {
   let w = 0;
@@ -95,6 +112,28 @@ function passedPawnPresent(board: Chess): boolean {
   return false;
 }
 
+function hasPawnChain(board: Chess, color: Color): boolean {
+  const pawns: Array<{ f: number; r: number }> = [];
+  for (let f = 0; f < 8; f++) {
+    for (let r = 0; r < 8; r++) {
+      const sq = `${FILES[f]}${r + 1}` as Square;
+      const p = board.get(sq);
+      if (!p || p.type !== "p" || p.color !== color) continue;
+      pawns.push({ f, r });
+    }
+  }
+  if (pawns.length < 3) return false;
+  let links = 0;
+  for (let i = 0; i < pawns.length; i++) {
+    for (let j = i + 1; j < pawns.length; j++) {
+      const df = Math.abs(pawns[i].f - pawns[j].f);
+      const dr = Math.abs(pawns[i].r - pawns[j].r);
+      if (df === 1 && dr === 1) links += 1;
+    }
+  }
+  return links >= 2;
+}
+
 /**
  * Instant board scan (may flicker). Prefer StructureThemeTracker for notes.
  */
@@ -111,6 +150,9 @@ export function detectStructureThemes(fen: string): string[] {
     }
     if (hangingCd(board, "w") || hangingCd(board, "b")) {
       themes.push("hanging_pawns");
+    }
+    if (colors.some((c) => hasPawnChain(board, c))) {
+      themes.push("pawn_chain");
     }
     for (let f = 0; f < 8; f++) {
       const { w, b } = filePawnCounts(board, f);
@@ -148,32 +190,236 @@ export function detectStructureThemes(fen: string): string[] {
 }
 
 /**
- * Only emit iqp / doubled / hanging / passer after they persist
- * for HEURISTICS_DOUBLED_PERSIST_PLIES consecutive positions.
+ * Windowed structure for notes: theme must survive the move (before∩after)
+ * and show up across recent plies — not a one-frame snapshot.
  */
 export class StructureThemeTracker {
+  private history: string[][] = [];
   private streaks = new Map<string, number>();
 
-  update(fen: string): string[] {
-    const raw = detectStructureThemes(fen);
-    const rawSet = new Set(raw);
-    const out: string[] = [];
+  update(fenBefore: string, fenAfter: string): string[] {
+    const beforeRaw = detectStructureThemes(fenBefore);
+    const afterRaw = detectStructureThemes(fenAfter);
+    const beforeSet = new Set(beforeRaw);
+    const afterSet = new Set(afterRaw);
 
     for (const theme of PERSIST_STRUCTURE) {
-      if (rawSet.has(theme)) {
-        const n = (this.streaks.get(theme) || 0) + 1;
-        this.streaks.set(theme, n);
-        if (n >= HEURISTICS_DOUBLED_PERSIST_PLIES) out.push(theme);
+      if (afterSet.has(theme)) {
+        this.streaks.set(theme, (this.streaks.get(theme) || 0) + 1);
       } else {
         this.streaks.set(theme, 0);
       }
     }
 
-    for (const t of raw) {
-      if (!PERSIST_STRUCTURE.has(t)) out.push(t);
+    this.history.push(afterRaw);
+    if (this.history.length > 5) this.history.shift();
+
+    const window = this.history.slice(-STRUCTURE_WINDOW);
+    const needHits = window.length >= 2 ? 2 : 1;
+    const out: string[] = [];
+
+    for (const t of afterRaw) {
+      if (!beforeSet.has(t)) continue;
+      if (PERSIST_STRUCTURE.has(t)) {
+        const streak = this.streaks.get(t) || 0;
+        if (streak < HEURISTICS_DOUBLED_PERSIST_PLIES) continue;
+      }
+      const hits = window.filter((h) => h.includes(t)).length;
+      if (hits < needHits) continue;
+      out.push(t);
     }
     return out;
   }
+}
+
+export type StructureFeature = {
+  theme: string;
+  owner: "user" | "opponent" | "both";
+  /** e.g. "doubled c-pawns", "d-pawn isolani", "hanging c/d-pawns" */
+  label: string;
+};
+
+function doubledPawnFiles(board: Chess, color: Color): number[] {
+  const files: number[] = [];
+  for (let f = 0; f < 8; f++) {
+    let count = 0;
+    for (let r = 0; r < 8; r++) {
+      const p = board.get(`${FILES[f]}${r + 1}` as Square);
+      if (p && p.type === "p" && p.color === color) count += 1;
+    }
+    if (count >= 2) files.push(f);
+  }
+  return files;
+}
+
+function passedPawnFiles(board: Chess, color: Color): number[] {
+  const files: number[] = [];
+  for (let f = 0; f < 8; f++) {
+    for (let r = 0; r < 8; r++) {
+      const sq = `${FILES[f]}${r + 1}` as Square;
+      const p = board.get(sq);
+      if (!p || p.type !== "p" || p.color !== color) continue;
+      const ahead =
+        color === "w"
+          ? Array.from({ length: 7 - r }, (_, i) => r + 2 + i)
+          : Array.from({ length: r }, (_, i) => r - i);
+      let blocked = false;
+      for (const rank of ahead) {
+        for (const df of [-1, 0, 1]) {
+          const ff = f + df;
+          if (ff < 0 || ff > 7) continue;
+          const q = board.get(`${FILES[ff]}${rank}` as Square);
+          if (q?.type === "p" && q.color !== color) {
+            blocked = true;
+            break;
+          }
+        }
+        if (blocked) break;
+      }
+      if (!blocked) {
+        files.push(f);
+        break;
+      }
+    }
+  }
+  return files;
+}
+
+function fileListLabel(files: number[]): string {
+  if (!files.length) return "";
+  if (files.length === 1) return `${FILES[files[0]]}-pawn`;
+  if (files.length === 2) {
+    return `${FILES[files[0]]}/${FILES[files[1]]}-pawns`;
+  }
+  return `${files.map((f) => FILES[f]).join("")}-pawns`;
+}
+
+function ownerFor(
+  userHas: boolean,
+  oppHas: boolean
+): "user" | "opponent" | "both" | null {
+  if (userHas && oppHas) return "both";
+  if (userHas) return "user";
+  if (oppHas) return "opponent";
+  return null;
+}
+
+/**
+ * Side-aware pawn-structure labels for notes (whose pawns + which file).
+ */
+export function describeStructureFeatures(
+  fen: string,
+  userColor: "white" | "black"
+): StructureFeature[] {
+  const out: StructureFeature[] = [];
+  try {
+    const board = new Chess(fen);
+    const user: Color = userColor === "white" ? "w" : "b";
+    const opp: Color = user === "w" ? "b" : "w";
+
+    const userIqp = hasIsolatedQueenPawn(board, user);
+    const oppIqp = hasIsolatedQueenPawn(board, opp);
+    const iqpOwner = ownerFor(userIqp, oppIqp);
+    if (iqpOwner) {
+      out.push({
+        theme: "iqp",
+        owner: iqpOwner,
+        label:
+          iqpOwner === "both"
+            ? "d-pawn isolanis"
+            : iqpOwner === "user"
+              ? "your d-pawn isolani"
+              : "their d-pawn isolani",
+      });
+    }
+
+    const userDbl = doubledPawnFiles(board, user);
+    const oppDbl = doubledPawnFiles(board, opp);
+    const dblOwner = ownerFor(userDbl.length > 0, oppDbl.length > 0);
+    if (dblOwner) {
+      const files =
+        dblOwner === "user"
+          ? userDbl
+          : dblOwner === "opponent"
+            ? oppDbl
+            : userDbl.length
+              ? userDbl
+              : oppDbl;
+      const core =
+        files.length === 1
+          ? `doubled ${FILES[files[0]]}-pawns`
+          : `doubled ${files.map((f) => FILES[f]).join("/")}-pawns`;
+      out.push({
+        theme: "doubled_pawns",
+        owner: dblOwner,
+        label:
+          dblOwner === "user"
+            ? `your ${core}`
+            : dblOwner === "opponent"
+              ? `their ${core}`
+              : core,
+      });
+    }
+
+    const userHang = hangingCd(board, user);
+    const oppHang = hangingCd(board, opp);
+    const hangOwner = ownerFor(userHang, oppHang);
+    if (hangOwner) {
+      out.push({
+        theme: "hanging_pawns",
+        owner: hangOwner,
+        label:
+          hangOwner === "user"
+            ? "your hanging c/d-pawns"
+            : hangOwner === "opponent"
+              ? "their hanging c/d-pawns"
+              : "hanging c/d-pawns",
+      });
+    }
+
+    const userChain = hasPawnChain(board, user);
+    const oppChain = hasPawnChain(board, opp);
+    const chainOwner = ownerFor(userChain, oppChain);
+    if (chainOwner) {
+      out.push({
+        theme: "pawn_chain",
+        owner: chainOwner,
+        label:
+          chainOwner === "user"
+            ? "your pawn chain"
+            : chainOwner === "opponent"
+              ? "their pawn chain"
+              : "the pawn chain",
+      });
+    }
+
+    const userPass = passedPawnFiles(board, user);
+    const oppPass = passedPawnFiles(board, opp);
+    const passOwner = ownerFor(userPass.length > 0, oppPass.length > 0);
+    if (passOwner) {
+      const files =
+        passOwner === "user"
+          ? userPass
+          : passOwner === "opponent"
+            ? oppPass
+            : [...userPass, ...oppPass];
+      const fl = fileListLabel(files);
+      const core = files.length === 1 ? `passed ${FILES[files[0]]}-pawn` : `passed ${fl}`;
+      out.push({
+        theme: "passed_pawn",
+        owner: passOwner,
+        label:
+          passOwner === "user"
+            ? `your ${core}`
+            : passOwner === "opponent"
+              ? `their ${core}`
+              : core,
+      });
+    }
+  } catch {
+    /* ignore */
+  }
+  return out;
 }
 
 /**

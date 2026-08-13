@@ -231,3 +231,44 @@ export function noteHasSubstance(text: string): boolean {
   if (isWeakFillerNote(t)) return false;
   return true;
 }
+
+export function noteTextFingerprint(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/\.\.\./g, " ")
+    .replace(/[^a-z0-9\s]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .split(" ")
+    .filter((w) => w.length > 2)
+    .slice(0, 16)
+    .join(" ");
+}
+
+export function noteTextAlreadySaid(
+  text: string,
+  usedTips: Set<string>
+): boolean {
+  const fp = noteTextFingerprint(text);
+  if (!fp) return false;
+  if (usedTips.has(`note:${fp}`)) return true;
+  for (const key of usedTips) {
+    if (!key.startsWith("note:")) continue;
+    const prev = key.slice(5);
+    if (!prev) continue;
+    if (prev === fp) return true;
+    if (fp.startsWith(prev) || prev.startsWith(fp)) return true;
+    const a = new Set(fp.split(" "));
+    const b = prev.split(" ");
+    let hit = 0;
+    for (const w of b) if (a.has(w)) hit += 1;
+    if (b.length >= 5 && hit / b.length >= 0.72) return true;
+    if (a.size >= 5 && hit / a.size >= 0.72) return true;
+  }
+  return false;
+}
+
+export function claimNoteText(text: string, usedTips: Set<string>): void {
+  const fp = noteTextFingerprint(text);
+  if (fp) usedTips.add(`note:${fp}`);
+}

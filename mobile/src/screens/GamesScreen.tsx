@@ -1,11 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
-  FlatList,
-  Image,
   Platform,
   Pressable,
   ScrollView,
+  SectionList,
   StyleSheet,
   Text,
   Vibration,
@@ -16,6 +15,7 @@ import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
 import { ChessBoard } from "../components/ChessBoard";
 import { GameEvalGraph } from "../components/GameEvalGraph";
+import { OpponentAvatar } from "../components/OpponentAvatar";
 import {
   BrutalButton,
   DisplayTitle,
@@ -39,6 +39,7 @@ import {
 } from "../engine/gameCoach/analysisCache";
 import { COACH_MARK_SOURCES } from "../engine/gameCoach/coachMarks";
 import { formatOpeningLabel } from "../engine/gameCoach/ecoLabels";
+import { formatOpponentName } from "../data/opponentAvatar";
 import { computePhaseSplits } from "../engine/gameCoach/phaseSplits";
 import { useStockfish } from "../engine/StockfishProvider";
 import { GLOBAL_DEPTH } from "../engine/analysisConfig";
@@ -46,6 +47,7 @@ import { displayCp, toWhiteCp } from "../engine/analyzeMistakes";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import { ensureStudyGames } from "../storage/analyticsLoaders";
 import type { NormalizedGame } from "../data/platformGames";
+import { fetchExplorer } from "../api/client";
 import { colors, font, radius, result, spacing, type } from "../theme";
 
 /** Matches TabNavigator order: Wrapped, Insights, Study, Games, Profile */
@@ -64,13 +66,43 @@ function navHaptic() {
   });
 }
 
+function dayKey(value?: string): string {
+  if (!value) return "unknown";
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "unknown";
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+
 function formatGameDate(value?: string): string {
   if (!value) return "Unknown date";
-  return new Date(value).toLocaleDateString(undefined, {
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return "Unknown date";
+  const today = new Date();
+  const startToday = new Date(
+    today.getFullYear(),
+    today.getMonth(),
+    today.getDate()
+  );
+  const startThat = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+  const diffDays = Math.round(
+    (startToday.getTime() - startThat.getTime()) / 86400000
+  );
+  if (diffDays === 0) return "Today";
+  if (diffDays === 1) return "Yesterday";
+  return d.toLocaleDateString(undefined, {
+    weekday: "short",
     day: "2-digit",
     month: "short",
     year: "numeric",
   });
+}
+
+function formatDayHeader(key: string): string {
+  if (key === "unknown") return "Unknown date";
+  return formatGameDate(`${key}T12:00:00`);
 }
 
 function resultTone(value?: string): string {
@@ -259,6 +291,23 @@ export function GamesScreen() {
         depth: GLOBAL_DEPTH,
         multiPv: 3,
         signal: cancelRef.current,
+        fetchExplorer: async (fen, source, ratings) => {
+          const res = await fetchExplorer(
+            fen,
+            source,
+            undefined,
+            undefined,
+            ratings
+          );
+          return {
+            moves: res.moves || [],
+            white: res.white || 0,
+            draws: res.draws || 0,
+            black: res.black || 0,
+            opening: res.opening,
+            fallback: res.fallback,
+          };
+        },
         onProgress: (p) => {
           setAnalyzeProgress(`${p.status} (${p.ply}/${p.total})`);
         },
@@ -421,6 +470,21 @@ export function GamesScreen() {
     });
   }, [plies.length, stopHoldNav]);
 
+  const gameSections = useMemo(() => {
+    const byDay = new Map<string, StudyGame[]>();
+    for (const g of games) {
+      const key = dayKey(g.created_at);
+      const list = byDay.get(key);
+      if (list) list.push(g);
+      else byDay.set(key, [g]);
+    }
+    return Array.from(byDay.entries()).map(([key, data]) => ({
+      title: formatDayHeader(key),
+      key,
+      data,
+    }));
+  }, [games]);
+
   if (selectedGame) {
     return (
       <FadeFromBlank contentKey={`game-${selectedGame.id}`}>
@@ -434,7 +498,21 @@ export function GamesScreen() {
             <Text style={styles.backLabel}>Games</Text>
           </Pressable>
 
-          <DisplayTitle>{selectedGame.opponent_name || "Opponent"}</DisplayTitle>
+          <View style={styles.analysisHeader}>
+            <OpponentAvatar
+              platform={queryFilters.platform}
+              username={selectedGame.opponent_name}
+              size={44}
+            />
+            <View style={styles.analysisHeaderText}>
+              <DisplayTitle>
+                {formatOpponentName(
+                  selectedGame.opponent_name,
+                  selectedGame.opp_rating
+                )}
+              </DisplayTitle>
+            </View>
+          </View>
           <Text style={styles.subtitle}>
             {`${formatGameDate(selectedGame.created_at)} · ${
               selectedGame.speed || "game"
@@ -554,7 +632,11 @@ export function GamesScreen() {
 
           {currentNote ? (
             <EdgeCard style={styles.noteCard}>
-              <Text style={styles.noteTag}>Book ideas</Text>
+              <Text style={styles.noteTag}>
+                {plyIndex === plies.length - 1 && analysis
+                  ? "Summary"
+                  : "Book ideas"}
+              </Text>
               <Text style={styles.noteBody}>{currentNote}</Text>
             </EdgeCard>
           ) : null}
@@ -564,7 +646,6 @@ export function GamesScreen() {
             {plies.map((p, i) => {
               const active = i === plyIndex;
               const noted = Boolean(p.note);
-              const markSrc = p.mark ? COACH_MARK_SOURCES[p.mark] : null;
               return (
                 <Pressable
                   key={`${p.ply}-${p.san}`}
@@ -576,20 +657,15 @@ export function GamesScreen() {
                     p.mark === "book" && styles.moveChipBook,
                   ]}
                 >
-                  <View style={styles.moveChipInner}>
-                    {markSrc ? (
-                      <Image source={markSrc} style={styles.moveChipMark} />
-                    ) : null}
-                    <Text
-                      style={[
-                        styles.moveChipText,
-                        active && styles.moveChipTextActive,
-                      ]}
-                    >
-                      {p.side === "white" ? `${p.fullmove}. ` : ""}
-                      {p.san}
-                    </Text>
-                  </View>
+                  <Text
+                    style={[
+                      styles.moveChipText,
+                      active && styles.moveChipTextActive,
+                    ]}
+                  >
+                    {p.side === "white" ? `${p.fullmove}. ` : ""}
+                    {p.san}
+                  </Text>
                 </Pressable>
               );
             })}
@@ -621,9 +697,6 @@ export function GamesScreen() {
         <View style={styles.screen}>
           <View style={styles.listHeader}>
             <DisplayTitle>Games</DisplayTitle>
-            <Text style={styles.subtitle}>
-              Pick a game from your history. Analysis runs only when you ask.
-            </Text>
           </View>
 
           {listError && !games.length ? (
@@ -633,10 +706,11 @@ export function GamesScreen() {
           {!gamesTabActive ? (
             <Text style={styles.emptyText}>Open this tab to load your games.</Text>
           ) : (
-            <FlatList
-              data={games}
+            <SectionList
+              sections={gameSections}
               keyExtractor={(item) => item.id}
               contentContainerStyle={styles.listContent}
+              stickySectionHeadersEnabled={false}
               ListEmptyComponent={
                 listLoading ? (
                   <ActivityIndicator color={colors.cream} style={{ marginTop: 40 }} />
@@ -646,6 +720,9 @@ export function GamesScreen() {
                   </Text>
                 )
               }
+              renderSectionHeader={({ section }) => (
+                <Text style={styles.dayHeader}>{section.title}</Text>
+              )}
               renderItem={({ item }) => (
                 <Pressable
                   onPress={() => void openGame(item)}
@@ -654,23 +731,35 @@ export function GamesScreen() {
                     pressed && styles.gameRowPressed,
                   ]}
                 >
-                  <View style={styles.gameRowTop}>
-                    <Text style={styles.gameOpp} numberOfLines={1}>
-                      vs {item.opponent_name || "Unknown"}
-                    </Text>
-                    <Text
-                      style={[styles.gameResult, { color: resultTone(item.result) }]}
-                    >
-                      {item.result || "—"}
+                  <OpponentAvatar
+                    platform={queryFilters.platform}
+                    username={item.opponent_name}
+                    size={40}
+                  />
+                  <View style={styles.gameRowBody}>
+                    <View style={styles.gameRowTop}>
+                      <Text style={styles.gameOpp} numberOfLines={1}>
+                        vs{" "}
+                        {formatOpponentName(item.opponent_name, item.opp_rating)}
+                      </Text>
+                      <Text
+                        style={[
+                          styles.gameResult,
+                          { color: resultTone(item.result) },
+                        ]}
+                      >
+                        {item.result || "—"}
+                      </Text>
+                    </View>
+                    <Text style={styles.gameMeta} numberOfLines={1}>
+                      {[
+                        item.speed,
+                        formatOpeningLabel(item.opening_eco, item.opening_name),
+                      ]
+                        .filter(Boolean)
+                        .join(" · ")}
                     </Text>
                   </View>
-                  <Text style={styles.gameMeta} numberOfLines={1}>
-                    {formatGameDate(item.created_at)}
-                    {item.speed ? ` · ${item.speed}` : ""}
-                    {item.opening_name || item.opening_eco
-                      ? ` · ${formatOpeningLabel(item.opening_eco, item.opening_name)}`
-                      : ""}
-                  </Text>
                 </Pressable>
               )}
               ListFooterComponent={
@@ -716,6 +805,16 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: spacing.md,
     paddingBottom: 120,
+  },
+  dayHeader: {
+    fontFamily: font.sansMedium,
+    fontSize: type.caption.fontSize,
+    lineHeight: type.caption.lineHeight,
+    color: colors.textMuted,
+    textTransform: "uppercase",
+    letterSpacing: 0.6,
+    marginTop: spacing.md,
+    marginBottom: spacing.xs,
   },
   moreRow: {
     alignItems: "center",
@@ -855,12 +954,6 @@ const styles = StyleSheet.create({
   },
   moveChipNoted: { borderColor: "rgba(237,231,211,0.35)" },
   moveChipBook: { borderColor: "rgba(237,231,211,0.45)" },
-  moveChipInner: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 4,
-  },
-  moveChipMark: { width: 14, height: 14 },
   moveChipText: {
     fontFamily: font.mono,
     fontSize: type.caption.fontSize,
@@ -877,6 +970,9 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.md,
   },
   gameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
     backgroundColor: colors.surface,
     borderRadius: radius.md,
     padding: spacing.md,
@@ -885,6 +981,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   gameRowPressed: { opacity: 0.85 },
+  gameRowBody: { flex: 1, minWidth: 0 },
   gameRowTop: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -902,5 +999,15 @@ const styles = StyleSheet.create({
     fontFamily: font.sans,
     fontSize: type.caption.fontSize,
     color: colors.textDim,
+  },
+  analysisHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: 2,
+  },
+  analysisHeaderText: {
+    flex: 1,
+    minWidth: 0,
   },
 });

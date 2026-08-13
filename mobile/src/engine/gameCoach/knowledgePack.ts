@@ -114,13 +114,38 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
   {
     id: "attack",
     label: "Attacking the king",
-    requireThemes: ["attack", "opp_king_exposed"],
-    weight: 3,
+    requireThemes: ["attack"],
+    weight: 4,
     rules: [
       "When you are the attacking side, every move should increase pressure or open a line — quiet shuffles hand the initiative back.",
       "Bring more attackers than defenders before the final break; tempo against their king comes first.",
+      "Ignore slow pawn structure debates while their king is soft — force the issue with checks, captures, and threats.",
     ],
     phases: ["opening", "middlegame", "any"],
+  },
+  {
+    id: "king_safety",
+    label: "King safety",
+    requireThemes: ["king_safety"],
+    weight: 4,
+    rules: [
+      "An exposed king is the most important imbalance — fix yours or punish theirs before quieter plans.",
+      "Open files and diagonals toward a king beat slow manoeuvres; trade attackers only if the attack is gone.",
+      "If your king is the soft one, contest open lines, trade their lead attacker, then look for counterplay.",
+    ],
+    phases: ["opening", "middlegame", "any"],
+  },
+  {
+    id: "imbalances",
+    label: "Practical imbalances",
+    requireThemes: ["imbalances"],
+    weight: 3,
+    rules: [
+      "Name the big imbalances (king safety, material, space, activity, structure) and play toward your plusses.",
+      "The most important imbalance today decides the plan — don't grind a pawn structure while a king attack is on.",
+      "Improve the worst-placed piece that hits today's target before inventing a new plan.",
+    ],
+    phases: ["middlegame", "opening", "any"],
   },
   {
     id: "missed_opportunity",
@@ -161,7 +186,7 @@ const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
   {
     id: "forcing_moves",
     label: "Forcing moves",
-    requireThemes: ["forcing_moves", "tactics"],
+    requireThemes: ["forcing_moves"],
     weight: 3,
     rules: [
       "Scan checks, captures, and threats for both sides before choosing a quiet move.",

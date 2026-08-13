@@ -2,7 +2,7 @@ import { PERMANENT_CACHE_TTL_MS, readCache, writeCache } from "../../storage/cac
 import type { GameCoachResult } from "./analyzeGame";
 
 function cacheKey(platform: string, username: string, gameId: string): string {
-  return `game-coach:v29:${platform}|${username.trim().toLowerCase()}|${gameId}`;
+  return `game-coach:v51:${platform}|${username.trim().toLowerCase()}|${gameId}`;
 }
 
 export async function loadCachedGameAnalysis(

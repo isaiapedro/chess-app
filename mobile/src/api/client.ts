@@ -264,3 +264,58 @@ export async function fetchMastersPgn(gameId: string) {
     `/api/v1/study/masters-pgn/${encodeURIComponent(gameId)}`
   );
 }
+
+export type CoachRetrieveNugget = {
+  cardId: string;
+  label: string;
+  text: string;
+  book?: string | null;
+  game?: string | null;
+  source?: string | null;
+  quality?: string | null;
+  score?: number | null;
+};
+
+export type CoachRetrieveRequest = {
+  fen: string;
+  themes?: string[];
+  phase?: "opening" | "middlegame" | "endgame";
+  san?: string;
+  bestSan?: string | null;
+  eco?: string | null;
+  opening?: string | null;
+  wantCount?: number;
+};
+
+export async function fetchCoachRetrieve(
+  body: CoachRetrieveRequest
+): Promise<{ nuggets: CoachRetrieveNugget[] }> {
+  const url = `${API_BASE}/api/v1/coach/retrieve`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const res = await fetch(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Accept: "application/json" },
+      body: JSON.stringify({
+        fen: body.fen,
+        themes: body.themes || [],
+        phase: body.phase,
+        san: body.san,
+        bestSan: body.bestSan,
+        eco: body.eco,
+        opening: body.opening,
+        wantCount: body.wantCount ?? 2,
+      }),
+      signal: controller.signal,
+    });
+    if (!res.ok) {
+      return { nuggets: [] };
+    }
+    return (await res.json()) as { nuggets: CoachRetrieveNugget[] };
+  } catch {
+    return { nuggets: [] };
+  } finally {
+    clearTimeout(timer);
+  }
+}

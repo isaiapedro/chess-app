@@ -1,32 +1,32 @@
 import type { PositionPov } from "./positionPov";
-import { assessBoardFacts, textFitsBoard } from "./noteRelevance";
+import { assessBoardFacts, noteTextAlreadySaid, textFitsBoard } from "./noteRelevance";
 
 type PlanSlot = "early" | "mid" | "late";
 
 const OPENING_FAMILY_PLANS: Record<string, string[]> = {
   opening_sicilian: [
-    "Sicilian: unequal chances — White presses in the centre/kingside; Black counters on the c-file and with ...d5/...e5 breaks.",
+    "Sicilian: White — press in the centre/kingside; Black — counter on the c-file and with ...d5/...e5 breaks.",
     "Sicilian: race the attack that matches your structure — don't mix a pawn storm with a quiet Scheveningen setup.",
     "If the Sicilian centre opens (...d5), play with pieces; if it stays closed, prepare ...b5 or the f-pawn break.",
   ],
   opening_najdorf: [
     "Najdorf: ...a6 restrains Nb5 and prepares ...b5 — queenside expansion is Black's main counterplay.",
     "Najdorf: choose ...e5 or ...e6 on purpose — they change whether ...d5 or ...f5 is the freeing break.",
-    "Najdorf English Attack: opposite-side races — White's g/h pawns vs Black's ...b5/...Bb7 and the ...d5 break.",
+    "Najdorf English Attack: White — g/h pawn storm; Black — ...b5/...Bb7 and the ...d5 break.",
   ],
   opening_french: [
     "French: Black challenges e4 with ...d5; the c8 bishop stays awkward until ...c5 and piece trades free it.",
-    "French Advance: attack the base of the chain (d4) with ...c5; White uses space on the kingside.",
+    "French Advance: White — kingside space; Black — attack the d4 base with ...c5.",
     "If the French centre locks, play on the wing your chain points to.",
   ],
   opening_caro_kann: [
     "Caro-Kann: solid ...c6/...d5 — develop the light-squared bishop outside the chain before ...e6 when you can.",
-    "Caro-Kann: White should use the space lead before the game simplifies.",
+    "Caro-Kann: White — use the space lead before the game simplifies; Black — stay solid and free the light-squared bishop.",
     "Caro-Kann: meet ...c5 carefully — that break decides whether the position opens or stays a grind.",
   ],
   opening_queens_gambit: [
     "Queen's Gambit: fight for d5/c4 — Exchange/Carlsbad structures often lead to minority-attack plans.",
-    "QGD: White pressures d5 or prepares e4; Black seeks ...c5/...e5 freeing breaks.",
+    "QGD: White — pressure d5 or prepare e4; Black — seek ...c5/...e5 freeing breaks.",
     "QGD Carlsbad: minority attack (b4–b5) aims to create a weak c-pawn.",
   ],
   opening_qgd: [
@@ -35,19 +35,19 @@ const OPENING_FAMILY_PLANS: Record<string, string[]> = {
   ],
   opening_kings_indian: [
     "King's Indian: Black fianchettoes and strikes with ...e5 or ...c5; after a closed centre, ...f5 is the classic lever.",
-    "KID: White's queenside space vs Black's kingside storm — race the right break, not a third plan.",
+    "KID: White — queenside space and breaks; Black — kingside storm and the right ...f5/...c5 lever.",
     "In g4/Be3 KIDs, Black's ...c5/...a6/...b5 ideas often come before a blind ...f5.",
   ],
   opening_indian: [
     "Indian complex: flexible centre — decide early whether you want a closed King's Indian fight or a Grünfeld-style open centre.",
   ],
   opening_london: [
-    "London: solid Bd3/Bf4 setup — White seeks e3–c3 harmony and a controlled e4 or c4 break.",
+    "London: White — e3–c3 harmony and a controlled e4 or c4 break; Black — hit d4 with ...c5/...Qb6 and free the c8 bishop.",
     "London: knights often head for e5 and d2–f3; keep the pieces coordinated before inventing a storm.",
     "If Black locks the London centre, play on the wing your pieces already face.",
   ],
   opening_ruy_lopez: [
-    "Ruy Lopez: White pressures e5 and prepares c3–d4; Black chooses Marshall, Berlin, or Closed structures.",
+    "Ruy Lopez: White — pressure e5 and prepare c3–d4; Black — choose Marshall, Berlin, or Closed structures.",
     "Ruy Closed: manoeuvre (Re1, Nbd2–f1–g3) before forcing the centre open.",
     "When the Ruy centre opens, activity and the bishop pair often beat a lonely pawn.",
   ],
@@ -58,17 +58,17 @@ const OPENING_FAMILY_PLANS: Record<string, string[]> = {
   ],
   opening_scandinavian: [
     "Scandinavian: ...d5 challenges e4 at once — develop minors fast and castle before hunting pawns.",
-    "Scandinavian: after the early queen trade or retreat, meet White's space with ...c6/...e6 or ...c5.",
+    "Scandinavian: White — space and tempo vs the queen; Black — meet space with ...c6/...e6 or ...c5.",
     "In the Scandinavian, watch Nb5/Bd2 tricks against the queen before grabbing pawns.",
   ],
   opening_petroff: [
     "Petroff: symmetrical e4–e5 fight — equality from accurate trades and timely ...d5/...c5.",
-    "Petroff: improve the worst piece and meet White's kingside space with central counters.",
+    "Petroff: White — try for a lasting bind; Black — neutralize and meet kingside space with central counters.",
     "When the Petroff opens up, the first side to get rooks on open files usually takes over.",
   ],
   opening_english: [
     "English: c4 fights for d5 without early e-pawn commitment.",
-    "English: clamp ...d5, expand with b4 or e3–d4, use the fianchetto long diagonal.",
+    "English: White — clamp ...d5, expand with b4 or e3–d4; Black — timely ...d5/...b5 and open-file activity.",
     "If Black breaks with ...d5/...b5 in the English, use the open files — don't cling to a dead bind.",
   ],
   named_opening: [
@@ -126,12 +126,140 @@ const EG_PLANS: string[] = [
   "Pawn endings: calculate opposition and key squares before pushing — one tempo decides many of these.",
 ];
 
+function softUncap(s: string): string {
+  const t = s.trim();
+  if (!t) return t;
+  if (/^\.\.\.|^[NBRQK][a-h]?[1-8]?|^O-O|^0-0/.test(t)) return t;
+  return t.replace(/^[A-Z]/, (c) => c.toLowerCase());
+}
+
+function ensurePeriod(s: string): string {
+  const t = s.trim();
+  if (!t) return "";
+  return /[.!?]$/.test(t) ? t : `${t}.`;
+}
+
+function stripColorLead(clause: string): string {
+  return clause
+    .replace(/^(White|Black)\s*[—\-–:]\s*/i, "")
+    .replace(/^(White|Black)\s+/i, "")
+    .trim();
+}
+
+function extractSideBit(clause: string, color: "white" | "black"): string {
+  const re = new RegExp(
+    `\\b${color}\\b\\s*[—\\-–:]?\\s*(.+)`,
+    "i"
+  );
+  const m = clause.match(re);
+  if (m?.[1]) return m[1].trim().replace(/[.]+$/, "");
+  return stripColorLead(clause).replace(/[.]+$/, "");
+}
+
+/**
+ * Keep opening tips on the user's colour: split White/Black dual tips,
+ * drop wrong-side-only advice (e.g. "White should…" when user is Black).
+ */
+export function adaptCoachTipForSide(
+  text: string,
+  userColor: "white" | "black"
+): string {
+  const raw = text.replace(/\s+/g, " ").trim();
+  if (!raw) return "";
+
+  const dashDual = raw.match(
+    /^(?:(.+?)\s*[—\-–:]\s*)?White\s*[—\-–:]\s*(.+?);\s*Black\s*[—\-–:]\s*(.+)$/i
+  );
+  if (dashDual) {
+    const prefix = (dashDual[1] || "").replace(/[:\s]+$/, "").trim();
+    const bit = stripColorLead(
+      userColor === "white" ? dashDual[2] : dashDual[3]
+    );
+    if (!bit) return "";
+    return ensurePeriod(prefix ? `${prefix} — ${softUncap(bit)}` : capitalize(bit));
+  }
+
+  const dashDualFlip = raw.match(
+    /^(?:(.+?)\s*[—\-–:]\s*)?Black\s*[—\-–:]\s*(.+?);\s*White\s*[—\-–:]\s*(.+)$/i
+  );
+  if (dashDualFlip) {
+    const prefix = (dashDualFlip[1] || "").replace(/[:\s]+$/, "").trim();
+    const bit = stripColorLead(
+      userColor === "black" ? dashDualFlip[2] : dashDualFlip[3]
+    );
+    if (!bit) return "";
+    return ensurePeriod(prefix ? `${prefix} — ${softUncap(bit)}` : capitalize(bit));
+  }
+
+  const proseDual = raw.match(
+    /^(.*?)\s*[—\-–]\s*White\s+(.+?);\s*Black\s+(.+)$/i
+  );
+  if (proseDual) {
+    const prefix = proseDual[1].replace(/[:\s]+$/, "").trim();
+    const bit = stripColorLead(
+      userColor === "white" ? `White ${proseDual[2]}` : `Black ${proseDual[3]}`
+    );
+    if (!bit) return "";
+    return ensurePeriod(prefix ? `${prefix} — ${softUncap(bit)}` : capitalize(bit));
+  }
+
+  const semi = raw.split(/\s*;\s*/).map((s) => s.trim()).filter(Boolean);
+  if (semi.length >= 2) {
+    const whiteClause = semi.find((s) => /\bWhite\b/i.test(s));
+    const blackClause = semi.find((s) => /\bBlack\b/i.test(s));
+    if (whiteClause && blackClause && whiteClause !== blackClause) {
+      const bit = extractSideBit(
+        userColor === "white" ? whiteClause : blackClause,
+        userColor
+      );
+      if (!bit) return "";
+      const label = raw.match(/^([A-Za-z][^:]{0,40}):/);
+      const prefix =
+        label && !/^(white|black)$/i.test(label[1].trim())
+          ? label[1].trim()
+          : "";
+      return ensurePeriod(prefix ? `${prefix} — ${softUncap(bit)}` : capitalize(bit));
+    }
+  }
+
+  const hasWhite = /\bWhite\b/.test(raw);
+  const hasBlack = /\bBlack\b/.test(raw);
+  const blackMoves = /\.\.\.[NBRQK]?[a-h]?[1-8]?x?[a-h]?[1-8]?/.test(raw);
+
+  if (userColor === "black") {
+    if (/\bWhite should\b/i.test(raw) && !hasBlack) return "";
+    if (hasWhite && !hasBlack && !blackMoves) return "";
+    if (/^White\b/i.test(raw) && !hasBlack) return "";
+  } else {
+    if (/\bBlack should\b/i.test(raw) && !hasWhite) return "";
+    if (!hasWhite && hasBlack && !/\byou\b/i.test(raw)) {
+      if (
+        /\bBlack\b\s+(challenges|fianchetto|strikes|develops|meets|tests|chooses)/i.test(
+          raw
+        )
+      ) {
+        return "";
+      }
+      if (/^\.\.\.|^[A-Za-z][^:]{0,36}:\s*\.\.\./.test(raw)) return "";
+    }
+  }
+
+  return ensurePeriod(raw);
+}
+
+function capitalize(s: string): string {
+  const t = s.trim();
+  if (!t) return t;
+  return t.replace(/^[a-z]/, (c) => c.toUpperCase());
+}
+
 function pickPlan(
   key: string,
   pool: string[],
   usedTips: Set<string>,
   slot: PlanSlot,
-  facts: ReturnType<typeof assessBoardFacts>
+  facts: ReturnType<typeof assessBoardFacts>,
+  userColor: "white" | "black"
 ): string {
   if (!pool.length) return "";
   const usedKey = `plan:${key}:${slot}`;
@@ -145,12 +273,15 @@ function pickPlan(
   for (const idx of order) {
     const text = pool[idx];
     if (!text) continue;
-    if (!textFitsBoard(text, facts)) continue;
-    const fp = `planfp:${text.slice(0, 48)}`;
+    const adapted = adaptCoachTipForSide(text, userColor);
+    if (!adapted) continue;
+    if (!textFitsBoard(adapted, facts)) continue;
+    if (noteTextAlreadySaid(adapted, usedTips)) continue;
+    const fp = `planfp:${adapted.slice(0, 48)}`;
     if (usedTips.has(fp)) continue;
     usedTips.add(usedKey);
     usedTips.add(fp);
-    return text;
+    return adapted;
   }
   return "";
 }
@@ -174,6 +305,25 @@ function slotForPly(
   return "mid";
 }
 
+function openingAlreadyNamed(bit: string, openingLabel: string): boolean {
+  const label = openingLabel.trim();
+  if (!label) return true;
+  const hay = bit.toLowerCase();
+  if (hay.includes(label.toLowerCase())) return true;
+  const tokens = label
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(
+      (t) =>
+        t.length >= 4 &&
+        !["defense", "defence", "attack", "game", "opening", "system"].includes(
+          t
+        )
+    );
+  if (!tokens.length) return false;
+  return tokens.some((t) => hay.includes(t));
+}
+
 /**
  * Deeper, multi-step opening / middlegame / endgame plan notes from book themes.
  */
@@ -187,9 +337,11 @@ export function phasePlanNote(args: {
   usedTips: Set<string>;
   fenAfter: string;
   playedSan: string;
+  userColor: "white" | "black";
 }): string {
   const slot = slotForPly(args.phase, args.ply);
   if (!slot) return "";
+  const userColor = args.userColor;
   const facts = assessBoardFacts({
     fenAfter: args.fenAfter,
     playedSan: args.playedSan,
@@ -203,10 +355,17 @@ export function phasePlanNote(args: {
       if (tag === "named_opening" || tag === "opening_plan") continue;
       const pool = OPENING_FAMILY_PLANS[tag];
       if (pool) {
-        const bit = pickPlan(tag, pool, args.usedTips, slot, facts);
+        const bit = pickPlan(tag, pool, args.usedTips, slot, facts, userColor);
         if (bit) {
-          if (args.openingLabel && slot === "early" && !bit.includes(args.openingLabel)) {
-            return `${args.openingLabel}. ${bit}`;
+          if (
+            args.openingLabel &&
+            slot === "early" &&
+            !openingAlreadyNamed(bit, args.openingLabel)
+          ) {
+            const body = bit.replace(/^[A-Za-z][^:]{0,40}:\s*/, "").trim() || bit;
+            return ensurePeriod(
+              `In the ${args.openingLabel}, ${softUncap(body)}`
+            );
           }
           return bit;
         }
@@ -219,7 +378,14 @@ export function phasePlanNote(args: {
     for (const s of args.structure) {
       const pool = MG_STRUCTURE_PLANS[s];
       if (pool) {
-        const bit = pickPlan(`mg:${s}`, pool, args.usedTips, slot, facts);
+        const bit = pickPlan(
+          `mg:${s}`,
+          pool,
+          args.usedTips,
+          slot,
+          facts,
+          userColor
+        );
         if (bit) return bit;
       }
     }
@@ -232,7 +398,8 @@ export function phasePlanNote(args: {
         ],
         args.usedTips,
         slot,
-        facts
+        facts,
+        userColor
       );
     }
     if (args.pov.kingMotifLive && args.pov.userKingExposed) {
@@ -244,11 +411,12 @@ export function phasePlanNote(args: {
         ],
         args.usedTips,
         slot,
-        facts
+        facts,
+        userColor
       );
     }
     return "";
   }
 
-  return pickPlan("eg", EG_PLANS, args.usedTips, slot, facts);
+  return pickPlan("eg", EG_PLANS, args.usedTips, slot, facts, userColor);
 }

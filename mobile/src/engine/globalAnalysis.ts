@@ -239,7 +239,7 @@ function toStudyGames(
   }));
 }
 
-type PermanentEvalStore = {
+export type PermanentEvalStore = {
   games: Record<string, GlobalGameRecord>;
   consumedMistakeKeys?: string[];
   consumedOpeningKeys?: string[];
@@ -270,7 +270,7 @@ export async function loadPermanentEvalStore(
   return cached || emptyVault();
 }
 
-async function savePermanentEvalStore(
+export async function savePermanentEvalStore(
   filters: Pick<QueryFilters, "username" | "platform">,
   vault: PermanentEvalStore
 ): Promise<void> {
@@ -293,6 +293,50 @@ async function savePermanentEvalStore(
     consumedMistakeKeys: mergedMistakes,
     consumedOpeningKeys: mergedOpenings,
   } satisfies PermanentEvalStore);
+}
+
+/** Merge position evals into the shared study/Games vault (same gameId). */
+export async function upsertSharedGameEvals(
+  filters: Pick<QueryFilters, "username" | "platform">,
+  gameId: string,
+  patch: {
+    positions: Record<string, PositionEval>;
+    evalsWhiteCp?: number[];
+  }
+): Promise<void> {
+  const id = String(gameId || "").trim();
+  if (!id || !filters.username?.trim()) return;
+  const positions = patch.positions || {};
+  if (!Object.keys(positions).length && !patch.evalsWhiteCp?.length) return;
+
+  const vault = await loadPermanentEvalStore(filters);
+  const prev = vault.games[id];
+  const next: GlobalGameRecord = {
+    gameId: id,
+    evalsWhiteCp:
+      patch.evalsWhiteCp && patch.evalsWhiteCp.length
+        ? patch.evalsWhiteCp
+        : prev?.evalsWhiteCp || [],
+    positions: { ...(prev?.positions || {}), ...positions },
+    mistakeCandidates: prev?.mistakeCandidates || [],
+    openingCandidates: prev?.openingCandidates || [],
+    opening_accuracy_pct: prev?.opening_accuracy_pct ?? null,
+    opening_accuracy_moves: prev?.opening_accuracy_moves ?? 0,
+    endgameEval: prev?.endgameEval ?? null,
+    middlegameEval: prev?.middlegameEval ?? null,
+    style: prev?.style ?? null,
+  };
+  await savePermanentEvalStore(filters, {
+    ...vault,
+    games: { ...vault.games, [id]: next },
+  });
+}
+
+export function getSharedGameRecord(
+  vault: PermanentEvalStore,
+  gameId: string
+): GlobalGameRecord | null {
+  return vault.games[String(gameId)] || null;
 }
 
 function buildPeriodState(

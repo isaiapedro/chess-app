@@ -448,8 +448,8 @@ export const BOOK_ARCHIVE: KnowledgeCard[] = [
   {
     id: "mg_imbalance_silman",
     label: "Silman Imbalances (Middlegame)",
-    requireThemes: ["planning", "piece_activity", "initiative"],
-    weight: 2,
+    requireThemes: ["imbalances", "planning", "initiative"],
+    weight: 3,
     rules: [
       "List imbalances (king safety, material, structure, space, activity, development) and play toward your plusses.",
       "Improve the worst-placed piece that hits today's target before inventing a new plan.",
