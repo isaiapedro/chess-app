@@ -1,10 +1,12 @@
 import React, { useMemo, useState } from "react";
 import {
+  Image,
   LayoutChangeEvent,
   Pressable,
   StyleSheet,
   Text,
   View,
+  type ImageSourcePropType,
 } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import { Chess, Square } from "chess.js";
@@ -27,6 +29,9 @@ type Props = {
   onMove?: (uci: string, san: string, fenAfter: string) => void;
   highlightUci?: string | null;
   guessUci?: string | null;
+  /** Accuracy badge on the destination square of a move (UCI). */
+  markUci?: string | null;
+  markSource?: ImageSourcePropType | null;
 };
 
 function squareColor(fileIdx: number, rankIdx: number): string {
@@ -58,6 +63,8 @@ export function ChessBoard({
   onMove,
   highlightUci,
   guessUci,
+  markUci,
+  markSource,
 }: Props) {
   const [size, setSize] = useState(320);
   const [selected, setSelected] = useState<Square | null>(null);
@@ -77,6 +84,10 @@ export function ChessBoard({
   const toHi = highlightUci?.slice(2, 4) as Square | undefined;
   const fromGuess = guessUci?.slice(0, 2) as Square | undefined;
   const toGuess = guessUci?.slice(2, 4) as Square | undefined;
+  const markSq =
+    markUci && markUci.length >= 4
+      ? (markUci.slice(2, 4) as Square)
+      : null;
 
   const onLayout = (e: LayoutChangeEvent) => {
     const w = e.nativeEvent.layout.width;
@@ -182,6 +193,18 @@ export function ChessBoard({
                     {isTarget && !piece ? <View style={styles.dot} /> : null}
                     {isTarget && piece ? <View style={styles.captureRing} /> : null}
                     {pieceKey ? <PieceSvg pieceKey={pieceKey} size={pieceSize} /> : null}
+                    {markSource && markSq === sq ? (
+                      <Image
+                        source={markSource}
+                        style={[
+                          styles.sqMark,
+                          {
+                            width: sqSize * 0.42,
+                            height: sqSize * 0.42,
+                          },
+                        ]}
+                      />
+                    ) : null}
                     {fileIdx === 0 ? (
                       <Text
                         style={[
@@ -273,5 +296,11 @@ const styles = StyleSheet.create({
     borderRadius: radius.xs,
     borderWidth: 3,
     borderColor: withAlpha(colors.red, 0.55),
+  },
+  sqMark: {
+    position: "absolute",
+    top: 2,
+    right: 2,
+    zIndex: 3,
   },
 });

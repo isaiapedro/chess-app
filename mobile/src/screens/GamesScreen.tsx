@@ -9,8 +9,9 @@ import {
   View,
 } from "react-native";
 import { Chess } from "chess.js";
-import { ArrowLeft } from "lucide-react-native";
+import { Ionicons } from "@expo/vector-icons";
 import { ChessBoard } from "../components/ChessBoard";
+import { GameEvalGraph } from "../components/GameEvalGraph";
 import {
   BrutalButton,
   DisplayTitle,
@@ -32,21 +33,20 @@ import {
   loadCachedGameAnalysis,
   saveCachedGameAnalysis,
 } from "../engine/gameCoach/analysisCache";
+import { COACH_MARK_SOURCES } from "../engine/gameCoach/coachMarks";
 import { formatOpeningLabel } from "../engine/gameCoach/ecoLabels";
+import { computePhaseSplits } from "../engine/gameCoach/phaseSplits";
 import { useStockfish } from "../engine/StockfishProvider";
 import { GLOBAL_DEPTH } from "../engine/analysisConfig";
-import { displayCp } from "../engine/analyzeMistakes";
+import { displayCp, toWhiteCp } from "../engine/analyzeMistakes";
 import type { StudyGame } from "../engine/analyzeMistakes";
-import {
-  loadLocalGamesPage,
-  findLocalGameById,
-  type NormalizedGame,
-} from "../data/platformGames";
-import { AppIcon } from "../icons";
+import { ensureStudyGames } from "../storage/analyticsLoaders";
+import type { NormalizedGame } from "../data/platformGames";
 import { colors, font, radius, result, spacing, type } from "../theme";
 
 /** Matches TabNavigator order: Wrapped, Insights, Study, Games, Profile */
 const GAMES_TAB_INDEX = 3;
+const GAMES_PAGE_SIZE = 30;
 
 function formatGameDate(value?: string): string {
   if (!value) return "Unknown date";
@@ -75,8 +75,10 @@ export function GamesScreen() {
   const [listError, setListError] = useState<string | null>(null);
   const [games, setGames] = useState<StudyGame[]>([]);
   const [hasMore, setHasMore] = useState(false);
-  const [offset, setOffset] = useState(0);
-  const listLoadedForKey = useRef<string | null>(null);
+  const [visibleCount, setVisibleCount] = useState(GAMES_PAGE_SIZE);
+  const allGamesRef = useRef<StudyGame[]>([]);
+  const loadedFiltersKey = useRef<string | null>(null);
+  const lastRefreshRef = useRef(refreshToken);
 
   const [selectedGame, setSelectedGame] = useState<NormalizedGame | null>(null);
   const [plies, setPlies] = useState<GameCoachPly[]>([]);
@@ -91,7 +93,20 @@ export function GamesScreen() {
   const cancelRef = useRef({ cancelled: false });
   const liveReq = useRef(0);
 
-  const listKey = `${queryFilters.platform}|${queryFilters.username}|${refreshToken}`;
+  const filtersKey = useMemo(
+    () =>
+      [
+        queryFilters.platform,
+        queryFilters.username,
+        queryFilters.timeframe,
+        queryFilters.speed || "",
+        queryFilters.color || "",
+        queryFilters.result || "",
+        queryFilters.dateFrom || "",
+        queryFilters.dateTo || "",
+      ].join("|"),
+    [queryFilters]
+  );
 
   useEffect(() => {
     setSelectedGame(null);
@@ -102,46 +117,60 @@ export function GamesScreen() {
     setAnalyzeProgress(null);
     setLiveLines([]);
     setLiveCp(null);
-    setOffset(0);
     setGames([]);
-    listLoadedForKey.current = null;
-  }, [listKey]);
+    setHasMore(false);
+    setVisibleCount(GAMES_PAGE_SIZE);
+    allGamesRef.current = [];
+    loadedFiltersKey.current = null;
+  }, [filtersKey]);
+
+  const applyVisible = useCallback((all: StudyGame[], count: number) => {
+    allGamesRef.current = all;
+    const next = Math.min(Math.max(count, GAMES_PAGE_SIZE), all.length || count);
+    setVisibleCount(next);
+    setGames(all.slice(0, next));
+    setHasMore(all.length > next);
+  }, []);
 
   const loadList = useCallback(
-    async (nextOffset: number, append: boolean) => {
+    async (force: boolean) => {
       if (!queryFilters.username.trim()) {
         setGames([]);
         setHasMore(false);
+        allGamesRef.current = [];
         setListError("Sign in / set a username to browse your games.");
         return;
       }
       setListLoading(true);
       setListError(null);
       try {
-        const page = await loadLocalGamesPage(queryFilters, {
-          force: false,
-          limit: 30,
-          offset: nextOffset,
-        });
-        setGames((prev) => (append ? [...prev, ...page.games] : page.games));
-        setHasMore(page.has_more);
-        setOffset(nextOffset + page.games.length);
-        listLoadedForKey.current = listKey;
+        // Same cache + ingest path as Study / puzzles — soft hits AsyncStorage.
+        const all = await ensureStudyGames(queryFilters, force);
+        loadedFiltersKey.current = filtersKey;
+        applyVisible(all, GAMES_PAGE_SIZE);
       } catch (err) {
         setListError(err instanceof Error ? err.message : "Failed to load games");
       } finally {
         setListLoading(false);
       }
     },
-    [queryFilters, listKey]
+    [queryFilters, filtersKey, applyVisible]
   );
 
-  // Only load history when Games tab is focused — no startup ingest.
+  // Focus Games tab: reuse cache; refreshToken (same as puzzles) forces newer fetch.
   useEffect(() => {
     if (!gamesTabActive) return;
-    if (listLoadedForKey.current === listKey) return;
-    void loadList(0, false);
-  }, [gamesTabActive, listKey, loadList]);
+    const force = refreshToken !== lastRefreshRef.current;
+    lastRefreshRef.current = refreshToken;
+    if (
+      !force &&
+      loadedFiltersKey.current === filtersKey &&
+      allGamesRef.current.length > 0
+    ) {
+      return;
+    }
+    void loadList(force);
+  }, [gamesTabActive, filtersKey, refreshToken, loadList]);
 
   const openGame = useCallback(
     async (game: StudyGame) => {
@@ -153,11 +182,9 @@ export function GamesScreen() {
       setLiveCp(null);
       setPlyIndex(-1);
 
-      const full =
-        game.pgn_str || game.moves_str
-          ? (game as NormalizedGame)
-          : (await findLocalGameById(queryFilters, game.id)) ||
-            (game as NormalizedGame);
+      const fromList =
+        allGamesRef.current.find((g) => g.id === game.id) || game;
+      const full = fromList as NormalizedGame;
       setSelectedGame(full);
       const source = full.pgn_str || full.moves_str || "";
       setPlies(buildReplayPlies(source));
@@ -209,6 +236,9 @@ export function GamesScreen() {
         moves: selectedGame.moves_str,
         eco: selectedGame.opening_eco,
         opening: selectedGame.opening_name,
+        userColor: selectedGame.user_color,
+        platform: queryFilters.platform,
+        username: queryFilters.username,
         evaluate,
         depth: GLOBAL_DEPTH,
         multiPv: 3,
@@ -276,7 +306,7 @@ export function GamesScreen() {
       try {
         const ev = await evaluate(fenNow, GLOBAL_DEPTH, 3, 0);
         if (liveReq.current !== req) return;
-        setLiveCp(ev.cpWhite);
+        setLiveCp(toWhiteCp(fenNow, ev.cpWhite));
         setLiveLines(linesFromEval(fenNow, ev));
       } catch {
         if (liveReq.current !== req) return;
@@ -296,6 +326,32 @@ export function GamesScreen() {
     return plies[plyIndex]?.note || "";
   }, [plyIndex, plies]);
 
+  const graphPoints = useMemo(
+    () =>
+      plies
+        .map((p, plyIndex) => ({
+          plyIndex,
+          ply: p.ply,
+          cp: p.evalAfterCp,
+          mark: p.mark,
+        }))
+        .filter(
+          (p): p is { plyIndex: number; ply: number; cp: number; mark: typeof p.mark } =>
+            p.cp != null
+        ),
+    [plies]
+  );
+
+  const phaseSplits = useMemo(() => {
+    if (!analysis?.plies?.length) return null;
+    const userColor =
+      selectedGame?.user_color === "black" ? "black" : "white";
+    return computePhaseSplits(analysis.plies, userColor);
+  }, [analysis, selectedGame?.user_color]);
+
+  const currentMark =
+    plyIndex >= 0 ? plies[plyIndex]?.mark || null : null;
+
   const highlightUci =
     plyIndex >= 0 && plies[plyIndex] ? plies[plyIndex].uci : null;
 
@@ -312,7 +368,7 @@ export function GamesScreen() {
           keyboardShouldPersistTaps="handled"
         >
           <Pressable onPress={closeGame} style={styles.backRow} hitSlop={8}>
-            <AppIcon icon={ArrowLeft} size={18} color={colors.cream} />
+            <Ionicons name="arrow-back" size={18} color={colors.cream} />
             <Text style={styles.backLabel}>Games</Text>
           </Pressable>
 
@@ -348,7 +404,12 @@ export function GamesScreen() {
               {liveLines.length ? (
                 <View style={styles.linesBox}>
                   {liveLines.map((line) => (
-                    <Text key={line.rank} style={styles.lineRow}>
+                    <Text
+                      key={line.rank}
+                      style={styles.lineText}
+                      numberOfLines={1}
+                      ellipsizeMode="tail"
+                    >
                       <Text style={styles.lineRank}>{line.rank}. </Text>
                       <Text style={styles.lineEval}>{formatEval(line.cpWhite)} </Text>
                       {line.pvSan.join(" ")}
@@ -365,6 +426,10 @@ export function GamesScreen() {
               orientation={orientation}
               interactive={false}
               highlightUci={highlightUci}
+              markUci={currentMark && highlightUci ? highlightUci : null}
+              markSource={
+                currentMark ? COACH_MARK_SOURCES[currentMark] : null
+              }
             />
           </EdgeCard>
 
@@ -449,84 +514,105 @@ export function GamesScreen() {
               );
             })}
           </View>
+
+          {analysis && graphPoints.length >= 2 ? (
+            <View style={styles.graphBlock}>
+              <Text style={[styles.movesHeader, styles.graphHeader]}>
+                Eval graph
+              </Text>
+              <GameEvalGraph
+                points={graphPoints}
+                currentPly={plyIndex}
+                phaseSplits={phaseSplits}
+                userColor={
+                  selectedGame.user_color === "black" ? "black" : "white"
+                }
+                onSelectPly={setPlyIndex}
+              />
+            </View>
+          ) : null}
         </ScrollView>
       </FadeFromBlank>
     );
   }
 
   return (
-    <FadeFromBlank contentKey={`games-list-${listKey}`}>
-      <View style={styles.screen}>
-        <View style={styles.listHeader}>
-          <DisplayTitle>Games</DisplayTitle>
-          <Text style={styles.subtitle}>
-            Pick a game from your history. Analysis runs only when you ask.
-          </Text>
+      <FadeFromBlank contentKey={`games-list-${filtersKey}`}>
+        <View style={styles.screen}>
+          <View style={styles.listHeader}>
+            <DisplayTitle>Games</DisplayTitle>
+            <Text style={styles.subtitle}>
+              Pick a game from your history. Analysis runs only when you ask.
+            </Text>
+          </View>
+
+          {listError && !games.length ? (
+            <Text style={styles.errorText}>{listError}</Text>
+          ) : null}
+
+          {!gamesTabActive ? (
+            <Text style={styles.emptyText}>Open this tab to load your games.</Text>
+          ) : (
+            <FlatList
+              data={games}
+              keyExtractor={(item) => item.id}
+              contentContainerStyle={styles.listContent}
+              ListEmptyComponent={
+                listLoading ? (
+                  <ActivityIndicator color={colors.cream} style={{ marginTop: 40 }} />
+                ) : (
+                  <Text style={styles.emptyText}>
+                    No games in this period. Adjust filters or sync from Profile.
+                  </Text>
+                )
+              }
+              renderItem={({ item }) => (
+                <Pressable
+                  onPress={() => void openGame(item)}
+                  style={({ pressed }) => [
+                    styles.gameRow,
+                    pressed && styles.gameRowPressed,
+                  ]}
+                >
+                  <View style={styles.gameRowTop}>
+                    <Text style={styles.gameOpp} numberOfLines={1}>
+                      vs {item.opponent_name || "Unknown"}
+                    </Text>
+                    <Text
+                      style={[styles.gameResult, { color: resultTone(item.result) }]}
+                    >
+                      {item.result || "—"}
+                    </Text>
+                  </View>
+                  <Text style={styles.gameMeta} numberOfLines={1}>
+                    {formatGameDate(item.created_at)}
+                    {item.speed ? ` · ${item.speed}` : ""}
+                    {item.opening_name || item.opening_eco
+                      ? ` · ${formatOpeningLabel(item.opening_eco, item.opening_name)}`
+                      : ""}
+                  </Text>
+                </Pressable>
+              )}
+              onEndReached={() => {
+                if (!hasMore || listLoading) return;
+                applyVisible(
+                  allGamesRef.current,
+                  visibleCount + GAMES_PAGE_SIZE
+                );
+              }}
+              onEndReachedThreshold={0.4}
+              ListFooterComponent={
+                listLoading && games.length ? (
+                  <ActivityIndicator
+                    color={colors.cream}
+                    style={{ marginVertical: 16 }}
+                  />
+                ) : null
+              }
+            />
+          )}
         </View>
-
-        {listError && !games.length ? (
-          <Text style={styles.errorText}>{listError}</Text>
-        ) : null}
-
-        {!gamesTabActive ? (
-          <Text style={styles.emptyText}>Open this tab to load your games.</Text>
-        ) : (
-          <FlatList
-            data={games}
-            keyExtractor={(item) => item.id}
-            contentContainerStyle={styles.listContent}
-            ListEmptyComponent={
-              listLoading ? (
-                <ActivityIndicator color={colors.cream} style={{ marginTop: 40 }} />
-              ) : (
-                <Text style={styles.emptyText}>
-                  No games in this period. Adjust filters or sync from Profile.
-                </Text>
-              )
-            }
-            renderItem={({ item }) => (
-              <Pressable
-                onPress={() => void openGame(item)}
-                style={({ pressed }) => [
-                  styles.gameRow,
-                  pressed && styles.gameRowPressed,
-                ]}
-              >
-                <View style={styles.gameRowTop}>
-                  <Text style={styles.gameOpp} numberOfLines={1}>
-                    vs {item.opponent_name || "Unknown"}
-                  </Text>
-                  <Text
-                    style={[styles.gameResult, { color: resultTone(item.result) }]}
-                  >
-                    {item.result || "—"}
-                  </Text>
-                </View>
-                <Text style={styles.gameMeta} numberOfLines={1}>
-                  {formatGameDate(item.created_at)}
-                  {item.speed ? ` · ${item.speed}` : ""}
-                  {item.opening_name || item.opening_eco
-                    ? ` · ${formatOpeningLabel(item.opening_eco, item.opening_name)}`
-                    : ""}
-                </Text>
-              </Pressable>
-            )}
-            onEndReached={() => {
-              if (hasMore && !listLoading) void loadList(offset, true);
-            }}
-            onEndReachedThreshold={0.4}
-            ListFooterComponent={
-              listLoading && games.length ? (
-                <ActivityIndicator
-                  color={colors.cream}
-                  style={{ marginVertical: 16 }}
-                />
-              ) : null
-            }
-          />
-        )}
-      </View>
-    </FadeFromBlank>
+      </FadeFromBlank>
   );
 }
 
@@ -596,8 +682,8 @@ const styles = StyleSheet.create({
     borderRadius: radius.pill,
     backgroundColor: result.win,
   },
-  linesBox: { gap: 2, marginBottom: spacing.sm },
-  lineRow: {
+  linesBox: { gap: 4, marginBottom: spacing.sm },
+  lineText: {
     fontFamily: font.mono,
     fontSize: type.caption.fontSize,
     color: colors.textSoft,
@@ -678,6 +764,15 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
   },
   moveChipTextActive: { color: colors.cream },
+  graphBlock: {
+    marginTop: spacing.sm,
+    marginBottom: spacing.md,
+    marginHorizontal: -spacing.md,
+    overflow: "visible",
+  },
+  graphHeader: {
+    paddingHorizontal: spacing.md,
+  },
   gameRow: {
     backgroundColor: colors.surface,
     borderRadius: radius.md,

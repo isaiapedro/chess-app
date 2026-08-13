@@ -1,5 +1,16 @@
 export { formatOpeningLabel } from "./ecoLabels";
-export { retrieveKnowledgeNugget } from "./retrieve";
+export {
+  retrieveKnowledgeNugget,
+  retrieveKnowledgeNuggets,
+} from "./retrieve";
+export { composeCoachNote, expandCoachThemes, classifyUserError } from "./noteCompose";
+export {
+  lookupCoachGameMetrics,
+  buildCoachGameMetrics,
+  emptyCoachGameMetrics,
+  type CoachGameMetrics,
+  type CoachMetricMoment,
+} from "./gameMetricsLookup";
 export {
   analyzeSelectedGame,
   buildReplayPlies,
@@ -19,3 +30,9 @@ export {
   detectStructureThemes,
   detectOpeningFamily,
 } from "./structureDetect";
+export {
+  COACH_MARK_SOURCES,
+  classifyCoachMark,
+  type CoachMark,
+} from "./coachMarks";
+export { computePhaseSplits, type PhaseSplits } from "./phaseSplits";

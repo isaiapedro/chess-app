@@ -1,12 +1,35 @@
 import { Chess, type Square } from "chess.js";
 import { GLOBAL_DEPTH } from "../analysisConfig";
 import { applyUciMove, uciFromMove } from "../chessMoves";
+import { toWhiteCp } from "../analyzeMistakes";
+import { classifyCoachMark, type CoachMark } from "./coachMarks";
 import { formatOpeningLabel } from "./ecoLabels";
-import { retrieveKnowledgeNugget } from "./retrieve";
+import {
+  emptyCoachGameMetrics,
+  lookupCoachGameMetrics,
+  type CoachGameMetrics,
+} from "./gameMetricsLookup";
+import { composeCoachNote, expandCoachThemes, classifyUserError, shouldComposeNote } from "./noteCompose";
+import { assessPositionPov } from "./positionPov";
+import { retrieveKnowledgeNuggets } from "./retrieve";
 import {
   detectOpeningFamily,
   detectStructureThemes,
 } from "./structureDetect";
+import type { Platform } from "../../api/types";
+
+const KING_FILTER = new Set([
+  "king_safety",
+  "opp_king_exposed",
+  "user_king_exposed",
+  "attack",
+]);
+
+function normalizeUserColor(raw?: string | null): "white" | "black" {
+  const v = String(raw || "white").trim().toLowerCase();
+  if (v === "black" || v === "b") return "black";
+  return "white";
+}
 
 export type EvalFn = (
   fen: string,
@@ -43,6 +66,7 @@ export type GameCoachPly = {
   lines: EngineLine[];
   note: string;
   analyzed: boolean;
+  mark: CoachMark | null;
 };
 
 export type GameCoachResult = {
@@ -71,165 +95,11 @@ function phaseForPly(ply: number, pieceCount: number): "opening" | "middlegame" 
   return "middlegame";
 }
 
-function moveSketch(side: "white" | "black", san: string, fenBefore: string): string {
-  const who = side === "white" ? "White" : "Black";
-  try {
-    const board = new Chess(fenBefore);
-    const move = board.move(san);
-    if (!move) return `${who} continues.`;
-    if (move.flags.includes("k") || move.flags.includes("q")) {
-      return `${who} castles, knitting the rooks and tucking the king.`;
-    }
-    if (move.captured) {
-      return `${who} takes on ${move.to}, changing the tension.`;
-    }
-    if (move.piece === "p") {
-      return `${who} pushes to ${move.to}, reshaping the pawn skeleton.`;
-    }
-    const names: Record<string, string> = {
-      n: "knight",
-      b: "bishop",
-      r: "rook",
-      q: "queen",
-      k: "king",
-    };
-    return `${who} steers the ${names[move.piece] || "piece"} toward ${move.to}.`;
-  } catch {
-    return `${who} plays ${san}.`;
-  }
-}
-
-function whyAlternative(
-  bestSan: string,
-  bestPvSan: string[],
-  themes: string[]
-): string {
-  const follow = bestPvSan.slice(1, 3).join(" ");
-  if (follow) {
-    return `${bestSan} ${follow} keeps clearer control of the fight.`;
-  }
-  if (themes.includes("open_c_file") || themes.includes("open_file")) {
-    return `${bestSan} contests the open file before the opponent digs in.`;
-  }
-  if (themes.includes("iqp")) {
-    return `${bestSan} handles the isolated pawn more purposefully.`;
-  }
-  if (themes.includes("hanging_pawns")) {
-    return `${bestSan} keeps the hanging duo flexible instead of freezing it.`;
-  }
-  if (themes.includes("passed_pawn")) {
-    return `${bestSan} treats the passer with more urgency.`;
-  }
-  if (themes.includes("bishop_pair")) {
-    return `${bestSan} preserves or activates the bishop pair better.`;
-  }
-  if (themes.includes("space")) {
-    return `${bestSan} uses the space edge without giving counterplay.`;
-  }
-  return `${bestSan} meets the position's demands more cleanly.`;
-}
-
-function trainingTip(deltaCp: number, themes: string[]): string {
-  if (deltaCp >= 300) {
-    return "Drill tactics that force a checks-captures-threats scan before you move.";
-  }
-  if (deltaCp >= 150) {
-    if (themes.includes("open_file") || themes.includes("open_c_file")) {
-      return "In training, pause on open-file positions and name the invasion square before choosing a move.";
-    }
-    if (themes.includes("iqp") || themes.includes("hanging_pawns")) {
-      return "Practice structure positions: decide blockade vs break before calculating.";
-    }
-    return "When a move feels forcing, ask what you leave hanging and what the opponent's next threat is.";
-  }
-  if (deltaCp >= 80) {
-    return "Compare two candidates out loud — yours and the engine's — and say which plan each serves.";
-  }
-  if (deltaCp >= 40) {
-    return "Log the stronger alternative after the game and replay that branch once.";
-  }
-  return "";
-}
-
-/**
- * Weave position concepts (plans/motifs) with move judgment.
- * No labeled sections — only speak when the board or the gap calls for it.
- */
-function composeCoachNote(args: {
-  side: "white" | "black";
-  san: string;
-  fenBefore: string;
-  deltaCp: number;
-  bestSan: string | null;
-  bestPvSan: string[];
-  themes: string[];
-  concept: string | null;
-  openingLabel: string;
-  ply: number;
-}): string {
-  const parts: string[] = [];
-  const {
-    side,
-    san,
-    fenBefore,
-    deltaCp,
-    bestSan,
-    bestPvSan,
-    themes,
-    concept,
-    openingLabel,
-    ply,
-  } = args;
-
-  if (concept) {
-    parts.push(concept);
-  } else if (openingLabel && ply <= 8) {
-    parts.push(
-      `Typical ${openingLabel} motifs still matter here — centre control and where the pieces want to live.`
-    );
-  }
-
-  parts.push(moveSketch(side, san, fenBefore));
-
-  const matchesBest = Boolean(bestSan && bestSan === san);
-  if (matchesBest || deltaCp < 40) {
-    parts.push(
-      matchesBest
-        ? "Good choice — it fits what the position is asking for."
-        : "Solid enough — the plan stays intact."
-    );
-  } else if (bestSan) {
-    const judgment =
-      deltaCp >= 300
-        ? "Bad"
-        : deltaCp >= 150
-          ? "Mistake"
-          : deltaCp >= 80
-            ? "Inaccurate"
-            : "Okay";
-    parts.push(
-      `${judgment}: ${whyAlternative(bestSan, bestPvSan, themes)}`
-    );
-    const tip = trainingTip(deltaCp, themes);
-    if (tip) parts.push(tip);
-  } else if (deltaCp >= 80) {
-    parts.push(
-      deltaCp >= 150
-        ? "Mistake — a calmer look at the threats would have helped."
-        : "Inaccurate — the idea is understandable, but the timing is off."
-    );
-    const tip = trainingTip(deltaCp, themes);
-    if (tip) parts.push(tip);
-  }
-
-  return parts.join(" ");
-}
-
 function shouldSamplePly(ply: number, totalPlies: number): boolean {
   if (totalPlies <= 0) return false;
-  if (ply <= 18) return ply % 2 === 0;
+  if (ply <= 24) return true;
   if (ply >= totalPlies - 1) return true;
-  return ply % 4 === 0;
+  return ply % 2 === 0;
 }
 
 function sanFromUci(fen: string, uci: string | null): string | null {
@@ -290,7 +160,7 @@ export function linesFromEval(
     return {
       rank: i + 1,
       san: pvSan[0] || sanFromUci(fen, row.uci) || row.uci || "—",
-      cpWhite: row.cpWhite,
+      cpWhite: toWhiteCp(fen, row.cpWhite),
       pvSan,
     };
   });
@@ -345,7 +215,7 @@ export function parseGamePlies(pgnOrMoves: string): Array<{
 }
 
 /**
- * Analyze a user-selected game with Stockfish 18 + structure-gated knowledge.
+ * Analyze a user-selected game with Stockfish 18 + structure/phase RAG.
  */
 export async function analyzeSelectedGame(options: {
   gameId: string;
@@ -353,6 +223,10 @@ export async function analyzeSelectedGame(options: {
   moves?: string | null;
   eco?: string | null;
   opening?: string | null;
+  userColor?: string | null;
+  platform?: Platform;
+  username?: string;
+  metrics?: CoachGameMetrics | null;
   evaluate: EvalFn;
   depth?: number;
   multiPv?: number;
@@ -365,14 +239,34 @@ export async function analyzeSelectedGame(options: {
   const skeleton = parseGamePlies(source);
   const openingLabel = formatOpeningLabel(options.eco, options.opening);
   const openingTags = detectOpeningFamily(options.eco, options.opening);
+  const userColor = normalizeUserColor(options.userColor);
   const usedKnowledge = new Set<string>();
+  const usedTips = new Set<string>();
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
+
+  let metrics = options.metrics || null;
+  if (!metrics && options.platform && options.username) {
+    try {
+      metrics = await lookupCoachGameMetrics({
+        platform: options.platform,
+        username: options.username,
+        gameId: options.gameId,
+        userColor,
+      });
+    } catch {
+      metrics = emptyCoachGameMetrics();
+    }
+  }
+  if (!metrics) metrics = emptyCoachGameMetrics();
 
   for (let i = 0; i < skeleton.length; i++) {
     if (options.signal?.cancelled) break;
     const sk = skeleton[i];
-    const sample = shouldSamplePly(sk.ply, skeleton.length);
+    const isUserPly = sk.side === userColor;
+    const momentAtPly = isUserPly ? metrics.momentsByPly[sk.ply] || null : null;
+    const sample =
+      shouldSamplePly(sk.ply, skeleton.length) || Boolean(momentAtPly);
     options.onProgress?.({
       ply: i + 1,
       total: skeleton.length,
@@ -389,49 +283,154 @@ export async function analyzeSelectedGame(options: {
     let deltaCp = 0;
     let note = "";
     let analyzed = false;
+    let mark: CoachMark | null = null;
 
-    if (sample) {
-      try {
+    try {
+      if (sample) {
         const before = await options.evaluate(sk.fenBefore, depth, multiPv, 0);
-        evalBefore = before.cpWhite;
+        evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
         bestSan = sanFromUci(sk.fenBefore, before.bestUci);
         bestPvSan = pvToSan(sk.fenBefore, before.bestPv);
         lines = linesFromEval(sk.fenBefore, before);
+      }
 
-        const after = await options.evaluate(sk.fenAfter, depth, 1, 0);
-        evalAfter = after.cpWhite;
+      const after = await options.evaluate(sk.fenAfter, depth, 1, 0);
+      evalAfter = toWhiteCp(sk.fenAfter, after.cpWhite);
+      analyzed = true;
+
+      if (evalBefore != null && evalAfter != null) {
         const loss =
           sk.side === "white"
-            ? (evalBefore ?? 0) - (evalAfter ?? 0)
-            : (evalAfter ?? 0) - (evalBefore ?? 0);
+            ? evalBefore - evalAfter
+            : evalAfter - evalBefore;
         deltaCp = Math.max(0, Math.round(loss));
-        analyzed = true;
+      }
 
+      const playedBest = Boolean(bestSan && bestSan === sk.san);
+      mark =
+        evalBefore != null && evalAfter != null
+          ? classifyCoachMark({
+              side: sk.side,
+              evalBeforeCp: evalBefore,
+              evalAfterCp: evalAfter,
+              playedBest,
+            })
+          : null;
+
+      if (sample) {
         const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
         const phase = phaseForPly(sk.ply, pieceCount);
         const structure = detectStructureThemes(sk.fenAfter);
-        // Opening-family tags only in opening; structure tags always board-true.
-        const themes =
-          phase === "opening"
-            ? [...structure, ...openingTags, "development"]
-            : [...structure];
-        const nugget = retrieveKnowledgeNugget({ themes, phase }, usedKnowledge);
-        note = composeCoachNote({
-          side: sk.side,
-          san: sk.san,
-          fenBefore: sk.fenBefore,
+        const pov = assessPositionPov(sk.fenAfter, userColor);
+        const moment = momentAtPly;
+        const perspective = isUserPly ? "user" : "opponent";
+        const provisionalThemes = [
+          ...structure,
+          ...(pov.kingMotifLive ? pov.themes : []),
+          ...(isUserPly ? metrics.themesByPhase[phase] : []),
+        ];
+        const errorKind = isUserPly
+          ? classifyUserError({
+              fenBefore: sk.fenBefore,
+              playedSan: sk.san,
+              bestSan,
+              bestPvSan,
+              deltaCp,
+              themes: provisionalThemes,
+              userColor,
+              moment,
+              pov,
+            })
+          : null;
+        const noteWorthy = shouldComposeNote({
+          perspective,
           deltaCp,
-          bestSan,
-          bestPvSan,
-          themes,
-          concept: nugget?.text || null,
-          openingLabel,
+          playedBest,
+          moment,
+          structure,
+          errorKind,
           ply: sk.ply,
         });
-      } catch {
-        analyzed = false;
-        note = "";
+        // One-shot opening / MG plan even on quiet user plies early
+        const wantPhasePlan =
+          isUserPly &&
+          ((phase === "opening" && sk.ply <= 10) || phase === "middlegame");
+        if (!noteWorthy && !wantPhasePlan) {
+          note = "";
+        } else {
+          const metricsThemes = isUserPly
+            ? moment || deltaCp >= 80
+              ? [
+                  ...metrics.themesByPhase[phase],
+                  ...(moment ? metrics.globalThemes : []),
+                ]
+              : []
+            : [];
+          const themes = expandCoachThemes({
+            structure,
+            openingTags,
+            phase,
+            deltaCp,
+            playedBest,
+            metricsThemes,
+            moment,
+            perspective,
+            errorKind,
+            noteWorthy: noteWorthy || wantPhasePlan,
+            pov,
+            fenBefore: sk.fenBefore,
+            playedSan: sk.san,
+            bestSan,
+            usedTips,
+          });
+          // Drop king RAG when motif not relevant this ply
+          const ragThemes = themes.filter((t) => {
+            if (!KING_FILTER.has(t)) return true;
+            return themes.includes("opp_king_exposed") || themes.includes("user_king_exposed");
+          });
+          const wantCount =
+            (isUserPly && (errorKind || moment)) ||
+            (!isUserPly && deltaCp >= 100)
+              ? 1
+              : 0;
+          const nuggets =
+            wantCount > 0
+              ? retrieveKnowledgeNuggets(
+                  {
+                    themes: ragThemes,
+                    phase,
+                    wantCount,
+                    strict: true,
+                  },
+                  usedKnowledge
+                )
+              : [];
+          note = composeCoachNote({
+            side: sk.side,
+            userColor,
+            san: sk.san,
+            fenBefore: sk.fenBefore,
+            fenAfter: sk.fenAfter,
+            deltaCp,
+            bestSan,
+            bestPvSan,
+            themes,
+            concepts: nuggets.map((n) => n.text),
+            usedTips,
+            openingLabel,
+            ply: sk.ply,
+            phase,
+            metrics,
+            moment,
+            errorKind,
+            pov,
+          });
+        }
       }
+    } catch {
+      analyzed = false;
+      note = "";
+      mark = null;
     }
 
     prevEval = evalAfter ?? evalBefore ?? prevEval;
@@ -445,6 +444,7 @@ export async function analyzeSelectedGame(options: {
       lines,
       note,
       analyzed,
+      mark,
     });
 
     await new Promise((r) => setTimeout(r, 0));
@@ -471,6 +471,7 @@ export function buildReplayPlies(pgnOrMoves: string): GameCoachPly[] {
     lines: [],
     note: "",
     analyzed: false,
+    mark: null,
   }));
 }
 

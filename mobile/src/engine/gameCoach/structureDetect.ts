@@ -144,31 +144,16 @@ export function detectStructureThemes(fen: string): string[] {
   return themes;
 }
 
+/**
+ * Soft signal only: any named/ECO opening unlocks general centre/breaks/development.
+ * Do not map openings to named RAG cards — board structure + phase drive retrieval.
+ */
 export function detectOpeningFamily(
   eco?: string | null,
   opening?: string | null
 ): string[] {
-  const tags: string[] = [];
-  const ecoU = String(eco || "")
-    .trim()
-    .toUpperCase();
-  const name = String(opening || "").toLowerCase();
-  if (ecoU.startsWith("E6") || ecoU.startsWith("E7") || ecoU.startsWith("E8") || ecoU.startsWith("E9") || name.includes("king's indian") || name.includes("kings indian")) {
-    tags.push("kings_indian");
-  }
-  if (ecoU.startsWith("E0") || ecoU.startsWith("E1") || name.includes("catalan")) {
-    tags.push("catalan");
-  }
-  if (ecoU.startsWith("B") && (ecoU >= "B20" || name.includes("sicilian"))) {
-    if (name.includes("sicilian") || (ecoU >= "B20" && ecoU <= "B99")) {
-      tags.push("sicilian");
-    }
-  }
-  if (ecoU.startsWith("C6") || ecoU.startsWith("C7") || ecoU.startsWith("C8") || ecoU.startsWith("C9") || name.includes("ruy lopez") || name.includes("spanish")) {
-    tags.push("ruy_lopez");
-  }
-  if (ecoU.startsWith("D") || name.includes("queen") || name.includes("slav") || name.includes("grunfeld") || name.includes("grünfeld")) {
-    tags.push("queens_gambit_family");
-  }
-  return tags;
+  const ecoU = String(eco || "").trim();
+  const name = String(opening || "").trim();
+  if (!ecoU && !name) return [];
+  return ["named_opening"];
 }
