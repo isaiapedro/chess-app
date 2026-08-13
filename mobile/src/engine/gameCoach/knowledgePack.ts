@@ -1,7 +1,9 @@
 /**
- * General positional knowledge — board/phase themes, not opening-named patches.
- * Broader topic coverage; retrieval stays strict (score gates in retrieve.ts).
+ * General positional knowledge — board/phase themes.
+ * Broader topic coverage; BOOK_ARCHIVE appends opening/structure/endgame book patterns.
  */
+
+import { BOOK_ARCHIVE } from "./bookArchive";
 
 export type KnowledgeCard = {
   id: string;
@@ -13,7 +15,7 @@ export type KnowledgeCard = {
   weight?: number;
 };
 
-export const KNOWLEDGE_PACK: KnowledgeCard[] = [
+const CORE_KNOWLEDGE_PACK: KnowledgeCard[] = [
   {
     id: "development",
     label: "Development",
@@ -323,4 +325,10 @@ export const KNOWLEDGE_PACK: KnowledgeCard[] = [
     ],
     phases: ["endgame", "any"],
   },
+];
+
+/** Core pack + book/ontology archive (openings, structures, endgames). */
+export const KNOWLEDGE_PACK: KnowledgeCard[] = [
+  ...CORE_KNOWLEDGE_PACK,
+  ...BOOK_ARCHIVE,
 ];

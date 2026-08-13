@@ -10,6 +10,7 @@ import {
   type CoachGameMetrics,
 } from "./gameMetricsLookup";
 import { composeCoachNote, expandCoachThemes, classifyUserError, shouldComposeNote } from "./noteCompose";
+import { phasePlanSlotOpen } from "./phasePlans";
 import { assessPositionPov } from "./positionPov";
 import { retrieveKnowledgeNuggets } from "./retrieve";
 import {
@@ -244,6 +245,7 @@ export async function analyzeSelectedGame(options: {
   const usedTips = new Set<string>();
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
+  let userPlyCount = 0;
 
   let metrics = options.metrics || null;
   if (!metrics && options.platform && options.username) {
@@ -307,6 +309,7 @@ export async function analyzeSelectedGame(options: {
       }
 
       const playedBest = Boolean(bestSan && bestSan === sk.san);
+      if (isUserPly) userPlyCount += 1;
       mark =
         evalBefore != null && evalAfter != null
           ? classifyCoachMark({
@@ -327,6 +330,7 @@ export async function analyzeSelectedGame(options: {
         const provisionalThemes = [
           ...structure,
           ...(pov.kingMotifLive ? pov.themes : []),
+          ...openingTags,
           ...(isUserPly ? metrics.themesByPhase[phase] : []),
         ];
         const errorKind = isUserPly
@@ -350,16 +354,15 @@ export async function analyzeSelectedGame(options: {
           structure,
           errorKind,
           ply: sk.ply,
+          userPlyCount,
         });
-        // One-shot opening / MG plan even on quiet user plies early
         const wantPhasePlan =
-          isUserPly &&
-          ((phase === "opening" && sk.ply <= 10) || phase === "middlegame");
+          isUserPly && phasePlanSlotOpen(phase, sk.ply);
         if (!noteWorthy && !wantPhasePlan) {
           note = "";
         } else {
           const metricsThemes = isUserPly
-            ? moment || deltaCp >= 80
+            ? moment || deltaCp >= 80 || playedBest
               ? [
                   ...metrics.themesByPhase[phase],
                   ...(moment ? metrics.globalThemes : []),
@@ -383,21 +386,26 @@ export async function analyzeSelectedGame(options: {
             bestSan,
             usedTips,
           });
-          // Drop king RAG when motif not relevant this ply
           const ragThemes = themes.filter((t) => {
             if (!KING_FILTER.has(t)) return true;
-            return themes.includes("opp_king_exposed") || themes.includes("user_king_exposed");
+            return (
+              themes.includes("opp_king_exposed") ||
+              themes.includes("user_king_exposed")
+            );
           });
           const wantCount =
-            (isUserPly && (errorKind || moment)) ||
-            (!isUserPly && deltaCp >= 100)
-              ? 1
+            noteWorthy &&
+            ((!isUserPly && deltaCp >= 80) ||
+              (isUserPly && (errorKind || moment || playedBest || deltaCp < 40)))
+              ? !isUserPly
+                ? 2
+                : 1
               : 0;
           const nuggets =
             wantCount > 0
               ? retrieveKnowledgeNuggets(
                   {
-                    themes: ragThemes,
+                    themes: ragThemes.length ? ragThemes : themes,
                     phase,
                     wantCount,
                     strict: true,
@@ -418,12 +426,15 @@ export async function analyzeSelectedGame(options: {
             concepts: nuggets.map((n) => n.text),
             usedTips,
             openingLabel,
+            openingTags,
             ply: sk.ply,
             phase,
             metrics,
             moment,
             errorKind,
             pov,
+            playedBest,
+            userPlyCount,
           });
         }
       }

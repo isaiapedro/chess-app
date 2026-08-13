@@ -1,4 +1,5 @@
 import { Chess, type Square } from "chess.js";
+import { resolveEcoFamily } from "../ecoFamilies";
 
 const FILES = "abcdefgh";
 
@@ -145,15 +146,76 @@ export function detectStructureThemes(fen: string): string[] {
 }
 
 /**
- * Soft signal only: any named/ECO opening unlocks general centre/breaks/development.
- * Do not map openings to named RAG cards — board structure + phase drive retrieval.
+ * Soft opening themes for RAG + phase plans (from ECO family / name).
+ * Book archive cards match opening_* tags — not one-off local patches.
  */
 export function detectOpeningFamily(
   eco?: string | null,
   opening?: string | null
 ): string[] {
-  const ecoU = String(eco || "").trim();
-  const name = String(opening || "").trim();
+  const tags: string[] = [];
+  const ecoU = String(eco || "").trim().toUpperCase();
+  const name = String(opening || "").toLowerCase();
   if (!ecoU && !name) return [];
-  return ["named_opening"];
+
+  tags.push("named_opening");
+  tags.push("opening_plan");
+
+  const fam = resolveEcoFamily(ecoU || null, opening || null);
+  const key = fam?.key || "";
+  if (key.includes("sicilian") || name.includes("sicilian")) {
+    tags.push("opening_sicilian");
+    if (name.includes("najdorf")) tags.push("opening_najdorf");
+    if (name.includes("dragon")) tags.push("opening_dragon");
+    if (name.includes("scheveningen")) tags.push("opening_scheveningen");
+  }
+  if (key.includes("french") || name.includes("french")) {
+    tags.push("opening_french");
+    tags.push("opening_french_defence");
+  }
+  if (key.includes("caro") || name.includes("caro")) {
+    tags.push("opening_caro_kann");
+  }
+  if (
+    key.includes("qgd") ||
+    key.includes("qga") ||
+    key.includes("slav") ||
+    name.includes("queen's gambit") ||
+    name.includes("queens gambit") ||
+    name.includes("qgd") ||
+    name.includes("slav")
+  ) {
+    tags.push("opening_queens_gambit");
+    tags.push("opening_qgd");
+  }
+  if (key.includes("kings-indian") || name.includes("king's indian") || name.includes("kings indian")) {
+    tags.push("opening_kings_indian");
+    tags.push("opening_indian");
+  }
+  if (key.includes("grunfeld") || name.includes("grünfeld") || name.includes("grunfeld")) {
+    tags.push("opening_indian");
+  }
+  if (key.includes("london") || name.includes("london")) {
+    tags.push("opening_london");
+  }
+  if (key.includes("ruy") || name.includes("ruy lopez") || name.includes("spanish")) {
+    tags.push("opening_ruy_lopez");
+  }
+  if (key.includes("italian") || name.includes("italian") || name.includes("giuoco")) {
+    tags.push("opening_italian");
+  }
+  if (key.includes("scandinavian") || name.includes("scandinavian") || name.includes("center counter")) {
+    tags.push("opening_scandinavian");
+  }
+  if (key.includes("petroff") || name.includes("petroff") || name.includes("russian")) {
+    tags.push("opening_petroff");
+  }
+  if (key.includes("english") || name.includes("english opening") || name === "english") {
+    tags.push("opening_english");
+  }
+  if (name.includes("najdorf")) tags.push("opening_najdorf");
+  if (name.includes("dragon")) tags.push("opening_dragon");
+
+  return [...new Set(tags)];
 }
+

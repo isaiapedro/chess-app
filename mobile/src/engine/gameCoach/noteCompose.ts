@@ -9,15 +9,11 @@ import {
   type PositionPov,
 } from "./positionPov";
 
+import { phasePlanNote } from "./phasePlans";
+
 export type NotePerspective = "user" | "opponent";
 
-export type UserErrorKind = "mistake" | "missed_opportunity" | null;
-
-const PHASE_PLAN_KEY = {
-  opening: "plan:opening",
-  middlegame: "plan:middlegame",
-  endgame: "plan:endgame",
-} as const;
+export type UserErrorKind = "mistake" | "missed_opportunity" | "good" | null;
 
 const KING_MOTIF_THEMES = new Set([
   "king_safety",
@@ -158,9 +154,19 @@ export function expandCoachThemes(args: {
     themes.add("conversion");
   }
 
-  if (args.openingTags.length && args.phase === "opening") {
+  if (args.openingTags.length && (args.phase === "opening" || args.phase === "middlegame")) {
     themes.add("centre");
     themes.add("pawn_breaks");
+    themes.add("named_opening");
+    themes.add("opening_plan");
+    for (const t of args.openingTags) themes.add(t);
+  }
+  if (args.phase === "middlegame" && args.noteWorthy) {
+    themes.add("piece_activity");
+    themes.add("planning");
+  }
+  if (args.phase === "endgame" && args.noteWorthy) {
+    themes.add("endgame_technique");
   }
 
   // Metrics: drop sticky king-safety labels when motif is dead on this board
@@ -425,12 +431,14 @@ function explainOpponentMistake(args: {
   san: string;
   deltaCp: number;
   opponentBestSan: string | null;
+  bestPvSan: string[];
   pov: PositionPov;
   usedTips: Set<string>;
   fenBefore: string;
+  themes: string[];
 }): string {
   const abandoned = args.opponentBestSan
-    ? ` They could have held with ${args.opponentBestSan}.`
+    ? ` A sturdier try was ${args.bestPvSan.slice(0, 3).join(" ") || args.opponentBestSan}.`
     : "";
   const citeKing = kingMotifRelevant({
     fenBefore: args.fenBefore,
@@ -444,8 +452,39 @@ function explainOpponentMistake(args: {
     return pickVariant(
       "opp-soft-king",
       [
-        `Their ${args.san} leaves the king soft — keep forcing answers.${abandoned}`,
-        `Capitalize: their king is still soft after ${args.san}.${abandoned}`,
+        `Their ${args.san} softens the king cover — open a line or check before they repair it.${abandoned}`,
+        `Capitalize: after ${args.san} their king is still soft; keep forcing answers instead of slow improving moves.${abandoned}`,
+      ],
+      args.usedTips
+    );
+  }
+  if (args.themes.includes("iqp") || args.themes.includes("hanging_pawns")) {
+    return pickVariant(
+      "opp-struct",
+      [
+        `Their ${args.san} mishandles the pawn structure — blockade or pressure the new weakness before they untangle.${abandoned}`,
+        `Structure gift: ${args.san} leaves a soft pawn complex; sit on the hole and pile up.${abandoned}`,
+        `After ${args.san} the pawn skeleton softens — freeze the weakness and bring a second attacker before they repair it.${abandoned}`,
+      ],
+      args.usedTips
+    );
+  }
+  if (args.themes.includes("open_file") || args.themes.includes("open_c_file")) {
+    return pickVariant(
+      "opp-file",
+      [
+        `Their ${args.san} concedes file control — seize the open line and eye the 7th before they contest it.${abandoned}`,
+        `File gift after ${args.san}: double or invade while their majors are still off the highway.${abandoned}`,
+      ],
+      args.usedTips
+    );
+  }
+  if (args.themes.includes("space") || args.themes.includes("development")) {
+    return pickVariant(
+      "opp-dev",
+      [
+        `Their ${args.san} loses a tempo in development/space — open the position or hit the lagging piece now.${abandoned}`,
+        `Capitalize: ${args.san} leaves them behind in mobilization; force before they catch up.${abandoned}`,
       ],
       args.usedTips
     );
@@ -453,48 +492,196 @@ function explainOpponentMistake(args: {
   return pickVariant(
     "opp-soft",
     [
-      `Their ${args.san} leaves something soft — take the square, file, or tempo before they repair it.${abandoned}`,
-      `Capitalize on ${args.san}: hit the loose point they just created.${abandoned}`,
+      `Their ${args.san} leaves a concrete soft spot — take the square, file, or tempo before they fix it.${abandoned}`,
+      `Capitalize on ${args.san}: the evaluation swing means a loose piece, open line, or missed threat is available now.${abandoned}`,
+      `They erred with ${args.san}; name the gap (hanging unit, soft square, delayed development) and hit it immediately.${abandoned}`,
+      `After ${args.san} you get a free question — answer with a forcing move that makes their next repair costly.${abandoned}`,
     ],
     args.usedTips
   );
 }
 
-function openingPlanBit(
-  openingLabel: string,
-  pov: PositionPov,
-  usedTips: Set<string>
-): string {
-  if (usedTips.has(PHASE_PLAN_KEY.opening)) return "";
-  usedTips.add(PHASE_PLAN_KEY.opening);
-  const name = openingLabel || "this opening";
-  if (pov.kingMotifLive && pov.oppKingExposed) {
-    return `${name}: develop with tempo while their king is still soft.`;
+function explainGoodMove(args: {
+  san: string;
+  bestPvSan: string[];
+  themes: string[];
+  pov: PositionPov;
+  usedTips: Set<string>;
+  citeKing: boolean;
+}): string {
+  const follow = args.bestPvSan.slice(1, 3).join(" ");
+  if (args.citeKing && args.pov.oppKingExposed) {
+    markKingMotifCited(args.usedTips);
+    return pickVariant(
+      "good-attack",
+      [
+        `${args.san} keeps the pressure on their soft king${follow ? ` — ideas like ${follow} stay alive` : ""}.`,
+        `${args.san} asks the right question while their king is still exposed.`,
+        `${args.san} keeps the attack tempo — do not trade the initiative for a quiet side plan.`,
+      ],
+      args.usedTips
+    );
   }
-  if (pov.kingMotifLive && pov.userKingExposed) {
-    return `${name}: finish development and tuck your king before starting wing play.`;
+  if (args.themes.some((t) => t.startsWith("opening_") || t === "named_opening")) {
+    return pickVariant(
+      "good-book",
+      [
+        `${args.san} fits the book plan for this opening — stay with the structure's natural break.`,
+        `${args.san} matches the opening's typical jobs (develop, centre, prepare the thematic break).`,
+        `${args.san} keeps you inside the opening's intended middlegame — next: improve the piece that serves that plan.`,
+      ],
+      args.usedTips
+    );
   }
-  return `${name}: fight the centre, develop minors, and castle before pawn storms.`;
+  if (args.themes.includes("development") || args.themes.includes("centre")) {
+    return pickVariant(
+      "good-open",
+      [
+        `${args.san} fits the opening jobs: develop, centre, or king safety.`,
+        `${args.san} keeps the opening plan coherent — pieces and centre moving together.`,
+        `${args.san} is a healthy developing move; connect the remaining pieces before inventing a wing attack.`,
+      ],
+      args.usedTips
+    );
+  }
+  if (
+    args.themes.includes("iqp") ||
+    args.themes.includes("hanging_pawns") ||
+    args.themes.includes("pawn_chain") ||
+    args.themes.includes("space") ||
+    args.themes.includes("minority_attack")
+  ) {
+    return pickVariant(
+      "good-struct",
+      [
+        `${args.san} respects the structure — the plan stays tied to the pawn skeleton.`,
+        `${args.san} improves a piece that actually hits the structural target.`,
+        `${args.san} plays the structure correctly; keep restraining their break while you build on yours.`,
+      ],
+      args.usedTips
+    );
+  }
+  if (args.themes.includes("endgame_technique") || args.themes.includes("passed_pawn")) {
+    return pickVariant(
+      "good-end",
+      [
+        `${args.san} is clean endgame technique — activate, create/pass the passer, cut counterplay.`,
+        `${args.san} keeps the ending under control; next improve the king or the rook behind the passer.`,
+      ],
+      args.usedTips
+    );
+  }
+  return pickVariant(
+    "good-generic",
+    [
+      `${args.san} matches what the position asks for — keep the same plan on the next move.`,
+      `${args.san} is the clean choice; the follow-up is to improve the worst-placed piece toward the same target.`,
+      `${args.san} holds the thread — compare any alternative to this idea before drifting.`,
+      `${args.san} is accurate; treat quieter alternatives as wrong unless they serve the same target.`,
+    ],
+    args.usedTips
+  );
 }
 
-function middlegamePlanBit(pov: PositionPov, usedTips: Set<string>): string {
-  if (usedTips.has(PHASE_PLAN_KEY.middlegame)) return "";
-  usedTips.add(PHASE_PLAN_KEY.middlegame);
-  // Only name king attack/defense if motif still live now
-  if (pov.kingMotifLive && (pov.attackSide === "user" || pov.oppKingExposed)) {
-    return "Middlegame plan: their king is still a live target — open lines and improve attackers.";
-  }
-  if (pov.kingMotifLive && (pov.attackSide === "opponent" || pov.userKingExposed)) {
-    return "Middlegame plan: your king needs cover — contest open files, trade their lead attacker, then counterbreak.";
-  }
-  return "Middlegame plan: name a target (weak pawn, open file, or outpost), improve pieces toward it, restrain their break.";
-}
+const MOMENT_OPENERS = [
+  (n: number) => `Move ${n}`,
+  (n: number) => `Around move ${n}`,
+  (n: number) => `Here at move ${n}`,
+  (n: number) => `At move ${n}`,
+  (n: number) => `By move ${n}`,
+] as const;
+
+const MOMENT_HINGE = [
+  "is a turning point",
+  "is a hinge moment",
+  "marks a real shift",
+  "is where the game tilts",
+  "is the inflection",
+  "is where the thread changes",
+] as const;
+
+const MOMENT_HINGE_TAIL = [
+  "in the evaluation",
+  "on the board",
+  "for both sides",
+  "in this game",
+] as const;
+
+const MOMENT_SWING = [
+  "the score swung",
+  "the balance shifted hard",
+  "the assessment flipped",
+  "the evaluation jumped",
+  "the position changed character",
+] as const;
+
+const MOMENT_CHANCE = [
+  "this is where the chance mattered",
+  "the opportunity was real here",
+  "the window was open here",
+  "this is the moment that counted",
+  "the practical chance lived here",
+] as const;
+
+const MOMENT_FRAME = [
+  "this is the critical stretch",
+  "treat this as the decisive stretch",
+  "the game's direction is decided around here",
+  "pay attention — the fight pivots here",
+] as const;
 
 function momentBit(moment: CoachMetricMoment, usedTips: Set<string>): string {
   const key = `moment:${moment.ply}`;
   if (usedTips.has(key)) return "";
   usedTips.add(key);
-  return `Move ${moment.moveNumber} is a turning point in the evaluation.`;
+
+  const n = moment.moveNumber;
+  const opener = pickVariant(
+    "moment-opener",
+    MOMENT_OPENERS.map((fn) => fn(n)),
+    usedTips
+  );
+  const shape = pickVariant(
+    "moment-shape",
+    [
+      "hinge",
+      "swing-chance",
+      "hinge-chance",
+      "swing-frame",
+      "frame",
+      "swing-hinge",
+    ],
+    usedTips
+  );
+
+  if (shape === "hinge") {
+    const hinge = pickVariant("moment-hinge", [...MOMENT_HINGE], usedTips);
+    const tail = pickVariant("moment-hinge-tail", [...MOMENT_HINGE_TAIL], usedTips);
+    return `${opener} ${hinge} ${tail}.`;
+  }
+  if (shape === "swing-chance") {
+    const swing = pickVariant("moment-swing", [...MOMENT_SWING], usedTips);
+    const chance = pickVariant("moment-chance", [...MOMENT_CHANCE], usedTips);
+    return `${opener} ${swing} — ${chance}.`;
+  }
+  if (shape === "hinge-chance") {
+    const hinge = pickVariant("moment-hinge", [...MOMENT_HINGE], usedTips);
+    const chance = pickVariant("moment-chance", [...MOMENT_CHANCE], usedTips);
+    return `${opener} ${hinge} — ${chance}.`;
+  }
+  if (shape === "swing-frame") {
+    const swing = pickVariant("moment-swing", [...MOMENT_SWING], usedTips);
+    const frame = pickVariant("moment-frame", [...MOMENT_FRAME], usedTips);
+    return `${opener} ${swing}; ${frame}.`;
+  }
+  if (shape === "frame") {
+    const frame = pickVariant("moment-frame", [...MOMENT_FRAME], usedTips);
+    return `${opener}: ${frame}.`;
+  }
+  const swing = pickVariant("moment-swing", [...MOMENT_SWING], usedTips);
+  const hinge = pickVariant("moment-hinge", [...MOMENT_HINGE], usedTips);
+  const tail = pickVariant("moment-hinge-tail", [...MOMENT_HINGE_TAIL], usedTips);
+  return `${opener} ${swing} — ${hinge} ${tail}.`;
 }
 
 function rephraseConcept(
@@ -564,13 +751,44 @@ export function shouldComposeNote(args: {
   structure: string[];
   errorKind?: UserErrorKind;
   ply: number;
+  /** Count of user plies so far — for ~1/4 good-move notes */
+  userPlyCount?: number;
 }): boolean {
   if (args.perspective === "user") {
     if (args.moment) return true;
-    return Boolean(args.errorKind) || args.deltaCp >= 80;
+    if (args.errorKind === "mistake" || args.errorKind === "missed_opportunity") {
+      return true;
+    }
+    if (args.deltaCp >= 80) return true;
+    // Good / quiet teaching notes ~1 in 4 user moves
+    const good =
+      args.playedBest || args.deltaCp < 40 || args.errorKind === "good";
+    if (good) {
+      const n = args.userPlyCount ?? Math.ceil(args.ply / 2);
+      return n % 4 === 1;
+    }
+    return false;
   }
-  // Opponent mistakes only — how to capitalize
-  return args.deltaCp >= 100;
+  // Opponent mistakes — slightly lower bar, richer capitalize notes
+  return args.deltaCp >= 80;
+}
+
+function assembleParts(
+  chunks: Array<string | null | undefined>,
+  orderSeed: number
+): string {
+  const parts = chunks.filter((c): c is string => Boolean(c && c.trim()));
+  if (parts.length <= 2) return parts.join(" ");
+  // Vary order: concept before/after judgment
+  if (orderSeed % 3 === 1 && parts.length >= 2) {
+    const [a, b, ...rest] = parts;
+    return [b, a, ...rest].join(" ");
+  }
+  if (orderSeed % 3 === 2 && parts.length >= 3) {
+    const [a, b, c, ...rest] = parts;
+    return [a, c, b, ...rest].join(" ");
+  }
+  return parts.join(" ");
 }
 
 export function composeCoachNote(args: {
@@ -586,12 +804,15 @@ export function composeCoachNote(args: {
   concepts: string[];
   usedTips: Set<string>;
   openingLabel: string;
+  openingTags?: string[];
   ply: number;
   phase: "opening" | "middlegame" | "endgame";
   metrics?: CoachGameMetrics | null;
   moment?: CoachMetricMoment | null;
   errorKind?: UserErrorKind;
   pov?: PositionPov | null;
+  playedBest?: boolean;
+  userPlyCount?: number;
 }): string {
   const perspective: NotePerspective =
     args.side === args.userColor ? "user" : "opponent";
@@ -606,45 +827,49 @@ export function composeCoachNote(args: {
     pov,
     usedTips: args.usedTips,
   });
+  const playedBest =
+    args.playedBest ?? Boolean(args.bestSan && args.bestSan === args.san);
 
-  const parts: string[] = [];
+  const plan = phasePlanNote({
+    phase: args.phase,
+    ply: args.ply,
+    openingLabel: args.openingLabel,
+    openingTags: args.openingTags || [],
+    structure: args.themes,
+    pov,
+    usedTips: args.usedTips,
+  });
 
-  if (args.phase === "opening" && args.ply <= 10) {
-    const op = openingPlanBit(args.openingLabel, pov, args.usedTips);
-    if (op) parts.push(op);
-  }
-  if (args.phase === "middlegame") {
-    const mg = middlegamePlanBit(pov, args.usedTips);
-    if (mg) parts.push(mg);
-  }
+  const conceptBits = args.concepts
+    .slice(0, perspective === "opponent" ? 2 : 1)
+    .map((c) =>
+      rephraseConcept(c, pov.attackSide, pov, args.usedTips, citeKing)
+    );
 
   if (perspective === "opponent") {
-    if (args.deltaCp < 100) return parts.join(" ");
-    parts.push(
-      explainOpponentMistake({
-        san: args.san,
-        deltaCp: args.deltaCp,
-        opponentBestSan: args.bestSan,
-        pov,
-        usedTips: args.usedTips,
-        fenBefore: args.fenBefore,
-      })
-    );
-    if (args.concepts[0]) {
-      parts.push(
-        rephraseConcept(
-          args.concepts[0],
-          pov.attackSide,
-          pov,
-          args.usedTips,
-          citeKing
-        )
-      );
+    if (args.deltaCp < 80) {
+      return plan || "";
     }
-    return parts.join(" ");
+    return assembleParts(
+      [
+        plan,
+        explainOpponentMistake({
+          san: args.san,
+          deltaCp: args.deltaCp,
+          opponentBestSan: args.bestSan,
+          bestPvSan: args.bestPvSan,
+          pov,
+          usedTips: args.usedTips,
+          fenBefore: args.fenBefore,
+          themes: args.themes,
+        }),
+        ...conceptBits,
+      ],
+      args.ply
+    );
   }
 
-  const errorKind =
+  let errorKind =
     args.errorKind ??
     classifyUserError({
       fenBefore: args.fenBefore,
@@ -658,60 +883,69 @@ export function composeCoachNote(args: {
       pov,
     });
 
-  if (!errorKind && !moment) {
-    return parts.join(" ");
+  const wantGood =
+    !errorKind &&
+    !moment &&
+    (playedBest || args.deltaCp < 40) &&
+    shouldComposeNote({
+      perspective: "user",
+      deltaCp: args.deltaCp,
+      playedBest,
+      moment,
+      structure: args.themes,
+      errorKind: "good",
+      ply: args.ply,
+      userPlyCount: args.userPlyCount,
+    });
+  if (wantGood) errorKind = "good";
+
+  if (!errorKind && !moment && !plan) {
+    return "";
   }
 
-  if (moment) {
-    const bit = momentBit(moment, args.usedTips);
-    if (bit) parts.push(bit);
-  }
+  const turnBit = moment ? momentBit(moment, args.usedTips) : "";
 
-  if (args.concepts[0]) {
-    parts.push(
-      rephraseConcept(
-        args.concepts[0],
-        pov.attackSide,
-        pov,
-        args.usedTips,
-        citeKing
-      )
-    );
-  }
-
-  const preferMiss =
+  let judgment = "";
+  if (errorKind === "good") {
+    judgment = explainGoodMove({
+      san: args.san,
+      bestPvSan: args.bestPvSan,
+      themes: args.themes,
+      pov,
+      usedTips: args.usedTips,
+      citeKing,
+    });
+  } else if (
     errorKind === "missed_opportunity" ||
     (moment && !errorKind && args.deltaCp < 150) ||
-    (errorKind === "mistake" && citeKing && pov.oppKingExposed && !pov.userKingExposed);
-
-  if (preferMiss) {
-    parts.push(
-      explainUserMissed({
-        playedSan: args.san,
-        bestSan: args.bestSan,
-        bestPvSan: args.bestPvSan,
-        fenBefore: args.fenBefore,
-        userColor: args.userColor,
-        pov,
-        usedTips: args.usedTips,
-        citeKing,
-      })
-    );
-  } else if (errorKind || moment) {
-    parts.push(
-      explainUserMistake({
-        playedSan: args.san,
-        bestSan: args.bestSan,
-        bestPvSan: args.bestPvSan,
-        themes: args.themes,
-        pov,
-        usedTips: args.usedTips,
-        citeKing,
-      })
-    );
+    (errorKind === "mistake" && citeKing && pov.oppKingExposed && !pov.userKingExposed)
+  ) {
+    judgment = explainUserMissed({
+      playedSan: args.san,
+      bestSan: args.bestSan,
+      bestPvSan: args.bestPvSan,
+      fenBefore: args.fenBefore,
+      userColor: args.userColor,
+      pov,
+      usedTips: args.usedTips,
+      citeKing,
+    });
+  } else if (errorKind === "mistake" || moment) {
+    judgment = explainUserMistake({
+      playedSan: args.san,
+      bestSan: args.bestSan,
+      bestPvSan: args.bestPvSan,
+      themes: args.themes,
+      pov,
+      usedTips: args.usedTips,
+      citeKing,
+    });
   }
 
-  return parts.join(" ");
+  return assembleParts(
+    [plan, turnBit, ...conceptBits, judgment],
+    args.ply
+  );
 }
 
 export { assessPositionPov };

@@ -22,6 +22,9 @@ export {
   type EngineLine,
 } from "./analyzeGame";
 export { KNOWLEDGE_PACK } from "./knowledgePack";
+export { BOOK_ARCHIVE } from "./bookArchive";
+export { phasePlanNote, phasePlanSlotOpen } from "./phasePlans";
+
 export {
   loadCachedGameAnalysis,
   saveCachedGameAnalysis,
