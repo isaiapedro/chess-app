@@ -9,11 +9,12 @@ import { useTabSwipe } from "../context/TabSwipeContext";
 import { RecapScreen } from "../screens/RecapScreen";
 import { InsightsScreen } from "../screens/InsightsScreen";
 import { StudyScreen } from "../screens/StudyScreen";
+import { GamesScreen } from "../screens/GamesScreen";
 import { ProfileScreen } from "../screens/ProfileScreen";
 import { studyFiltersKey } from "../storage/studyCacheKeys";
 import { colors } from "../theme";
 
-const TAB_ORDER = ["Wrapped", "Insights", "Study", "Profile"] as const;
+const TAB_ORDER = ["Wrapped", "Insights", "Study", "Games", "Profile"] as const;
 const TAB_BAR_PADDING = 6;
 const TAB_GAP = 10;
 const TAB_PILL_SCALE = 0.945;
@@ -35,6 +36,7 @@ const TAB_ICONS: Record<TabName, keyof typeof Ionicons.glyphMap> = {
   Wrapped: "sync-outline",
   Insights: "bar-chart-outline",
   Study: "school-outline",
+  Games: "flash-outline",
   Profile: "person-outline",
 };
 
@@ -199,8 +201,13 @@ export function TabNavigator() {
             <StudyScreen />
           </TabFadePage>
         </View>
-        <View key="Profile" collapsable={false}>
+        <View key="Games" collapsable={false}>
           <TabFadePage active={activeIndex === 3} visitKey={visitKey}>
+            <GamesScreen />
+          </TabFadePage>
+        </View>
+        <View key="Profile" collapsable={false}>
+          <TabFadePage active={activeIndex === 4} visitKey={visitKey}>
             <ProfileScreen />
           </TabFadePage>
         </View>
