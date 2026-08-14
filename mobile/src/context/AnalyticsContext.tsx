@@ -14,19 +14,18 @@ import type { OpeningMixStats } from "../engine/openingMix";
 import type { StyleMetricsAggregate } from "../engine/styleMetrics";
 import { useAuth } from "./AuthContext";
 import { useFilters } from "./FilterContext";
-import { useScanLog } from "./ScanLogContext";
 import {
   ensureOpeningMix,
   ensureSession,
   ensureStyleMetrics,
   ensureVaultMetrics,
+  rebuildSessionDerived,
   remeshVaultFromBucket,
   type EndgamePhasePayload,
   type MiddlegamePhasePayload,
   type OpeningPhasePayload,
 } from "../storage/analyticsLoaders";
 import {
-  GLOBAL_FIRST_SCAN_MAX_GAMES,
   GLOBAL_MAX_GAMES,
 } from "../engine/analysisConfig";
 import {
@@ -60,8 +59,10 @@ function gameInDateRange(
   if (!dateFrom && !dateTo) return true;
   const day = String(createdAt || "").slice(0, 10);
   if (!day) return false;
-  if (dateFrom && day < dateFrom) return false;
-  if (dateTo && day > dateTo) return false;
+  const fromDay = dateFrom ? String(dateFrom).slice(0, 10) : "";
+  const toDay = dateTo ? String(dateTo).slice(0, 10) : "";
+  if (fromDay && day < fromDay) return false;
+  if (toDay && day > toDay) return false;
   return true;
 }
 
@@ -97,7 +98,7 @@ type AnalyticsState = {
   metricsReady: boolean;
   metricsScanned: number;
   metricsTotal: number;
-  refreshAnalytics: (forceNetwork?: boolean) => Promise<void>;
+  refreshAnalytics: (mode?: boolean | "pull") => Promise<void>;
   requestVaultMetrics: (force?: boolean) => void;
 };
 
@@ -106,8 +107,6 @@ const AnalyticsContext = createContext<AnalyticsState | null>(null);
 export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
   const auth = useAuth();
   const { queryFilters, refreshToken } = useFilters();
-  const { phase } = useScanLog();
-  const scanReady = phase === "done" || phase === "error";
   const [games, setGames] = useState<StudyGame[]>([]);
   const [gamesLoading, setGamesLoading] = useState(true);
   const [mix, setMix] = useState<OpeningMixStats | null>(null);
@@ -141,27 +140,7 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
   const vaultRunningRef = useRef(false);
   const vaultRunIdRef = useRef(0);
   const metricsRunIdRef = useRef(0);
-
-  const refreshStyleFromBucket = useCallback(
-    async (loadedGames: StudyGame[]) => {
-      const scoped = sortRecentGames(loadedGames).slice(0, GLOBAL_MAX_GAMES);
-      const resolved = await ensureStyleMetrics(queryFilters, {
-        games: scoped,
-      });
-      setStyle(resolved.style);
-      setStyleScanned(resolved.scanned);
-      setStyleTotal(resolved.total);
-      setStyleComplete(resolved.periodComplete);
-      // #region agent log
-      agentLog("A", "AnalyticsContext.tsx:styleFromBucket", "style loaded from vault", {
-        scanned: resolved.scanned,
-        total: resolved.total,
-        complete: resolved.periodComplete,
-      });
-      // #endregion
-    },
-    [queryFilters]
-  );
+  const coldTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const refreshVaultMetrics = useCallback(
     async (loadedGames: StudyGame[], options?: { force?: boolean }) => {
@@ -252,10 +231,45 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
     [queryFilters]
   );
 
-  const refreshVaultRemesh = useCallback(
-    async (loadedGames: StudyGame[]) => {
+  const clearPhaseMetrics = useCallback(() => {
+    setMix(null);
+    setStyle(null);
+    setStyleScanned(0);
+    setStyleTotal(0);
+    setStyleComplete(true);
+    setOpeningPhase(null);
+    setMiddlegamePhase(null);
+    setEndgamePhase(null);
+    setOpeningPhaseLoading(false);
+    setMiddlegamePhaseLoading(false);
+    setEndgamePhaseLoading(false);
+    markHeuristicsComplete();
+  }, []);
+
+  const remeshViewMetrics = useCallback(
+    async (
+      filters: typeof queryFilters,
+      loadedGames: StudyGame[],
+      viewKey: string
+    ) => {
       const scoped = sortRecentGames(loadedGames);
-      const remeshed = await remeshVaultFromBucket(queryFilters, scoped);
+      if (sessionKeyRef.current !== viewKey) return false;
+      if (!scoped.length) {
+        clearPhaseMetrics();
+        return true;
+      }
+      setOpeningPhaseLoading(true);
+      setMiddlegamePhaseLoading(true);
+      setEndgamePhaseLoading(true);
+      setStyleComplete(false);
+      setStyleTotal(Math.min(scoped.length, GLOBAL_MAX_GAMES));
+      const styleGames = scoped.slice(0, GLOBAL_MAX_GAMES);
+      const [remeshed, styleResolved, mixData] = await Promise.all([
+        remeshVaultFromBucket(filters, scoped),
+        ensureStyleMetrics(filters, { games: styleGames }),
+        ensureOpeningMix(filters, scoped, false),
+      ]);
+      if (sessionKeyRef.current !== viewKey) return false;
       if (remeshed) {
         setOpeningPhase(remeshed.opening);
         setOpeningPhaseLoading(false);
@@ -263,18 +277,40 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setMiddlegamePhaseLoading(false);
         setEndgamePhase(remeshed.endgame);
         setEndgamePhaseLoading(false);
-        // #region agent log
-        agentLog("A", "AnalyticsContext.tsx:remeshVault", "vault remesh from bucket", {
-          opening: remeshed.opening.analyzedCount,
-          middlegame: remeshed.middlegame.analyzedCount,
-          endgame: remeshed.endgame.analyzedCount,
-        });
-        // #endregion
-        return;
+      } else {
+        setOpeningPhase(null);
+        setMiddlegamePhase(null);
+        setEndgamePhase(null);
+        setOpeningPhaseLoading(false);
+        setMiddlegamePhaseLoading(false);
+        setEndgamePhaseLoading(false);
       }
-      void refreshVaultMetrics(scoped, { force: false });
+      setStyle(styleResolved.style);
+      setStyleScanned(styleResolved.scanned);
+      setStyleTotal(styleResolved.total);
+      setStyleComplete(styleResolved.periodComplete);
+      setMix(mixData);
+      lastStyleRefreshKey.current = viewKey;
+      // #region agent log
+      agentLog("A", "AnalyticsContext.tsx:remeshViewMetrics", "filter remesh only", {
+        viewKey,
+        games: scoped.length,
+        remeshed: Boolean(remeshed),
+        opening: remeshed?.opening.analyzedCount ?? 0,
+        styleScanned: styleResolved.scanned,
+      });
+      // #endregion
+      return Boolean(remeshed);
     },
-    [queryFilters, refreshVaultMetrics]
+    [clearPhaseMetrics]
+  );
+
+  const refreshVaultRemesh = useCallback(
+    async (loadedGames: StudyGame[]) => {
+      const viewKey = sessionKeyRef.current || studyFiltersKey(queryFilters);
+      return remeshViewMetrics(queryFilters, loadedGames, viewKey);
+    },
+    [queryFilters, remeshViewMetrics]
   );
 
   const requestVaultMetrics = useCallback(
@@ -288,16 +324,30 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
       // #endregion
       const list = gamesRef.current;
       if (!list.length) return;
-      void refreshVaultMetrics(list, { force });
+      if (force) {
+        void refreshVaultMetrics(list, { force: true });
+        return;
+      }
+      void refreshVaultRemesh(list);
     },
-    [refreshVaultMetrics]
+    [refreshVaultMetrics, refreshVaultRemesh]
   );
 
-  const applySpeedView = useCallback(
+  const applyFilterView = useCallback(
     (filters: typeof queryFilters, periodGames: StudyGame[]) => {
       const viewKey = studyFiltersKey(filters);
+      const dateFiltered =
+        filters.dateFrom || filters.dateTo
+          ? periodGames.filter((game) =>
+              gameInDateRange(
+                String(game.created_at || ""),
+                filters.dateFrom,
+                filters.dateTo
+              )
+            )
+          : periodGames;
       const filtered = sortRecentGames(
-        filterPeriodGamesBySpeed(periodGames, filters.speed)
+        filterPeriodGamesBySpeed(dateFiltered, filters.speed)
       );
       const asNorm = filtered as NormalizedGame[];
       sessionKeyRef.current = viewKey;
@@ -307,47 +357,27 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
       setRecap(buildLocalRecap(filters, asNorm));
       setInsights(buildLocalInsights(filters, asNorm));
       setGamesLoading(false);
-      setStyleTotal(Math.min(filtered.length, GLOBAL_MAX_GAMES));
       lastStyleRefreshKey.current = null;
       vaultSignalRef.current.cancelled = true;
       vaultSignalRef.current = { cancelled: false };
       vaultRunIdRef.current += 1;
       vaultRunningRef.current = false;
       if (!filtered.length) {
-        setMix(null);
-        setStyle(null);
-        setStyleScanned(0);
-        setStyleComplete(true);
-        setOpeningPhase(null);
-        setMiddlegamePhase(null);
-        setEndgamePhase(null);
-        setOpeningPhaseLoading(false);
-        setMiddlegamePhaseLoading(false);
-        setEndgamePhaseLoading(false);
-        markHeuristicsComplete();
+        clearPhaseMetrics();
         return;
       }
-      setOpeningPhaseLoading(true);
-      setMiddlegamePhaseLoading(true);
-      setEndgamePhaseLoading(true);
-      setStyleComplete(false);
-      void ensureOpeningMix(filters, filtered, false).then((mixData) => {
-        if (sessionKeyRef.current !== viewKey) return;
-        setMix(mixData);
-      });
       vaultRequestedRef.current = true;
+      void remeshViewMetrics(filters, filtered, viewKey);
     },
-    []
+    [clearPhaseMetrics, remeshViewMetrics]
   );
 
   const lastRefreshTokenRef = useRef(refreshToken);
 
   const refreshAnalytics = useCallback(
-    async (forceNetwork = false) => {
-      const runId = ++metricsRunIdRef.current;
-      recapSignalRef.current.cancelled = true;
-      recapSignalRef.current = { cancelled: false };
-      const recapSignal = recapSignalRef.current;
+    async (mode: boolean | "pull" = false) => {
+      const pullOnly = mode === "pull";
+      const forceNetwork = mode === true;
       const periodKey = analyticsPeriodKey(queryFilters);
       const viewKey = studyFiltersKey(queryFilters);
       const prevViewKey = sessionKeyRef.current;
@@ -355,21 +385,111 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
       const periodChanged =
         prevPeriodKey !== null && prevPeriodKey !== periodKey;
 
-      if (
-        !forceNetwork &&
-        hydratedPeriodKeyRef.current === periodKey
-      ) {
+      if (pullOnly) {
+        try {
+          const periodFilters = withoutSpeedFilter(queryFilters);
+          const prevIds = new Set(
+            periodGamesRef.current.map((g) => String(g.id))
+          );
+          const session = await ensureSession(periodFilters, "recent");
+          const periodGames = sortRecentGames(session.games);
+          const newGames = periodGames.filter(
+            (g) => !prevIds.has(String(g.id))
+          );
+          periodGamesRef.current = periodGames;
+          hydratedPeriodKeyRef.current = periodKey;
+          const viewGames = sortRecentGames(
+            filterPeriodGamesBySpeed(periodGames, queryFilters.speed)
+          );
+          // #region agent log
+          agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "pull recent games", {
+            periodKey,
+            viewKey,
+            periodGames: periodGames.length,
+            viewGames: viewGames.length,
+            newGames: newGames.length,
+            speed: queryFilters.speed || "all",
+          });
+          // #endregion
+          sessionKeyRef.current = viewKey;
+          setSessionKey(viewKey);
+          gamesRef.current = viewGames;
+          setGames(viewGames);
+          setGamesLoading(false);
+          lastStyleRefreshKey.current = viewKey;
+
+          InteractionManager.runAfterInteractions(() => {
+            if (recapSignalRef.current.cancelled) return;
+            void (async () => {
+              const derived = await rebuildSessionDerived(periodFilters);
+              if (recapSignalRef.current.cancelled) return;
+              if (derived) {
+                const speedActive = Boolean(queryFilters.speed);
+                setRecap(
+                  speedActive
+                    ? buildLocalRecap(queryFilters, viewGames as NormalizedGame[])
+                    : derived.recap
+                );
+                setInsights(
+                  speedActive
+                    ? buildLocalInsights(
+                        queryFilters,
+                        viewGames as NormalizedGame[]
+                      )
+                    : derived.insights
+                );
+              }
+              if (newGames.length && viewGames.length) {
+                void refreshVaultMetrics(viewGames, { force: false });
+                void ensureStyleMetrics(queryFilters, {
+                  games: viewGames.slice(0, GLOBAL_MAX_GAMES),
+                }).then((resolved) => {
+                  if (sessionKeyRef.current !== viewKey) return;
+                  setStyle(resolved.style);
+                  setStyleScanned(resolved.scanned);
+                  setStyleTotal(resolved.total);
+                  setStyleComplete(resolved.periodComplete);
+                });
+                void ensureOpeningMix(queryFilters, viewGames, true).then(
+                  (mixData) => {
+                    if (sessionKeyRef.current !== viewKey) return;
+                    setMix(mixData);
+                  }
+                );
+              }
+            })();
+          });
+        } catch {
+          setGamesLoading(false);
+        }
+        return;
+      }
+
+      if (!forceNetwork && hydratedPeriodKeyRef.current === periodKey) {
         if (prevViewKey === viewKey) return;
         // #region agent log
-        agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "speed-only view", {
+        agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "speed-only remesh", {
           periodKey,
           viewKey,
           periodGames: periodGamesRef.current.length,
         });
         // #endregion
-        applySpeedView(queryFilters, periodGamesRef.current);
+        applyFilterView(queryFilters, periodGamesRef.current);
         return;
       }
+
+      const runId = ++metricsRunIdRef.current;
+      recapSignalRef.current.cancelled = true;
+      if (coldTimerRef.current) {
+        clearTimeout(coldTimerRef.current);
+        coldTimerRef.current = null;
+      }
+      recapSignalRef.current = { cancelled: false };
+      const recapSignal = recapSignalRef.current;
+      const sameUserPlatform =
+        prevViewKey != null &&
+        prevViewKey.split("|").slice(0, 2).join("|") ===
+          viewKey.split("|").slice(0, 2).join("|");
 
       // #region agent log
       agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "session refresh start", {
@@ -383,11 +503,39 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
       sessionKeyRef.current = viewKey;
       setSessionKey(viewKey);
       setGamesLoading(true);
-      setOpeningPhaseLoading(true);
-      setMiddlegamePhaseLoading(true);
-      setEndgamePhaseLoading(true);
       lastStyleRefreshKey.current = null;
-      if (forceNetwork || periodChanged) {
+
+      if (periodChanged && !forceNetwork && sameUserPlatform) {
+        const prevPeriodGames = periodGamesRef.current;
+        const filteredPrev =
+          prevPeriodGames.length &&
+          (queryFilters.dateFrom || queryFilters.dateTo)
+            ? sortRecentGames(
+                prevPeriodGames.filter((game) =>
+                  gameInDateRange(
+                    String(game.created_at || ""),
+                    queryFilters.dateFrom,
+                    queryFilters.dateTo
+                  )
+                )
+              )
+            : prevPeriodGames.length
+              ? sortRecentGames(prevPeriodGames)
+              : [];
+        if (filteredPrev.length) {
+          periodGamesRef.current = filteredPrev;
+          hydratedPeriodKeyRef.current = periodKey;
+          applyFilterView(queryFilters, filteredPrev);
+        } else {
+          setOpeningPhaseLoading(true);
+          setMiddlegamePhaseLoading(true);
+          setEndgamePhaseLoading(true);
+        }
+        vaultSignalRef.current.cancelled = true;
+        vaultSignalRef.current = { cancelled: false };
+        vaultRunIdRef.current += 1;
+        vaultRunningRef.current = false;
+      } else if (forceNetwork || periodChanged) {
         hydratedPeriodKeyRef.current = null;
         resetBackgroundWork();
         vaultSignalRef.current.cancelled = true;
@@ -398,38 +546,6 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
           periodGamesRef.current = [];
           gamesRef.current = [];
           setGames([]);
-        } else {
-          const sameUserPlatform =
-            prevViewKey != null &&
-            prevViewKey.split("|").slice(0, 2).join("|") ===
-              viewKey.split("|").slice(0, 2).join("|");
-          const prevPeriodGames = periodGamesRef.current;
-          const filteredPrev =
-            sameUserPlatform &&
-            prevPeriodGames.length &&
-            (queryFilters.dateFrom || queryFilters.dateTo)
-              ? sortRecentGames(
-                  prevPeriodGames.filter((game) =>
-                    gameInDateRange(
-                      String(game.created_at || ""),
-                      queryFilters.dateFrom,
-                      queryFilters.dateTo
-                    )
-                  )
-                )
-              : [];
-          if (filteredPrev.length) {
-            periodGamesRef.current = filteredPrev;
-            const speedFiltered = filterPeriodGamesBySpeed(
-              filteredPrev,
-              queryFilters.speed
-            );
-            gamesRef.current = speedFiltered;
-            setGames(speedFiltered);
-          } else {
-            periodGamesRef.current = [];
-            setGames([]);
-          }
         }
         setMix(null);
         setStyle(null);
@@ -439,76 +555,238 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setOpeningPhase(null);
         setMiddlegamePhase(null);
         setEndgamePhase(null);
+        setOpeningPhaseLoading(true);
+        setMiddlegamePhaseLoading(true);
+        setEndgamePhaseLoading(true);
         setRecap(null);
         setInsights(null);
         vaultRequestedRef.current = false;
       }
 
       try {
-        await new Promise<void>((resolve) => {
-          requestAnimationFrame(() => {
-            InteractionManager.runAfterInteractions(() => resolve());
-          });
-        });
-        if (metricsRunIdRef.current !== runId) return;
         const periodFilters = withoutSpeedFilter(queryFilters);
-        const session = await ensureSession(periodFilters, false);
-        if (metricsRunIdRef.current !== runId || recapSignal.cancelled) return;
+        const sessionT0 = Date.now();
 
-        const periodGames = sortRecentGames(session.games);
-        periodGamesRef.current = periodGames;
-        const viewGames = sortRecentGames(
-          filterPeriodGamesBySpeed(periodGames, queryFilters.speed)
-        );
-        gamesRef.current = viewGames;
-        setGames(viewGames);
-        setRecap(buildLocalRecap(queryFilters, viewGames as NormalizedGame[]));
-        setInsights(
-          buildLocalInsights(queryFilters, viewGames as NormalizedGame[])
-        );
-        setGamesLoading(false);
-        if (!viewGames.length) {
-          markHeuristicsComplete();
-          setOpeningPhaseLoading(false);
-          setMiddlegamePhaseLoading(false);
-          setEndgamePhaseLoading(false);
+        if (forceNetwork) {
+          const session = await ensureSession(periodFilters, true);
+          // #region agent log
+          agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "ensureSession done", {
+            ms: Date.now() - sessionT0,
+            games: session.games.length,
+            periodKey,
+            mode: "force",
+          });
+          // #endregion
+          if (metricsRunIdRef.current !== runId || recapSignal.cancelled) {
+            if (metricsRunIdRef.current === runId) setGamesLoading(false);
+            return;
+          }
+
+          const periodGames = sortRecentGames(session.games);
+          periodGamesRef.current = periodGames;
+          const viewGames = sortRecentGames(
+            filterPeriodGamesBySpeed(periodGames, queryFilters.speed)
+          );
+          gamesRef.current = viewGames;
+          setGames(viewGames);
+          const speedActive = Boolean(queryFilters.speed);
+          setRecap(
+            speedActive
+              ? buildLocalRecap(queryFilters, viewGames as NormalizedGame[])
+              : session.recap
+          );
+          setInsights(
+            speedActive
+              ? buildLocalInsights(queryFilters, viewGames as NormalizedGame[])
+              : session.insights
+          );
+          setGamesLoading(false);
+          hydratedPeriodKeyRef.current = periodKey;
+          lastStyleRefreshKey.current = viewKey;
+
+          void loadBaselineStore(false).then((peerStore) => {
+            if (metricsRunIdRef.current !== runId) return;
+            if (peerStore) setBaselines(peerStore);
+          });
+
+          if (!viewGames.length) {
+            clearPhaseMetrics();
+            return;
+          }
+
+          vaultRequestedRef.current = true;
+          setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
+          void refreshVaultMetrics(viewGames, { force: false });
+          void ensureOpeningMix(queryFilters, viewGames, false).then(
+            (mixData) => {
+              if (metricsRunIdRef.current !== runId) return;
+              setMix(mixData);
+            }
+          );
+          return;
         }
-        setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
-        const evalQueue = Math.min(
-          viewGames.length,
-          GLOBAL_FIRST_SCAN_MAX_GAMES
+
+        const soft = await ensureSession(periodFilters, false);
+        if (metricsRunIdRef.current !== runId || recapSignal.cancelled) {
+          if (metricsRunIdRef.current === runId) setGamesLoading(false);
+          return;
+        }
+
+        const softPeriod = sortRecentGames(soft.games);
+        periodGamesRef.current = softPeriod;
+        const softView = sortRecentGames(
+          filterPeriodGamesBySpeed(softPeriod, queryFilters.speed)
         );
+        const softHasGames = softView.length > 0;
+        if (softHasGames) {
+          gamesRef.current = softView;
+          setGames(softView);
+          setRecap(soft.recap);
+          setInsights(soft.insights);
+          setGamesLoading(false);
+          hydratedPeriodKeyRef.current = periodKey;
+          lastStyleRefreshKey.current = viewKey;
+        }
+
+        // #region agent log
+        agentLog("E", "AnalyticsContext.tsx:refreshAnalytics", "soft paint done", {
+          ms: Date.now() - sessionT0,
+          games: softView.length,
+          periodKey,
+        });
+        // #endregion
 
         void loadBaselineStore(false).then((peerStore) => {
           if (metricsRunIdRef.current !== runId) return;
           if (peerStore) setBaselines(peerStore);
         });
 
-        vaultRequestedRef.current = true;
-        void refreshVaultMetrics(viewGames, { force: false });
+        const prevIds = new Set(softPeriod.map((g) => String(g.id)));
+        const speedActive = Boolean(queryFilters.speed);
+        const coldDelayMs = softHasGames ? 1800 : 0;
+        if (coldTimerRef.current) clearTimeout(coldTimerRef.current);
+        coldTimerRef.current = setTimeout(() => {
+          coldTimerRef.current = null;
+          InteractionManager.runAfterInteractions(() => {
+            if (metricsRunIdRef.current !== runId || recapSignal.cancelled) {
+              return;
+            }
+            void (async () => {
+              try {
+                const session = await ensureSession(periodFilters, "recent");
+                if (metricsRunIdRef.current !== runId || recapSignal.cancelled) {
+                  if (metricsRunIdRef.current === runId) setGamesLoading(false);
+                  return;
+                }
 
-        const mixData = await ensureOpeningMix(
-          queryFilters,
-          viewGames,
-          false
-        );
-        if (metricsRunIdRef.current !== runId) return;
-        setMix(mixData);
-        hydratedPeriodKeyRef.current = periodKey;
+                const periodGames = sortRecentGames(session.games);
+                const viewGames = sortRecentGames(
+                  filterPeriodGamesBySpeed(periodGames, queryFilters.speed)
+                );
+                const newGames = periodGames.filter(
+                  (g) => !prevIds.has(String(g.id))
+                );
+                const gamesChanged =
+                  newGames.length > 0 ||
+                  periodGames.length !== softPeriod.length;
 
-        // #region agent log
-        agentLog(
-          "F",
-          "AnalyticsContext.tsx:refreshAnalytics",
-          "session bundle done, vault already started",
-          {
-            periodGames: periodGames.length,
-            viewGames: viewGames.length,
-            evalQueue,
-            vaultRequested: vaultRequestedRef.current,
-          }
-        );
-        // #endregion
+                periodGamesRef.current = periodGames;
+                gamesRef.current = viewGames;
+                setGames(viewGames);
+                setRecap(
+                  speedActive
+                    ? buildLocalRecap(
+                        queryFilters,
+                        viewGames as NormalizedGame[]
+                      )
+                    : session.recap
+                );
+                setInsights(
+                  speedActive
+                    ? buildLocalInsights(
+                        queryFilters,
+                        viewGames as NormalizedGame[]
+                      )
+                    : session.insights
+                );
+                setGamesLoading(false);
+                hydratedPeriodKeyRef.current = periodKey;
+                lastStyleRefreshKey.current = viewKey;
+
+                // #region agent log
+                agentLog(
+                  "E",
+                  "AnalyticsContext.tsx:coldBackground",
+                  "recent merge done",
+                  {
+                    ms: Date.now() - sessionT0,
+                    games: viewGames.length,
+                    newGames: newGames.length,
+                    gamesChanged,
+                    periodKey,
+                  }
+                );
+                // #endregion
+
+                if (!viewGames.length) {
+                  clearPhaseMetrics();
+                  return;
+                }
+
+                if (!gamesChanged && softHasGames) {
+                  setOpeningPhaseLoading(false);
+                  setMiddlegamePhaseLoading(false);
+                  setEndgamePhaseLoading(false);
+                  if (!vaultRequestedRef.current) {
+                    vaultRequestedRef.current = true;
+                    lastStyleRefreshKey.current = viewKey;
+                    void remeshViewMetrics(queryFilters, viewGames, viewKey);
+                  }
+                  return;
+                }
+
+                setOpeningPhaseLoading(true);
+                setMiddlegamePhaseLoading(true);
+                setEndgamePhaseLoading(true);
+
+                vaultRequestedRef.current = true;
+                lastStyleRefreshKey.current = viewKey;
+                if (periodChanged && sameUserPlatform) {
+                  await remeshViewMetrics(queryFilters, viewGames, viewKey);
+                } else {
+                  setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
+                  void refreshVaultMetrics(viewGames, { force: false });
+                  void ensureOpeningMix(queryFilters, viewGames, false).then(
+                    (mixData) => {
+                      if (metricsRunIdRef.current !== runId) return;
+                      setMix(mixData);
+                    }
+                  );
+                }
+
+                // #region agent log
+                agentLog(
+                  "F",
+                  "AnalyticsContext.tsx:coldBackground",
+                  "insights + vault scheduled",
+                  {
+                    periodGames: periodGames.length,
+                    viewGames: viewGames.length,
+                    vaultRequested: vaultRequestedRef.current,
+                  }
+                );
+                // #endregion
+              } catch {
+                if (metricsRunIdRef.current === runId) {
+                  setGamesLoading(false);
+                  setOpeningPhaseLoading(false);
+                  setMiddlegamePhaseLoading(false);
+                  setEndgamePhaseLoading(false);
+                }
+              }
+            })();
+          });
+        }, coldDelayMs);
       } catch {
         if (metricsRunIdRef.current !== runId) return;
         setGamesLoading(false);
@@ -517,34 +795,43 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         setEndgamePhaseLoading(false);
       }
     },
-    [queryFilters, refreshVaultMetrics, applySpeedView]
+    [
+      queryFilters,
+      refreshVaultMetrics,
+      applyFilterView,
+      remeshViewMetrics,
+      clearPhaseMetrics,
+    ]
   );
 
   useEffect(() => {
     if (!auth.ready) return;
+    if (auth.isLoggedIn && !queryFilters.username.trim()) return;
     const force = lastRefreshTokenRef.current !== refreshToken;
     lastRefreshTokenRef.current = refreshToken;
     void refreshAnalytics(force);
     return () => {
       recapSignalRef.current.cancelled = true;
+      if (coldTimerRef.current) {
+        clearTimeout(coldTimerRef.current);
+        coldTimerRef.current = null;
+      }
     };
-  }, [auth.ready, refreshAnalytics, refreshToken]);
+  }, [
+    auth.ready,
+    auth.isLoggedIn,
+    queryFilters.username,
+    refreshAnalytics,
+    refreshToken,
+  ]);
 
   useEffect(() => {
-    if (!scanReady || !sessionKey || gamesLoading) return;
+    if (!sessionKey || gamesLoading) return;
     if (!games.length) return;
     if (lastStyleRefreshKey.current === sessionKey) return;
     lastStyleRefreshKey.current = sessionKey;
-    void refreshStyleFromBucket(games);
     void refreshVaultRemesh(games);
-  }, [
-    scanReady,
-    sessionKey,
-    games,
-    gamesLoading,
-    refreshStyleFromBucket,
-    refreshVaultRemesh,
-  ]);
+  }, [sessionKey, games, gamesLoading, refreshVaultRemesh]);
 
   const noGames = !gamesLoading && games.length === 0;
   const openingReady =
@@ -580,39 +867,6 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
     !gamesLoading &&
     mix != null &&
     (noGames || (openingReady && middlegameReady && endgameReady));
-
-  useEffect(() => {
-    // #region agent log
-    const id = setInterval(() => {
-      agentLog("D", "AnalyticsContext.tsx:heartbeat", "js heartbeat", {
-        metricsReady,
-        styleComplete,
-        openingLoading: openingPhaseLoading,
-        middlegameLoading: middlegamePhaseLoading,
-        endgameLoading: endgamePhaseLoading,
-        styleScanned,
-        styleTotal,
-        openingAnalyzed: openingPhase?.analyzedCount ?? null,
-        middlegameAnalyzed: middlegamePhase?.analyzedCount ?? null,
-        endgameAnalyzed: endgamePhase?.analyzedCount ?? null,
-        scanPhase: phase,
-      });
-    }, 2000);
-    return () => clearInterval(id);
-    // #endregion
-  }, [
-    metricsReady,
-    styleComplete,
-    openingPhaseLoading,
-    middlegamePhaseLoading,
-    endgamePhaseLoading,
-    styleScanned,
-    styleTotal,
-    openingPhase,
-    middlegamePhase,
-    endgamePhase,
-    phase,
-  ]);
 
   const value = useMemo<AnalyticsState>(
     () => ({

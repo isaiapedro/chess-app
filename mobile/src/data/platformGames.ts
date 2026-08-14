@@ -1,5 +1,4 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Chess } from "chess.js";
 import type { QueryFilters } from "../api/client";
 import type { Platform, Timeframe } from "../api/types";
 import type { StudyGame } from "../engine/analyzeMistakes";
@@ -12,6 +11,22 @@ import { takeInflight } from "../storage/cache";
 const STORE_PREFIX = "@chess-wrapped:user-games:v1:";
 const META_SUFFIX = ":meta";
 const GAMES_FETCH_TTL_MS = 24 * 60 * 60 * 1000;
+const PLATFORM_LIST_TIMEOUT_MS = 20_000;
+const PLATFORM_GAMES_TIMEOUT_MS = 180_000;
+
+async function fetchWithTimeout(
+  url: string,
+  init: RequestInit = {},
+  timeoutMs = PLATFORM_GAMES_TIMEOUT_MS
+): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
 
 export type PlatformGamesAuth = {
   email?: string | null;
@@ -201,6 +216,16 @@ async function storeIsFresh(
   return Date.now() / 1000 - last < GAMES_FETCH_TTL_MS / 1000;
 }
 
+function recentPullSinceMs(
+  store: UserGamesStore,
+  lastFetchedAtSec: number
+): number {
+  if (lastFetchedAtSec > 0) return Math.floor(lastFetchedAtSec * 1000);
+  const watermark = Number(store.watermark || 0);
+  if (watermark > 0) return watermark;
+  return 0;
+}
+
 function mergeGamesById(
   existing: Array<Record<string, unknown>>,
   incoming: Array<Record<string, unknown>>,
@@ -297,23 +322,27 @@ async function fetchLichessApi(
   if (authCreds.lichessAccessToken) {
     headers.Authorization = `Bearer ${authCreds.lichessAccessToken}`;
   }
-  const res = await fetch(
-    `https://lichess.org/api/games/user/${encodeURIComponent(username)}?${params}`,
-    { headers }
-  );
-  if (!res.ok) return null;
-  const text = (await res.text()).trim();
-  if (!text) return [];
-  const games: Array<Record<string, unknown>> = [];
-  for (const line of text.split("\n")) {
-    if (!line) continue;
-    try {
-      games.push(JSON.parse(line) as Record<string, unknown>);
-    } catch {
-      void 0;
+  try {
+    const res = await fetchWithTimeout(
+      `https://lichess.org/api/games/user/${encodeURIComponent(username)}?${params}`,
+      { headers }
+    );
+    if (!res.ok) return null;
+    const text = (await res.text()).trim();
+    if (!text) return [];
+    const games: Array<Record<string, unknown>> = [];
+    for (const line of text.split("\n")) {
+      if (!line) continue;
+      try {
+        games.push(JSON.parse(line) as Record<string, unknown>);
+      } catch {
+        void 0;
+      }
     }
+    return games;
+  } catch {
+    return null;
   }
-  return games;
 }
 
 function filterLichessSince(
@@ -331,6 +360,7 @@ async function fetchLichessGamesRaw(
 ): Promise<Array<Record<string, unknown>>> {
   const platform: Platform = "lichess";
   let store = await loadStore(platform, username);
+
   if (store && !force) {
     const covers = coverageCovers(
       await coverageSinceOf(platform, username, store),
@@ -398,8 +428,9 @@ async function fetchLichessGamesRaw(
     return filterLichessSince(games, sinceMs);
   }
 
-  const watermark = Number(store.watermark || 0);
-  const incoming = await fetchLichessApi(username, watermark);
+  const lastFetched = await readLastFetchedAt(platform, username, store);
+  const pullSince = recentPullSinceMs(store, lastFetched);
+  const incoming = await fetchLichessApi(username, pullSince);
   const existing = (await loadStore(platform, username)) || store;
   let games = existing.games || [];
   if (incoming == null) return filterLichessSince(games, sinceMs);
@@ -450,14 +481,19 @@ function chesscomArchiveUrl(
   return `https://api.chess.com/pub/player/${username.toLowerCase()}/games/${year}/${String(month).padStart(2, "0")}`;
 }
 
-async function chesscomListArchives(username: string): Promise<string[]> {
-  const res = await fetch(
-    `https://api.chess.com/pub/player/${username.toLowerCase()}/games/archives`,
-    { headers: { "User-Agent": chesscomUserAgent() } }
-  );
-  if (!res.ok) return [];
-  const body = (await res.json()) as { archives?: string[] };
-  return body.archives || [];
+async function chesscomListArchives(username: string): Promise<string[] | null> {
+  try {
+    const res = await fetchWithTimeout(
+      `https://api.chess.com/pub/player/${username.toLowerCase()}/games/archives`,
+      { headers: { "User-Agent": chesscomUserAgent() } },
+      PLATFORM_LIST_TIMEOUT_MS
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { archives?: string[] };
+    return body.archives || [];
+  } catch {
+    return null;
+  }
 }
 
 function archivesOverlappingSince(
@@ -473,22 +509,31 @@ function archivesOverlappingSince(
 
 async function fetchChesscomArchive(
   archiveUrl: string
-): Promise<Array<Record<string, unknown>>> {
-  const res = await fetch(archiveUrl, {
-    headers: { "User-Agent": chesscomUserAgent() },
-  });
-  if (!res.ok) return [];
-  const body = (await res.json()) as { games?: Array<Record<string, unknown>> };
-  return body.games || [];
+): Promise<Array<Record<string, unknown>> | null> {
+  try {
+    const res = await fetchWithTimeout(archiveUrl, {
+      headers: { "User-Agent": chesscomUserAgent() },
+    });
+    if (!res.ok) return null;
+    const body = (await res.json()) as { games?: Array<Record<string, unknown>> };
+    return body.games || [];
+  } catch {
+    return null;
+  }
 }
 
 async function fetchChesscomArchives(
   archives: string[]
-): Promise<Array<Record<string, unknown>>> {
+): Promise<Array<Record<string, unknown>> | null> {
   const fetched: Array<Record<string, unknown>> = [];
+  let anyOk = false;
   for (const url of archives) {
-    fetched.push(...(await fetchChesscomArchive(url)));
+    const page = await fetchChesscomArchive(url);
+    if (page == null) continue;
+    anyOk = true;
+    fetched.push(...page);
   }
+  if (!anyOk && archives.length) return null;
   return mergeGamesById([], fetched, chesscomGameId);
 }
 
@@ -497,23 +542,31 @@ async function chesscomRefreshHead(
   games: Array<Record<string, unknown>>
 ): Promise<Array<Record<string, unknown>>> {
   const now = new Date();
-  const currentUrl = chesscomArchiveUrl(username, now.getFullYear(), now.getMonth() + 1);
-  const headGames = await fetchChesscomArchive(currentUrl);
+  const currentKey = `${now.getFullYear()}-${now.getMonth() + 1}`;
   const prevMonth = now.getMonth() === 0 ? 12 : now.getMonth();
   const prevYear = now.getMonth() === 0 ? now.getFullYear() - 1 : now.getFullYear();
+  const prevKey = `${prevYear}-${prevMonth}`;
+  const currentUrl = chesscomArchiveUrl(username, now.getFullYear(), now.getMonth() + 1);
   const prevUrl = chesscomArchiveUrl(username, prevYear, prevMonth);
+  const headGames = await fetchChesscomArchive(currentUrl);
   const prevGames = await fetchChesscomArchive(prevUrl);
-  const headMonths = new Set([
-    `${now.getFullYear()}-${now.getMonth() + 1}`,
-    `${prevYear}-${prevMonth}`,
-  ]);
+  if (headGames == null && prevGames == null) {
+    return games;
+  }
+  const replaceMonths = new Set<string>();
+  if (headGames != null) replaceMonths.add(currentKey);
+  if (prevGames != null) replaceMonths.add(prevKey);
   const retained = games.filter((game) => {
     const end = chesscomGameEnd(game);
     if (end <= 0) return true;
     const dt = new Date(end * 1000);
-    return !headMonths.has(`${dt.getFullYear()}-${dt.getMonth() + 1}`);
+    return !replaceMonths.has(`${dt.getFullYear()}-${dt.getMonth() + 1}`);
   });
-  return mergeGamesById(retained, [...prevGames, ...headGames], chesscomGameId);
+  const incoming = [
+    ...(prevGames || []),
+    ...(headGames || []),
+  ];
+  return mergeGamesById(retained, incoming, chesscomGameId);
 }
 
 function filterChesscomSince(
@@ -542,6 +595,7 @@ async function fetchChesscomGamesRaw(
 ): Promise<Array<Record<string, unknown>>> {
   const platform: Platform = "chesscom";
   let store = await loadStore(platform, username);
+
   if (store && !force) {
     const covers = coverageCovers(
       await coverageSinceOf(platform, username, store),
@@ -553,12 +607,13 @@ async function fetchChesscomGamesRaw(
   }
 
   if (!store) {
-    const archives = archivesOverlappingSince(
-      await chesscomListArchives(username),
-      sinceTimestamp
-    );
+    const listed = await chesscomListArchives(username);
+    if (listed == null) return [];
+    const archives = archivesOverlappingSince(listed, sinceTimestamp);
     if (!archives.length) return [];
     const fetched = await fetchChesscomArchives(archives);
+    if (fetched == null) return [];
+    if (!fetched.length) return [];
     const existing = await loadStore(platform, username);
     let games: Array<Record<string, unknown>>;
     let coverageSince: number;
@@ -589,13 +644,17 @@ async function fetchChesscomGamesRaw(
     sinceTimestamp
   );
   if (!covers) {
-    const archives = archivesOverlappingSince(
-      await chesscomListArchives(username),
-      sinceTimestamp
-    );
+    const listed = await chesscomListArchives(username);
+    if (listed == null) {
+      return filterChesscomSince(store.games || [], sinceTimestamp);
+    }
+    const archives = archivesOverlappingSince(listed, sinceTimestamp);
     const fetched = archives.length
       ? await fetchChesscomArchives(archives)
       : [];
+    if (fetched == null) {
+      return filterChesscomSince(store.games || [], sinceTimestamp);
+    }
     const existing = (await loadStore(platform, username)) || store;
     let games = existing.games || [];
     const coverageSince = await mergedCoverageSince(
@@ -647,13 +706,17 @@ async function fetchChesscomGamesRaw(
 
 function movesFromPgn(pgnStr: string): string {
   if (!pgnStr?.trim()) return "";
-  try {
-    const chess = new Chess();
-    chess.loadPgn(pgnStr);
-    return chess.history().join(" ");
-  } catch {
-    return "";
-  }
+  const body = pgnStr
+    .replace(/\[[^\]]*\]/g, " ")
+    .replace(/\{[^}]*\}/g, " ")
+    .replace(/;.*$/gm, " ")
+    .replace(/\([^)]*\)/g, " ");
+  return body
+    .replace(/\d+\.(\.\.)?/g, " ")
+    .replace(/[!?+#]+/g, " ")
+    .replace(/\b(1-0|0-1|1\/2-1\/2|\*)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function toIso(tsSecondsOrMs: number): string {
@@ -811,6 +874,8 @@ export function filterNormalizedGames(
   games: NormalizedGame[],
   filters: QueryFilters
 ): NormalizedGame[] {
+  const fromDay = filters.dateFrom ? String(filters.dateFrom).slice(0, 10) : "";
+  const toDay = filters.dateTo ? String(filters.dateTo).slice(0, 10) : "";
   return games.filter((g) => {
     if (
       filters.speed &&
@@ -826,8 +891,8 @@ export function filterNormalizedGames(
     }
     if (filters.result && g.result !== filters.result) return false;
     const key = dateKey(g.created_at);
-    if (filters.dateFrom && key && key < filters.dateFrom) return false;
-    if (filters.dateTo && key && key > filters.dateTo) return false;
+    if (fromDay && key && key < fromDay) return false;
+    if (toDay && key && key > toDay) return false;
     return true;
   });
 }
@@ -867,6 +932,23 @@ export async function ingestPlatformGames(
   return parseLichessGames(raw, username);
 }
 
+async function readStoredPlatformGames(
+  username: string,
+  platform: Platform,
+  timeframe: Timeframe | string
+): Promise<NormalizedGame[]> {
+  if (!username.trim()) return [];
+  const store = await loadStore(platform, username);
+  if (!store?.games?.length) return [];
+  const { sinceTimestamp, sinceMs } = sinceForTimeframe(timeframe);
+  if (platform === "chesscom") {
+    const raw = filterChesscomSince(store.games || [], sinceTimestamp);
+    return parseChesscomGames(raw, username);
+  }
+  const raw = filterLichessSince(store.games || [], sinceMs);
+  return parseLichessGames(raw, username);
+}
+
 export type LocalGamesPage = {
   games: StudyGame[];
   total: number;
@@ -880,6 +962,7 @@ export async function loadLocalGamesPage(
   filters: QueryFilters,
   options?: {
     force?: boolean;
+    network?: boolean;
     limit?: number;
     offset?: number;
   }
@@ -900,6 +983,8 @@ export async function loadLocalGamesPage(
       has_more: false,
     };
   }
+  const allowNetwork =
+    options?.force === true || options?.network === true;
   const fk = [
     filters.platform,
     username.toLowerCase(),
@@ -909,17 +994,23 @@ export async function loadLocalGamesPage(
     filters.result || "_",
     filters.dateFrom || "_",
     filters.dateTo || "_",
-    options?.force ? "force" : "soft",
+    allowNetwork ? (options?.force ? "force" : "soft-net") : "store",
     String(limit),
     String(offset),
   ].join("|");
   return takeInflight(`local-ingest:${fk}`, async () => {
-    const ingested = await ingestPlatformGames(
-      username,
-      filters.platform,
-      filters.timeframe,
-      Boolean(options?.force)
-    );
+    const ingested = allowNetwork
+      ? await ingestPlatformGames(
+          username,
+          filters.platform,
+          filters.timeframe,
+          Boolean(options?.force)
+        )
+      : await readStoredPlatformGames(
+          username,
+          filters.platform,
+          filters.timeframe
+        );
     await new Promise<void>((resolve) => {
       if (typeof requestAnimationFrame === "function") {
         requestAnimationFrame(() => resolve());
@@ -947,6 +1038,7 @@ export async function findLocalGameById(
   gameId: string
 ): Promise<NormalizedGame | null> {
   const page = await loadLocalGamesPage(filters, {
+    network: false,
     limit: GAMES_PAGE_SIZE,
     offset: 0,
   });

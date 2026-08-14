@@ -1,14 +1,24 @@
 import { Chess, type Square } from "chess.js";
-import { GLOBAL_DEPTH } from "../analysisConfig";
-import { applyUciMove, fenKey, uciFromMove } from "../chessMoves";
+import {
+  COACH_ANALYZE_MULTIPV,
+  REFINE_DEPTH,
+  REFINE_MOVETIME,
+} from "../analysisConfig";
+import { applyUciMove, fenKey, sanToUci, uciFromMove } from "../chessMoves";
 import { toWhiteCp } from "../analyzeMistakes";
+import type { StudyGame } from "../analyzeMistakes";
 import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
+import {
+  analyzeEvalBucketMetrics,
+} from "../evalBucketMetrics";
 import {
   getSharedGameRecord,
   loadPermanentEvalStore,
   upsertSharedGameEvals,
+  type GlobalGameRecord,
   type PositionEval,
 } from "../globalAnalysis";
+import type { MistakeItem } from "../../api/client";
 import {
   classifyCoachMark,
   coachMissedFromPending,
@@ -453,6 +463,173 @@ function evalFromSharedPosition(hit: PositionEval): EngineEvalResult {
   };
 }
 
+/** Vault stores engine STM scores in `cpWhite`; coach plies use White-POV. */
+function stmCpFromWhite(fen: string, whiteCp: number): number {
+  const turn = fen.split(" ")[1];
+  return turn === "b" ? -whiteCp : whiteCp;
+}
+
+function whiteCpFromSeries(
+  series: number[] | undefined,
+  index: number
+): number | null {
+  if (!series || index < 0 || index >= series.length) return null;
+  const v = series[index];
+  return Number.isFinite(v) ? v : null;
+}
+
+const OPENING_CANDIDATE_MAX_PLY = 20;
+const MISTAKE_CANDIDATE_MIN_PLY = 12;
+const CANDIDATE_MIN_DROP_CP = 100;
+const MAX_VAULT_CANDIDATES = 3;
+
+function buildVaultProductFromPlies(args: {
+  gameId: string;
+  pgn?: string | null;
+  moves?: string | null;
+  eco?: string | null;
+  opening?: string | null;
+  userColor?: string | null;
+  plies: GameCoachPly[];
+  positions: Record<string, PositionEval>;
+}): {
+  positions: Record<string, PositionEval>;
+  evalsWhiteCp: number[];
+  mistakeCandidates: MistakeItem[];
+  openingCandidates: MistakeItem[];
+  opening_accuracy_pct: number | null;
+  opening_accuracy_moves: number;
+  endgameEval: GlobalGameRecord["endgameEval"];
+  middlegameEval: GlobalGameRecord["middlegameEval"];
+  style: GlobalGameRecord["style"];
+} {
+  const positions: Record<string, PositionEval> = { ...args.positions };
+  const evalsWhiteCp: number[] = [];
+  const openingCandidates: MistakeItem[] = [];
+  const mistakeCandidates: MistakeItem[] = [];
+  const userColor = normalizeUserColor(args.userColor);
+
+  if (args.plies.length) {
+    const start = args.plies[0];
+    if (start.evalBeforeCp != null) {
+      evalsWhiteCp.push(start.evalBeforeCp);
+      const key = fenKey(start.fenBefore);
+      if (!positions[key]) {
+        positions[key] = {
+          cpWhite: stmCpFromWhite(start.fenBefore, start.evalBeforeCp),
+          bestUci: null,
+        };
+      }
+    }
+  }
+
+  for (const ply of args.plies) {
+    if (ply.evalAfterCp != null) evalsWhiteCp.push(ply.evalAfterCp);
+
+    const beforeKey = fenKey(ply.fenBefore);
+    if (ply.evalBeforeCp != null) {
+      const bestUci =
+        positions[beforeKey]?.bestUci ||
+        (ply.bestSan ? sanToUci(ply.fenBefore, ply.bestSan) : null) ||
+        null;
+      positions[beforeKey] = {
+        cpWhite: stmCpFromWhite(ply.fenBefore, ply.evalBeforeCp),
+        bestUci,
+      };
+    }
+
+    const afterKey = fenKey(ply.fenAfter);
+    if (ply.evalAfterCp != null && !positions[afterKey]) {
+      positions[afterKey] = {
+        cpWhite: stmCpFromWhite(ply.fenAfter, ply.evalAfterCp),
+        bestUci: null,
+      };
+    }
+
+    const isUser = ply.side === userColor;
+    if (
+      !isUser ||
+      ply.evalBeforeCp == null ||
+      ply.evalAfterCp == null ||
+      ply.mark == null
+    ) {
+      continue;
+    }
+    const userIsWhite = userColor === "white";
+    const userBefore = userIsWhite ? ply.evalBeforeCp : -ply.evalBeforeCp;
+    const userAfter = userIsWhite ? ply.evalAfterCp : -ply.evalAfterCp;
+    const drop = userBefore - userAfter;
+    if (drop < CANDIDATE_MIN_DROP_CP) continue;
+    if (
+      ply.mark !== "inaccuracy" &&
+      ply.mark !== "mistake" &&
+      ply.mark !== "blunder" &&
+      ply.mark !== "missed"
+    ) {
+      continue;
+    }
+
+    const zeroBasedPly = Math.max(0, ply.ply - 1);
+    const item: MistakeItem = {
+      game_id: args.gameId,
+      created_at: "",
+      opening_name: args.opening || undefined,
+      opening_eco: args.eco || undefined,
+      user_color: userColor,
+      result: "",
+      ply: zeroBasedPly,
+      move_number: ply.fullmove,
+      fen: ply.fenBefore,
+      played_uci: ply.uci,
+      played_san: ply.san,
+      best_uci: positions[beforeKey]?.bestUci || null,
+      best_san: ply.bestSan,
+      eval_before_cp: Math.round(ply.evalBeforeCp * 10) / 10,
+      eval_after_cp: Math.round(ply.evalAfterCp * 10) / 10,
+      eval_delta_cp: Math.round((ply.evalAfterCp - ply.evalBeforeCp) * 10) / 10,
+      eval_drop_cp: Math.round(drop * 10) / 10,
+      comment: `Your position worsened by ~${Math.round(drop)} cp after ${ply.san}.`,
+    };
+
+    if (
+      zeroBasedPly < OPENING_CANDIDATE_MAX_PLY &&
+      openingCandidates.length < MAX_VAULT_CANDIDATES
+    ) {
+      openingCandidates.push(item);
+    }
+    if (
+      zeroBasedPly >= MISTAKE_CANDIDATE_MIN_PLY &&
+      mistakeCandidates.length < MAX_VAULT_CANDIDATES
+    ) {
+      mistakeCandidates.push(item);
+    }
+  }
+
+  const stubGame = {
+    id: args.gameId,
+    created_at: "",
+    opening_name: args.opening,
+    opening_eco: args.eco,
+    user_color: userColor,
+    result: "",
+    pgn_str: args.pgn,
+    moves_str: args.moves,
+  } as StudyGame;
+  const bucket = analyzeEvalBucketMetrics(stubGame, evalsWhiteCp);
+
+  return {
+    positions,
+    evalsWhiteCp,
+    mistakeCandidates,
+    openingCandidates,
+    opening_accuracy_pct: bucket.opening_accuracy_pct,
+    opening_accuracy_moves: bucket.opening_accuracy_moves,
+    endgameEval: bucket.endgameEval,
+    middlegameEval: bucket.middlegameEval,
+    style: bucket.style,
+  };
+}
+
 export function parseGamePlies(pgnOrMoves: string): Array<{
   ply: number;
   fullmove: number;
@@ -517,14 +694,16 @@ export async function analyzeSelectedGame(options: {
   evaluate: EvalFn;
   depth?: number;
   multiPv?: number;
+  movetimeMs?: number;
   fetchExplorer?: GameCoachExplorerFn;
   /** Optional vector RAG (API). Soft-falls back to theme pack. */
   retrieveKnowledge?: VectorRetrieveFn;
   onProgress?: (p: AnalyzeProgress) => void;
   signal?: { cancelled: boolean };
 }): Promise<GameCoachResult> {
-  const depth = options.depth ?? GLOBAL_DEPTH;
-  const multiPv = options.multiPv ?? 3;
+  const depth = options.depth ?? REFINE_DEPTH;
+  const multiPv = options.multiPv ?? COACH_ANALYZE_MULTIPV;
+  const movetimeMs = options.movetimeMs ?? REFINE_MOVETIME;
   const source = options.pgn || options.moves || "";
   const skeleton = parseGamePlies(source);
   const openingLabel = formatOpeningLabel(options.eco, options.opening);
@@ -562,15 +741,20 @@ export async function analyzeSelectedGame(options: {
 
   const sharedPositions: Record<string, PositionEval> = {};
   const collectedPositions: Record<string, PositionEval> = {};
+  let vaultSeries: number[] = [];
+  let vaultRecord: GlobalGameRecord | null = null;
   if (options.platform && options.username) {
     try {
       const vault = await loadPermanentEvalStore({
         platform: options.platform,
         username: options.username,
       });
-      const record = getSharedGameRecord(vault, options.gameId);
-      if (record?.positions) {
-        Object.assign(sharedPositions, record.positions);
+      vaultRecord = getSharedGameRecord(vault, options.gameId);
+      if (vaultRecord?.positions) {
+        Object.assign(sharedPositions, vaultRecord.positions);
+      }
+      if (vaultRecord?.evalsWhiteCp?.length) {
+        vaultSeries = vaultRecord.evalsWhiteCp;
       }
     } catch {
       /* vault optional */
@@ -587,7 +771,12 @@ export async function analyzeSelectedGame(options: {
     if (hit) {
       return evalFromSharedPosition(hit);
     }
-    const raw = await options.evaluate(fen, evalDepth, evalMultiPv, 0);
+    const raw = await options.evaluate(
+      fen,
+      evalDepth,
+      evalMultiPv,
+      movetimeMs
+    );
     const bestUci = raw.bestUci || null;
     collectedPositions[key] = { cpWhite: raw.cpWhite, bestUci };
     sharedPositions[key] = collectedPositions[key];
@@ -602,7 +791,8 @@ export async function analyzeSelectedGame(options: {
   let namedEndPly: number | null = null;
   let freqEndPly: number | null = null;
   let proAvailable = false;
-  if (options.fetchExplorer && skeleton.length) {
+  // Local opening map already decides book end — skip Lichess/masters explorer walk.
+  if (options.fetchExplorer && skeleton.length && mapEndPly == null) {
     options.onProgress?.({
       ply: 0,
       total: skeleton.length,
@@ -640,8 +830,9 @@ export async function analyzeSelectedGame(options: {
         : "Replaying…",
     });
 
-    let evalBefore: number | null = prevEval;
-    let evalAfter: number | null = null;
+    let evalBefore: number | null =
+      whiteCpFromSeries(vaultSeries, sk.ply - 1) ?? prevEval;
+    let evalAfter: number | null = whiteCpFromSeries(vaultSeries, sk.ply);
     let bestSan: string | null = null;
     let bestPvSan: string[] = [];
     let lines: EngineLine[] = [];
@@ -651,17 +842,35 @@ export async function analyzeSelectedGame(options: {
     let mark: CoachMark | null = null;
 
     try {
+      const beforeKey = fenKey(sk.fenBefore);
+      const afterKey = fenKey(sk.fenAfter);
+      const hasBeforePos = Boolean(
+        sharedPositions[beforeKey] || collectedPositions[beforeKey]
+      );
+      const hasAfterPos = Boolean(
+        sharedPositions[afterKey] || collectedPositions[afterKey]
+      );
+
       if (sample) {
+        // Vault hit returns immediately; SF only when fen missing from vault.
         const before = await resolveEval(sk.fenBefore, depth, multiPv);
-        evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
+        if (evalBefore == null) {
+          evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
+        }
         bestSan = sanFromUci(sk.fenBefore, before.bestUci);
         bestPvSan = pvToSan(sk.fenBefore, before.bestPv);
         lines = linesFromEval(sk.fenBefore, before);
+      } else if (hasBeforePos) {
+        const hit =
+          sharedPositions[beforeKey] || collectedPositions[beforeKey];
+        if (hit?.bestUci) bestSan = sanFromUci(sk.fenBefore, hit.bestUci);
       }
 
-      const after = await resolveEval(sk.fenAfter, depth, 1);
-      evalAfter = toWhiteCp(sk.fenAfter, after.cpWhite);
-      analyzed = true;
+      if (evalAfter == null || hasAfterPos) {
+        const after = await resolveEval(sk.fenAfter, depth, 1);
+        evalAfter = toWhiteCp(sk.fenAfter, after.cpWhite);
+      }
+      analyzed = evalAfter != null;
 
       if (evalBefore != null && evalAfter != null) {
         const loss =
@@ -938,16 +1147,38 @@ export async function analyzeSelectedGame(options: {
     });
   }
 
-  if (
-    options.platform &&
-    options.username &&
-    Object.keys(collectedPositions).length
-  ) {
+  if (options.platform && options.username && plies.length) {
     try {
+      const product = buildVaultProductFromPlies({
+        gameId: options.gameId,
+        pgn: options.pgn,
+        moves: options.moves,
+        eco: options.eco,
+        opening: options.opening,
+        userColor: options.userColor,
+        plies,
+        positions: { ...sharedPositions, ...collectedPositions },
+      });
       await upsertSharedGameEvals(
         { platform: options.platform, username: options.username },
         options.gameId,
-        { positions: collectedPositions }
+        {
+          positions: product.positions,
+          evalsWhiteCp: product.evalsWhiteCp,
+          mistakeCandidates: product.mistakeCandidates,
+          openingCandidates: product.openingCandidates,
+          opening_accuracy_pct: product.opening_accuracy_pct,
+          opening_accuracy_moves: product.opening_accuracy_moves,
+          endgameEval: product.endgameEval,
+          middlegameEval: product.middlegameEval,
+          style: product.style,
+          // Keep Study/Insights candidates/metrics if they already scanned deeper meta
+          preferExistingMeta: Boolean(
+            vaultRecord?.mistakeCandidates?.length ||
+              vaultRecord?.openingCandidates?.length ||
+              vaultRecord?.style
+          ),
+        }
       );
     } catch {
       /* vault write optional */

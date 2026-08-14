@@ -168,7 +168,13 @@ function analyticsTtlMs(filters: QueryFilters): number {
   if (filters.timeframe === "1 month") return INSIGHTS_RECENT_TTL_MS;
   const from = filters.dateFrom || null;
   const to = filters.dateTo || null;
-  if (from && to && from === to) return INSIGHTS_RECENT_TTL_MS;
+  if (
+    from &&
+    to &&
+    String(from).slice(0, 10) === String(to).slice(0, 10)
+  ) {
+    return INSIGHTS_RECENT_TTL_MS;
+  }
   return INSIGHTS_TTL_MS;
 }
 
@@ -250,18 +256,80 @@ function filterStudyGamesByView(
   );
 }
 
+function derivedMatchesGames(
+  recap: RecapResponse | null | undefined,
+  insights: InsightsResponse | null | undefined,
+  gamesCount: number
+): boolean {
+  if (!recap || !insights) return false;
+  const recapN = Number(recap.meta?.games_count ?? -1);
+  const insightsN = Number(insights.meta?.games_count ?? -1);
+  return recapN === gamesCount && insightsN === gamesCount;
+}
+
+async function bundleFromUnifiedStore(
+  period: QueryFilters,
+  options?: { rebuildDerived?: boolean }
+): Promise<SessionBundle | null> {
+  await yieldForUi({ heavy: true });
+  const stored = await loadLocalGamesPage(period, {
+    network: false,
+    limit: GAMES_FIRST_PAGE_SIZE,
+    offset: 0,
+  });
+  if (!stored.allFiltered.length) return null;
+  const games = toStudyGameList(stored.allFiltered);
+  const allFiltered = stored.allFiltered;
+  const gamesCount = games.length;
+
+  if (!options?.rebuildDerived) {
+    const ttl = analyticsTtlMs(period);
+    const [recap, insights] = await Promise.all([
+      readCache<RecapResponse>(analyticsRecapCacheKey(period), ttl),
+      readCache<InsightsResponse>(analyticsInsightsCacheKey(period), ttl),
+    ]);
+    if (derivedMatchesGames(recap, insights, gamesCount)) {
+      return {
+        games,
+        recap: recap!,
+        insights: insights!,
+      };
+    }
+  }
+
+  await yieldForUi({ heavy: true });
+  const recap = buildLocalRecap(period, allFiltered);
+  await yieldForUi({ heavy: true });
+  const insights = buildLocalInsights(period, allFiltered);
+  return {
+    games,
+    recap,
+    insights,
+  };
+}
+
+export async function rebuildSessionDerived(
+  filters: QueryFilters
+): Promise<SessionBundle | null> {
+  const period = withoutSpeedFilter(filters);
+  const bundle = await bundleFromUnifiedStore(period, { rebuildDerived: true });
+  if (!bundle) return null;
+  await writeSessionCaches(period, bundle);
+  return bundle;
+}
+
+export type SessionLoadMode = boolean | "recent";
+
 export async function ensureSession(
   filters: QueryFilters,
-  forceNetwork = false
+  mode: SessionLoadMode = false
 ): Promise<SessionBundle> {
+  const forceNetwork = mode === true;
+  const pullRecent = mode === "recent" || forceNetwork;
   const period = withoutSpeedFilter(filters);
   const fk = filtersKey(period);
-  const mode = forceNetwork ? "force" : "soft";
-  return takeInflight(`session:${fk}:${mode}`, async () => {
-    const gamesKey = analyticsStudyGamesCacheKey(period);
-    const recapKey = analyticsRecapCacheKey(period);
-    const insightsKey = analyticsInsightsCacheKey(period);
-
+  const inflightMode = forceNetwork ? "force" : pullRecent ? "recent" : "soft";
+  return takeInflight(`session:${fk}:${inflightMode}`, async () => {
     if (!period.username.trim()) {
       const bundle: SessionBundle = {
         games: [],
@@ -271,58 +339,79 @@ export async function ensureSession(
       return bundle;
     }
 
-    if (!forceNetwork) {
-      const analyticsTtl = analyticsTtlMs(period);
-      const [games, recap, insights] = await Promise.all([
-        readCache<StudyGame[]>(gamesKey, GAMES_TTL_MS),
-        readCache<RecapResponse>(recapKey, analyticsTtl),
-        readCache<InsightsResponse>(insightsKey, analyticsTtl),
+    if (!pullRecent) {
+      const ttl = analyticsTtlMs(period);
+      const gamesKey = analyticsStudyGamesCacheKey(period);
+      const [cachedGames, cachedRecap, cachedInsights] = await Promise.all([
+        readCache<StudyGame[]>(gamesKey, Math.max(ttl, GAMES_TTL_MS)),
+        readCache<RecapResponse>(analyticsRecapCacheKey(period), ttl),
+        readCache<InsightsResponse>(analyticsInsightsCacheKey(period), ttl),
       ]);
-      if (games != null && recap && insights) {
-        return { games, recap, insights };
+      if (
+        cachedGames?.length &&
+        derivedMatchesGames(cachedRecap, cachedInsights, cachedGames.length)
+      ) {
+        return {
+          games: cachedGames,
+          recap: cachedRecap!,
+          insights: cachedInsights!,
+        };
+      }
+
+      const fromStore = await bundleFromUnifiedStore(period, {
+        rebuildDerived: false,
+      });
+      if (fromStore) {
+        await writeSessionCaches(period, fromStore);
+        return fromStore;
       }
       const remeshed = await tryRemeshSessionFromRelated(period);
       if (remeshed) return remeshed;
+      return {
+        games: [],
+        recap: emptyRecap(period),
+        insights: emptyInsights(period),
+      };
     }
 
     await yieldForUi({ heavy: true });
-    const page = await loadLocalGamesPage(period, {
+    await loadLocalGamesPage(period, {
       force: forceNetwork,
+      network: true,
       limit: GAMES_FIRST_PAGE_SIZE,
       offset: 0,
     });
-    const allFiltered: NormalizedGame[] = page.allFiltered;
-    const periodGames = toStudyGameList(allFiltered);
-    const recap = buildLocalRecap(period, allFiltered);
-    const insights = buildLocalInsights(period, allFiltered);
-    const bundle: SessionBundle = {
-      games: periodGames,
-      recap,
-      insights,
+    await yieldForUi({ heavy: true });
+    const fromStore = await bundleFromUnifiedStore(period, {
+      rebuildDerived: true,
+    });
+    if (fromStore) {
+      await writeSessionCaches(period, fromStore);
+      return fromStore;
+    }
+    return {
+      games: [],
+      recap: emptyRecap(period),
+      insights: emptyInsights(period),
     };
-    await writeSessionCaches(period, bundle);
-    return bundle;
   });
 }
 
 export async function ensureStudyGames(
   filters: QueryFilters,
-  forceNetwork = false
+  mode: SessionLoadMode = false
 ): Promise<StudyGame[]> {
+  const forceNetwork = mode === true;
+  const pullRecent = mode === "recent" || forceNetwork;
   const period = withoutSpeedFilter(filters);
   const fk = filtersKey(filters);
-  return takeInflight(`games:${fk}`, async () => {
+  const inflightMode = forceNetwork ? "force" : pullRecent ? "recent" : "soft";
+  return takeInflight(`games:${fk}:${inflightMode}`, async () => {
     if (!filters.username.trim()) return [];
-    if (!forceNetwork) {
-      const cached = await readCache<StudyGame[]>(
-        analyticsStudyGamesCacheKey(period),
-        GAMES_TTL_MS
-      );
-      if (cached?.length) {
-        return filterStudyGamesByView(cached, filters);
-      }
-    }
-    const session = await ensureSession(period, forceNetwork);
+    const session = await ensureSession(
+      period,
+      forceNetwork ? true : pullRecent ? "recent" : false
+    );
     return filterStudyGamesByView(session.games, filters);
   });
 }
@@ -338,17 +427,23 @@ export async function ensureStudyGamesUpTo(
   return takeInflight(`games-up-to:${fk}:${cap}:${forceNetwork}`, async () => {
     if (!filters.username.trim()) return [];
     if (!forceNetwork) {
-      const cached = await readCache<StudyGame[]>(
-        analyticsStudyGamesCacheKey(period),
-        GAMES_TTL_MS
-      );
-      if (cached) {
-        const filtered = filterStudyGamesByView(cached, filters);
-        if (filtered.length >= cap) return filtered.slice(0, cap);
+      const stored = await loadLocalGamesPage(filters, {
+        network: false,
+        limit: cap,
+        offset: 0,
+      });
+      const fromStore = toStudyGameList(stored.allFiltered.slice(0, cap));
+      if (fromStore.length) {
+        if (!filters.speed && !filters.color && !filters.result) {
+          await writeCache(analyticsStudyGamesCacheKey(period), fromStore);
+        }
+        return fromStore;
       }
+      return [];
     }
     const page = await loadLocalGamesPage(filters, {
       force: forceNetwork,
+      network: true,
       limit: cap,
       offset: 0,
     });

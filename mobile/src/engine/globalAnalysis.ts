@@ -74,6 +74,7 @@ import {
   applyUciMove,
   canonicalUci,
   fenKey,
+  sanToUci,
   uciFromMove,
 } from "./chessMoves";
 import {
@@ -81,6 +82,7 @@ import {
   type EndgameEvalBucket,
   type MiddlegameEvalBucket,
 } from "./evalBucketMetrics";
+import { gameCoachAnalysisCacheKey } from "./gameCoach/analysisCache";
 import {
   aggregateStyleMetrics,
   createStyleScanSession,
@@ -295,22 +297,41 @@ export async function savePermanentEvalStore(
   } satisfies PermanentEvalStore);
 }
 
-/** Merge position evals into the shared study/Games vault (same gameId). */
+/** Merge position evals / analysis product into the shared study/Games vault. */
 export async function upsertSharedGameEvals(
   filters: Pick<QueryFilters, "username" | "platform">,
   gameId: string,
   patch: {
-    positions: Record<string, PositionEval>;
+    positions?: Record<string, PositionEval>;
     evalsWhiteCp?: number[];
+    mistakeCandidates?: MistakeItem[];
+    openingCandidates?: MistakeItem[];
+    opening_accuracy_pct?: number | null;
+    opening_accuracy_moves?: number;
+    endgameEval?: EndgameEvalBucket | null;
+    middlegameEval?: MiddlegameEvalBucket | null;
+    style?: StyleGameRow | null;
+    /** When true, keep existing candidate/metric fields if already populated. */
+    preferExistingMeta?: boolean;
   }
 ): Promise<void> {
   const id = String(gameId || "").trim();
   if (!id || !filters.username?.trim()) return;
   const positions = patch.positions || {};
-  if (!Object.keys(positions).length && !patch.evalsWhiteCp?.length) return;
+  const hasPositions = Object.keys(positions).length > 0;
+  const hasSeries = Boolean(patch.evalsWhiteCp?.length);
+  const hasMeta =
+    patch.mistakeCandidates != null ||
+    patch.openingCandidates != null ||
+    patch.opening_accuracy_pct !== undefined ||
+    patch.style !== undefined ||
+    patch.middlegameEval !== undefined ||
+    patch.endgameEval !== undefined;
+  if (!hasPositions && !hasSeries && !hasMeta) return;
 
   const vault = await loadPermanentEvalStore(filters);
   const prev = vault.games[id];
+  const prefer = Boolean(patch.preferExistingMeta);
   const next: GlobalGameRecord = {
     gameId: id,
     evalsWhiteCp:
@@ -318,13 +339,44 @@ export async function upsertSharedGameEvals(
         ? patch.evalsWhiteCp
         : prev?.evalsWhiteCp || [],
     positions: { ...(prev?.positions || {}), ...positions },
-    mistakeCandidates: prev?.mistakeCandidates || [],
-    openingCandidates: prev?.openingCandidates || [],
-    opening_accuracy_pct: prev?.opening_accuracy_pct ?? null,
-    opening_accuracy_moves: prev?.opening_accuracy_moves ?? 0,
-    endgameEval: prev?.endgameEval ?? null,
-    middlegameEval: prev?.middlegameEval ?? null,
-    style: prev?.style ?? null,
+    mistakeCandidates:
+      prefer && (prev?.mistakeCandidates?.length || 0) > 0
+        ? prev!.mistakeCandidates
+        : patch.mistakeCandidates ?? (prev?.mistakeCandidates || []),
+    openingCandidates:
+      prefer && (prev?.openingCandidates?.length || 0) > 0
+        ? prev!.openingCandidates
+        : patch.openingCandidates ?? (prev?.openingCandidates || []),
+    opening_accuracy_pct:
+      prefer && prev?.opening_accuracy_pct != null
+        ? prev.opening_accuracy_pct
+        : patch.opening_accuracy_pct !== undefined
+          ? patch.opening_accuracy_pct
+          : prev?.opening_accuracy_pct ?? null,
+    opening_accuracy_moves:
+      prefer && (prev?.opening_accuracy_moves || 0) > 0
+        ? prev!.opening_accuracy_moves
+        : patch.opening_accuracy_moves !== undefined
+          ? patch.opening_accuracy_moves
+          : prev?.opening_accuracy_moves ?? 0,
+    endgameEval:
+      prefer && prev?.endgameEval
+        ? prev.endgameEval
+        : patch.endgameEval !== undefined
+          ? patch.endgameEval
+          : prev?.endgameEval ?? null,
+    middlegameEval:
+      prefer && prev?.middlegameEval
+        ? prev.middlegameEval
+        : patch.middlegameEval !== undefined
+          ? patch.middlegameEval
+          : prev?.middlegameEval ?? null,
+    style:
+      prefer && prev?.style
+        ? prev.style
+        : patch.style !== undefined
+          ? patch.style
+          : prev?.style ?? null,
   };
   await savePermanentEvalStore(filters, {
     ...vault,
@@ -337,6 +389,150 @@ export function getSharedGameRecord(
   gameId: string
 ): GlobalGameRecord | null {
   return vault.games[String(gameId)] || null;
+}
+
+type CoachCachePly = {
+  ply: number;
+  fullmove: number;
+  side: string;
+  san: string;
+  uci: string;
+  fenBefore: string;
+  fenAfter: string;
+  evalBeforeCp: number | null;
+  evalAfterCp: number | null;
+  bestSan: string | null;
+  mark: string | null;
+};
+
+/** Prefer Games-tab coach analysis when vault has no scan for this game yet. */
+async function recordFromCoachCache(
+  filters: Pick<QueryFilters, "username" | "platform">,
+  game: StudyGame
+): Promise<GlobalGameRecord | null> {
+  const id = String(game.id || "").trim();
+  if (!id || !filters.username?.trim()) return null;
+  const coach = await readCache<{ plies?: CoachCachePly[] }>(
+    gameCoachAnalysisCacheKey(filters.platform, filters.username, id),
+    PERMANENT_CACHE_TTL_MS
+  );
+  const plies = coach?.plies;
+  if (!plies?.length) return null;
+
+  const positions: Record<string, PositionEval> = {};
+  const evalsWhiteCp: number[] = [];
+  const openingCandidates: MistakeItem[] = [];
+  const mistakeCandidates: MistakeItem[] = [];
+  const userIsWhite =
+    String(game.user_color || "white").toLowerCase() === "white";
+
+  const stmFromWhite = (fen: string, whiteCp: number) => {
+    const turn = fen.split(" ")[1];
+    return turn === "b" ? -whiteCp : whiteCp;
+  };
+
+  if (plies[0]?.evalBeforeCp != null) {
+    evalsWhiteCp.push(plies[0].evalBeforeCp);
+    positions[fenKey(plies[0].fenBefore)] = {
+      cpWhite: stmFromWhite(plies[0].fenBefore, plies[0].evalBeforeCp),
+      bestUci: null,
+    };
+  }
+
+  for (const ply of plies) {
+    if (ply.evalAfterCp != null) evalsWhiteCp.push(ply.evalAfterCp);
+    const beforeKey = fenKey(ply.fenBefore);
+    if (ply.evalBeforeCp != null) {
+      const bestUci = ply.bestSan ? sanToUci(ply.fenBefore, ply.bestSan) : "";
+      positions[beforeKey] = {
+        cpWhite: stmFromWhite(ply.fenBefore, ply.evalBeforeCp),
+        bestUci: bestUci || null,
+      };
+    }
+    if (ply.evalAfterCp != null) {
+      const afterKey = fenKey(ply.fenAfter);
+      if (!positions[afterKey]) {
+        positions[afterKey] = {
+          cpWhite: stmFromWhite(ply.fenAfter, ply.evalAfterCp),
+          bestUci: null,
+        };
+      }
+    }
+
+    const isUser =
+      (ply.side === "white" && userIsWhite) ||
+      (ply.side === "black" && !userIsWhite);
+    if (
+      !isUser ||
+      ply.evalBeforeCp == null ||
+      ply.evalAfterCp == null ||
+      !ply.mark
+    ) {
+      continue;
+    }
+    if (
+      ply.mark !== "inaccuracy" &&
+      ply.mark !== "mistake" &&
+      ply.mark !== "blunder" &&
+      ply.mark !== "missed"
+    ) {
+      continue;
+    }
+    const userBefore = userIsWhite ? ply.evalBeforeCp : -ply.evalBeforeCp;
+    const userAfter = userIsWhite ? ply.evalAfterCp : -ply.evalAfterCp;
+    const drop = userBefore - userAfter;
+    if (drop < OPENING_MIN_DROP_CP) continue;
+    const zeroBasedPly = Math.max(0, ply.ply - 1);
+    const item: MistakeItem = {
+      game_id: id,
+      created_at: String(game.created_at || ""),
+      opening_name: game.opening_name,
+      opening_eco: game.opening_eco,
+      opponent_name: opponentName(game),
+      speed: game.speed,
+      user_color: String(game.user_color || "white"),
+      result: String(game.result || ""),
+      ply: zeroBasedPly,
+      move_number: ply.fullmove,
+      fen: ply.fenBefore,
+      played_uci: ply.uci,
+      played_san: ply.san,
+      best_uci: positions[beforeKey]?.bestUci || null,
+      best_san: ply.bestSan,
+      eval_before_cp: Math.round(ply.evalBeforeCp * 10) / 10,
+      eval_after_cp: Math.round(ply.evalAfterCp * 10) / 10,
+      eval_delta_cp: Math.round((ply.evalAfterCp - ply.evalBeforeCp) * 10) / 10,
+      eval_drop_cp: Math.round(drop * 10) / 10,
+      comment: `Your position worsened by ~${Math.round(drop)} cp after ${ply.san}.`,
+    };
+    if (
+      zeroBasedPly < MAX_OPENING_PLY &&
+      openingCandidates.length < MAX_MOMENTS_PER_GAME
+    ) {
+      openingCandidates.push(item);
+    }
+    if (
+      zeroBasedPly >= OPENING_PLY_SKIP &&
+      mistakeCandidates.length < MAX_MOMENTS_PER_GAME
+    ) {
+      mistakeCandidates.push(item);
+    }
+  }
+
+  if (evalsWhiteCp.length < 2) return null;
+  const bucket = analyzeEvalBucketMetrics(game, evalsWhiteCp);
+  return {
+    gameId: id,
+    evalsWhiteCp,
+    positions,
+    mistakeCandidates,
+    openingCandidates,
+    opening_accuracy_pct: bucket.opening_accuracy_pct,
+    opening_accuracy_moves: bucket.opening_accuracy_moves,
+    endgameEval: bucket.endgameEval,
+    middlegameEval: bucket.middlegameEval,
+    style: bucket.style,
+  };
 }
 
 function buildPeriodState(
@@ -923,12 +1119,14 @@ export async function runGlobalPeriodAnalysis(options: {
     let sourceGames = options.games;
     if (options.continueScan) {
       const page = await loadLocalGamesPage(filters, {
+        network: false,
         limit: GLOBAL_MAX_GAMES,
         offset: 0,
       });
       sourceGames = toStudyGameList(page.allFiltered.slice(0, GLOBAL_MAX_GAMES));
     } else if (!sourceGames) {
       const page = await loadLocalGamesPage(filters, {
+        network: false,
         limit: GLOBAL_FIRST_SCAN_MAX_GAMES,
         offset: 0,
       });
@@ -1111,6 +1309,23 @@ export async function runGlobalPeriodAnalysis(options: {
         continue;
       }
       if (existing) continue;
+
+      // Reuse Games-tab coach product instead of re-scanning with Stockfish
+      const fromCoach = await recordFromCoachCache(filters, game);
+      if (fromCoach) {
+        vault = {
+          ...vault,
+          games: { ...vault.games, [id]: fromCoach },
+        };
+        done += 1;
+        await noteVaultDirty();
+        const label =
+          opponentName(game) || game.opening_name || id.slice(0, 8);
+        report(`Loaded ${label} from game analysis`, "scan", done, {
+          currentGame: label,
+        });
+        continue;
+      }
 
       await waitForPuzzleIdle();
       if (signal.cancelled) {
