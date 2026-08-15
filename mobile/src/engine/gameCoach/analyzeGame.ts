@@ -42,6 +42,13 @@ import {
   type RetrieveContext,
   type VectorRetrieveFn,
 } from "./retrieve";
+import {
+  collectGameKeys,
+  pickMomentKey,
+  type KeyTip,
+  type MomentEvent,
+} from "./keyRetrieve";
+import { loadCoachPack } from "./loadCoachPack";
 import { missedForcingLine } from "./tacticalFact";
 import {
   detectOpeningFamily,
@@ -739,6 +746,16 @@ export async function analyzeSelectedGame(options: {
   }
   if (!metrics) metrics = emptyCoachGameMetrics();
 
+  const coachPack = await loadCoachPack();
+  const gameKeys = collectGameKeys({
+    entries: coachPack.entries,
+    eco: options.eco,
+    opening: options.opening,
+    themesByPhase: metrics.themesByPhase,
+    globalThemes: metrics.globalThemes,
+  });
+  const usedKeyTips: KeyTip[] = [];
+
   const sharedPositions: Record<string, PositionEval> = {};
   const collectedPositions: Record<string, PositionEval> = {};
   let vaultSeries: number[] = [];
@@ -1008,26 +1025,27 @@ export async function analyzeSelectedGame(options: {
               pov.kingMotifLive
             );
           });
-          const highLive =
-            pov.kingMotifLive ||
-            themes.some((t) =>
-              [
-                "attack",
-                "forcing_moves",
-                "tactics",
-                "missed_opportunity",
-                "imbalances",
-                "king_safety",
-              ].includes(t)
-            );
           const wantCount =
             noteWorthy &&
             ((!isUserPly && deltaCp >= 80) ||
-              (isUserPly && (errorKind || moment || playedBest || deltaCp < 40)))
-              ? !isUserPly || highLive
-                ? 2
-                : 1
+              (isUserPly &&
+                (errorKind || moment || playedBest || deltaCp < 40)))
+              ? 1
               : 0;
+          let momentEvent: MomentEvent = "accuracy";
+          if (deltaCp >= 150 || (moment && deltaCp >= 120)) {
+            momentEvent = "blunder";
+          } else if (
+            errorKind === "mistake" ||
+            errorKind === "missed_opportunity" ||
+            (moment && deltaCp >= 80)
+          ) {
+            momentEvent = "mistake";
+          } else if (deltaCp >= 40 && !playedBest) {
+            momentEvent = "inaccuracy";
+          } else {
+            momentEvent = "accuracy";
+          }
           const retrieveCtx: RetrieveContext = {
             themes: ragThemes.length ? ragThemes : themes,
             phase,
@@ -1039,6 +1057,8 @@ export async function analyzeSelectedGame(options: {
             eco: options.eco,
             opening: options.opening,
             recentSans: skeleton.slice(0, i + 1).map((p) => p.san),
+            gameKeys,
+            momentEvent,
           };
           const nuggets: KnowledgeNugget[] =
             wantCount > 0
@@ -1048,6 +1068,21 @@ export async function analyzeSelectedGame(options: {
                   options.retrieveKnowledge || null
                 )
               : [];
+          // Capture full tip metadata for finale (games cites)
+          if (wantCount > 0 && isUserPly) {
+            const tip = pickMomentKey({
+              gameKeys,
+              packEntries: coachPack.entries,
+              phase,
+              themes: ragThemes.length ? ragThemes : themes,
+              recentSans: skeleton.slice(0, i + 1).map((p) => p.san),
+              eco: options.eco,
+              event: momentEvent,
+            });
+            if (tip && !usedKeyTips.some((t) => t.keyId === tip.keyId)) {
+              usedKeyTips.push(tip);
+            }
+          }
           note = composeCoachNote({
             side: sk.side,
             userColor,
@@ -1144,6 +1179,8 @@ export async function analyzeSelectedGame(options: {
       userColor,
       metrics,
       openingLabel,
+      usedKeyTips,
+      gameKeys,
     });
   }
 

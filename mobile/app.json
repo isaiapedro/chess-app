@@ -27,7 +27,15 @@
       "@react-native-community/datetimepicker",
       "expo-font",
       "expo-secure-store",
-      "expo-web-browser"
+      "expo-web-browser",
+      "expo-mail-composer",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Chess Wrapped to attach photos to feedback emails."
+        }
+      ],
+      "expo-asset"
     ]
   }
 }

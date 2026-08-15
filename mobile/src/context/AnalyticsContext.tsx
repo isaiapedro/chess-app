@@ -439,7 +439,9 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
                     : derived.insights
                 );
               }
-              if (newGames.length && viewGames.length) {
+              if (viewGames.length) {
+                // Paint already-calculated metrics; gap-fill only in background.
+                void remeshViewMetrics(queryFilters, viewGames, viewKey);
                 void refreshVaultMetrics(viewGames, { force: false });
                 void ensureStyleMetrics(queryFilters, {
                   games: viewGames.slice(0, GLOBAL_MAX_GAMES),
@@ -450,7 +452,7 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
                   setStyleTotal(resolved.total);
                   setStyleComplete(resolved.periodComplete);
                 });
-                void ensureOpeningMix(queryFilters, viewGames, true).then(
+                void ensureOpeningMix(queryFilters, viewGames, false).then(
                   (mixData) => {
                     if (sessionKeyRef.current !== viewKey) return;
                     setMix(mixData);
@@ -615,8 +617,21 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
           }
 
           vaultRequestedRef.current = true;
+          lastStyleRefreshKey.current = viewKey;
           setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
+          // Fetch done — paint calculated disk metrics, then bg-only gaps.
+          void remeshViewMetrics(queryFilters, viewGames, viewKey);
           void refreshVaultMetrics(viewGames, { force: false });
+          void ensureStyleMetrics(queryFilters, {
+            games: viewGames.slice(0, GLOBAL_MAX_GAMES),
+          }).then((resolved) => {
+            if (metricsRunIdRef.current !== runId) return;
+            if (sessionKeyRef.current !== viewKey) return;
+            setStyle(resolved.style);
+            setStyleScanned(resolved.scanned);
+            setStyleTotal(resolved.total);
+            setStyleComplete(resolved.periodComplete);
+          });
           void ensureOpeningMix(queryFilters, viewGames, false).then(
             (mixData) => {
               if (metricsRunIdRef.current !== runId) return;
@@ -646,6 +661,8 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
           setGamesLoading(false);
           hydratedPeriodKeyRef.current = periodKey;
           lastStyleRefreshKey.current = viewKey;
+          // Instant paint of already-calculated vault metrics (no SF).
+          void remeshViewMetrics(queryFilters, softView, viewKey);
         }
 
         // #region agent log
@@ -733,45 +750,44 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
                   return;
                 }
 
-                if (!gamesChanged && softHasGames) {
-                  setOpeningPhaseLoading(false);
-                  setMiddlegamePhaseLoading(false);
-                  setEndgamePhaseLoading(false);
-                  if (!vaultRequestedRef.current) {
-                    vaultRequestedRef.current = true;
-                    lastStyleRefreshKey.current = viewKey;
-                    void remeshViewMetrics(queryFilters, viewGames, viewKey);
-                  }
+                vaultRequestedRef.current = true;
+                lastStyleRefreshKey.current = viewKey;
+                setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
+
+                // 1) Remesh already-calculated metrics (no Stockfish).
+                await remeshViewMetrics(queryFilters, viewGames, viewKey);
+                if (metricsRunIdRef.current !== runId || recapSignal.cancelled) {
                   return;
                 }
 
-                setOpeningPhaseLoading(true);
-                setMiddlegamePhaseLoading(true);
-                setEndgamePhaseLoading(true);
-
-                vaultRequestedRef.current = true;
-                lastStyleRefreshKey.current = viewKey;
-                if (periodChanged && sameUserPlatform) {
-                  await remeshViewMetrics(queryFilters, viewGames, viewKey);
-                } else {
-                  setStyleTotal(Math.min(viewGames.length, GLOBAL_MAX_GAMES));
-                  void refreshVaultMetrics(viewGames, { force: false });
-                  void ensureOpeningMix(queryFilters, viewGames, false).then(
-                    (mixData) => {
-                      if (metricsRunIdRef.current !== runId) return;
-                      setMix(mixData);
-                    }
-                  );
-                }
+                // 2) Background: only analyze games missing from heuristic store.
+                void refreshVaultMetrics(viewGames, { force: false });
+                void ensureStyleMetrics(queryFilters, {
+                  games: viewGames.slice(0, GLOBAL_MAX_GAMES),
+                }).then((resolved) => {
+                  if (metricsRunIdRef.current !== runId) return;
+                  if (sessionKeyRef.current !== viewKey) return;
+                  setStyle(resolved.style);
+                  setStyleScanned(resolved.scanned);
+                  setStyleTotal(resolved.total);
+                  setStyleComplete(resolved.periodComplete);
+                });
+                void ensureOpeningMix(queryFilters, viewGames, false).then(
+                  (mixData) => {
+                    if (metricsRunIdRef.current !== runId) return;
+                    setMix(mixData);
+                  }
+                );
 
                 // #region agent log
                 agentLog(
                   "F",
                   "AnalyticsContext.tsx:coldBackground",
-                  "insights + vault scheduled",
+                  "remesh + gap vault scheduled",
                   {
                     periodGames: periodGames.length,
                     viewGames: viewGames.length,
+                    gamesChanged,
                     vaultRequested: vaultRequestedRef.current,
                   }
                 );

@@ -36,6 +36,11 @@ type StockfishContextValue = {
     multiPv?: number,
     movetimeMs?: number
   ) => Promise<EvalResult>;
+  startLiveEval: (
+    fen: string,
+    multiPv: number,
+    onUpdate: (result: EvalResult) => void
+  ) => () => void;
 };
 
 function depthOnlyTimeoutMs(depth: number): number {
@@ -66,6 +71,8 @@ type Pending = {
   id: string;
   resolve: (value: EvalResult) => void;
   reject: (error: Error) => void;
+  live?: boolean;
+  onPartial?: (value: EvalResult) => void;
 };
 
 function debugIngestUrl(): string {
@@ -120,10 +127,6 @@ function agentLog(
 const SF_BASE = "https://unpkg.com/stockfish@18.0.8/bin/";
 const SF_JS_URL = `${SF_BASE}stockfish-18-lite-single.js`;
 const SF_WASM_URL = `${SF_BASE}stockfish-18-lite-single.wasm`;
-// #region agent log
-const PROBE_GH_JS =
-  "https://github.com/nmrugg/stockfish.js/releases/download/v18.0.0/stockfish-18-lite-single.js";
-// #endregion
 
 const ENGINE_HTML = `<!DOCTYPE html>
 <html>
@@ -146,6 +149,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
   // #region agent log
   let rawMsgCount = 0;
   let goCount = 0;
+  let lastPartialTs = 0;
   // #endregion
 
   function send(type, payload) {
@@ -219,6 +223,31 @@ const ENGINE_HTML = `<!DOCTYPE html>
       var known = pvByMove[head];
       if (!known || pvUcis.length >= known.length) pvByMove[head] = pvUcis;
       scoreByMove[head] = cp;
+      if (currentId) {
+        var now = Date.now();
+        if (now - lastPartialTs > 120) {
+          lastPartialTs = now;
+          var partialLines = [];
+          for (var pi = 1; pi <= wantedMultiPv; pi++) {
+            if (bestByPv[pi] != null && scoreByPv[pi] != null) {
+              partialLines.push({
+                uci: bestByPv[pi][0],
+                cpWhite: scoreByPv[pi],
+                pv: bestByPv[pi]
+              });
+            }
+          }
+          if (partialLines.length) {
+            send('evalPartial', {
+              id: currentId,
+              cpWhite: partialLines[0].cpWhite,
+              bestUci: partialLines[0].uci,
+              bestPv: partialLines[0].pv,
+              multipv: partialLines
+            });
+          }
+        }
+      }
       return;
     }
     if (line.indexOf('bestmove') === 0) {
@@ -387,14 +416,14 @@ const ENGINE_HTML = `<!DOCTYPE html>
 
   async function runProbes() {
     send('probe', { probe: 'origin', hyp: 'A', ok: true, err: String(location.origin) });
-    await probeUrl('gh-js-control', 'A', '${PROBE_GH_JS}');
+    await probeUrl('gh-js-control', 'A', 'https://github.com/nmrugg/stockfish.js/releases/download/v18.0.0/stockfish-18-lite-single.js');
     await probeBlobWorker();
   }
   // #endregion
 
   async function boot() {
     // #region agent log
-    await runProbes();
+    runProbes();
     // #endregion
     send('debug', {
       stage: 'boot-start',
@@ -451,7 +480,14 @@ const ENGINE_HTML = `<!DOCTYPE html>
       send('pong', {});
       return;
     }
-    if (msg.type === 'eval') {
+    if (msg.type === 'stop') {
+      queuedReqs = [];
+      if (searching) {
+        try { engine.postMessage('stop'); } catch (e) {}
+      }
+      return;
+    }
+    if (msg.type === 'eval' || msg.type === 'liveEval') {
       if (!engine || !ready) {
         send('error', { id: msg.id, message: 'Engine not ready' });
         return;
@@ -463,7 +499,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
         seenCount++;
       }
       if (searching) {
-        queuedReqs.push(msg);
+        queuedReqs = [msg];
         try { engine.postMessage('stop'); } catch (e) {}
         return;
       }
@@ -476,6 +512,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
     currentId = msg.id;
     wantedMultiPv = Math.max(1, Math.min(5, msg.multiPv || 1));
     searching = true;
+    var infinite = !!msg.infinite || msg.type === 'liveEval';
     // #region agent log
     goCount++;
     // #endregion
@@ -483,7 +520,9 @@ const ENGINE_HTML = `<!DOCTYPE html>
     var movetime = msg.movetime;
     engine.postMessage('setoption name MultiPV value ' + wantedMultiPv);
     engine.postMessage('position fen ' + msg.fen);
-    if (movetime == null || movetime <= 0) {
+    if (infinite) {
+      engine.postMessage('go infinite');
+    } else if (movetime == null || movetime <= 0) {
       engine.postMessage('go depth ' + depth);
     } else {
       engine.postMessage('go depth ' + depth + ' movetime ' + movetime);
@@ -515,7 +554,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     agentLog("StockfishProvider.tsx:mount", "provider mounted", {
-      mode: "stockfish18-lite-single",
+      mode: "stockfish18-lite-cdn",
     });
     return () => {
       pending.current.forEach((item) =>
@@ -591,11 +630,10 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
       setError(msg.message || "Engine error");
       return;
     }
-    if (msg.type === "eval" && msg.id) {
+    if (msg.type === "evalPartial" && msg.id) {
       const item = pending.current.get(msg.id);
-      if (!item) return;
-      pending.current.delete(msg.id);
-      item.resolve({
+      if (!item?.onPartial) return;
+      item.onPartial({
         cpWhite: Number(msg.cpWhite || 0),
         bestUci: msg.bestUci || null,
         bestPv: msg.bestPv || (msg.bestUci ? [msg.bestUci] : []),
@@ -605,6 +643,27 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           pv: line.pv || [line.uci],
         })),
       });
+      return;
+    }
+    if (msg.type === "eval" && msg.id) {
+      const item = pending.current.get(msg.id);
+      if (!item) return;
+      const result = {
+        cpWhite: Number(msg.cpWhite || 0),
+        bestUci: msg.bestUci || null,
+        bestPv: msg.bestPv || (msg.bestUci ? [msg.bestUci] : []),
+        multipv: (msg.multipv || []).map((line) => ({
+          uci: line.uci,
+          cpWhite: line.cpWhite,
+          pv: line.pv || [line.uci],
+        })),
+      };
+      if (item.live) {
+        item.onPartial?.(result);
+        return;
+      }
+      pending.current.delete(msg.id);
+      item.resolve(result);
     }
   }, []);
 
@@ -712,9 +771,54 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
     [post, ready]
   );
 
+  const liveIdRef = useRef<string | null>(null);
+
+  const startLiveEval = useCallback(
+    (
+      fen: string,
+      multiPv: number,
+      onUpdate: (result: EvalResult) => void
+    ) => {
+      const terminal = terminalEval(fen);
+      if (terminal) {
+        onUpdate(terminal);
+        return () => undefined;
+      }
+      if (!ready) {
+        return () => undefined;
+      }
+      const id = `live${++seq.current}`;
+      liveIdRef.current = id;
+      pending.current.set(id, {
+        id,
+        live: true,
+        onPartial: onUpdate,
+        resolve: onUpdate,
+        reject: () => undefined,
+      });
+      post({
+        type: "liveEval",
+        id,
+        fen,
+        multiPv,
+        infinite: true,
+        stream: true,
+      });
+      return () => {
+        const cur = pending.current.get(id);
+        if (cur) pending.current.delete(id);
+        if (liveIdRef.current === id) {
+          liveIdRef.current = null;
+          post({ type: "stop" });
+        }
+      };
+    },
+    [post, ready]
+  );
+
   const value = useMemo(
-    () => ({ ready, error, evaluate }),
-    [ready, error, evaluate]
+    () => ({ ready, error, evaluate, startLiveEval }),
+    [ready, error, evaluate, startLiveEval]
   );
 
   return (
@@ -727,7 +831,9 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           source={{ html: ENGINE_HTML, baseUrl: SF_BASE }}
           onMessage={onMessage}
           onLoadEnd={() => {
-            agentLog("StockfishProvider.tsx:onLoadEnd", "webview loaded", {});
+            agentLog("StockfishProvider.tsx:onLoadEnd", "webview loaded", {
+              mode: "cdn",
+            });
           }}
           onError={(e) => {
             agentLog("StockfishProvider.tsx:onError", "webview error", {

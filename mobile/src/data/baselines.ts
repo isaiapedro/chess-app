@@ -1,10 +1,5 @@
-import { fetchBaselines, type BaselinesResponse } from "../api/client";
-import {
-  PERMANENT_CACHE_TTL_MS,
-  readCache,
-  takeInflight,
-  writeCache,
-} from "../storage/cache";
+import type { BaselinesResponse } from "../api/client";
+import { takeInflight } from "../storage/cache";
 
 export type BaselineMetricHit = {
   mean: number | null;
@@ -245,15 +240,22 @@ export function ratingBand(rating: number | null | undefined): string | null {
   return null;
 }
 
-export function timeControlToSpeed(
+export function estimateGameSecondsFromTc(
   tc: string | null | undefined
-): Speed | null {
+): number | null {
   if (!tc || tc === "-") return null;
   const parts = String(tc).split("+");
   const base = Number(parts[0]);
   const inc = parts.length > 1 ? Number(parts[1]) : 0;
   if (!Number.isFinite(base) || !Number.isFinite(inc)) return null;
-  const total = base + 40 * inc;
+  return base + 40 * inc;
+}
+
+export function timeControlToSpeed(
+  tc: string | null | undefined
+): Speed | null {
+  const total = estimateGameSecondsFromTc(tc);
+  if (total == null) return null;
   if (total < 180) return "bullet";
   if (total < 480) return "blitz";
   if (total < 1500) return "rapid";
@@ -525,69 +527,14 @@ function preferFresherStore(
 }
 
 export async function loadBaselineStore(
-  forceNetwork = false
+  _forceNetwork = false
 ): Promise<BaselineStore> {
-  return takeInflight(`baselines:${forceNetwork ? "force" : "soft"}`, async () => {
-    const bundled = baselinesFromBundledAsset();
-    const disk = await readCache<BaselineStore>(
-      BASELINES_CACHE_KEY,
-      PERMANENT_CACHE_TTL_MS
-    );
-
-    if (!forceNetwork && cachedStore && storeHasActivityMetrics(cachedStore)) {
-      const best = preferFresherStore(bundled, cachedStore);
-      if (best !== cachedStore) {
-        cachedStore = best;
-        await writeCache(BASELINES_CACHE_KEY, best);
-      }
+  return takeInflight("baselines:bundled", async () => {
+    if (cachedStore && storeHasActivityMetrics(cachedStore)) {
       return cachedStore;
     }
-
-    if (!forceNetwork) {
-      const best = preferFresherStore(bundled, disk);
-      if (storeHasActivityMetrics(best)) {
-        cachedStore = best;
-        await writeCache(BASELINES_CACHE_KEY, best);
-        return cachedStore;
-      }
-    }
-
-    if (!forceNetwork) {
-      const legacy = await readCache<BaselinesResponse>(
-        "/api/v1/baselines",
-        PERMANENT_CACHE_TTL_MS
-      );
-      const migrated = legacy ? storeFromPayload(legacy) : null;
-      if (migrated && storeHasActivityMetrics(migrated)) {
-        cachedStore = preferFresherStore(bundled, migrated);
-        await writeCache(BASELINES_CACHE_KEY, cachedStore);
-        return cachedStore;
-      }
-    }
-
-    try {
-      const payload = await fetchBaselines(true);
-      const store = storeFromPayload(payload);
-      if (store && (forceNetwork || storeHasActivityMetrics(store) || !bundled.available)) {
-        cachedStore = preferFresherStore(store, bundled);
-        await writeCache(BASELINES_CACHE_KEY, cachedStore);
-        return cachedStore;
-      }
-    } catch {
-      /* fall through */
-    }
-
-    if (storeHasActivityMetrics(bundled)) {
-      cachedStore = bundled;
-      await writeCache(BASELINES_CACHE_KEY, cachedStore);
-      return cachedStore;
-    }
-    if (disk?.available) {
-      cachedStore = disk;
-      return cachedStore;
-    }
-    cachedStore = bundled;
-    await writeCache(BASELINES_CACHE_KEY, cachedStore);
+    // Peer baselines ship in the APK/IPA and do not change at runtime.
+    cachedStore = baselinesFromBundledAsset();
     return cachedStore;
   });
 }

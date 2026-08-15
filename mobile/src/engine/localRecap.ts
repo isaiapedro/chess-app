@@ -1,3 +1,4 @@
+import { Chess } from "chess.js";
 import type { QueryFilters } from "../api/client";
 import type {
   BadgeItem,
@@ -10,6 +11,7 @@ import type {
   RecapResponse,
   ResultsBreakdown,
 } from "../api/types";
+import { estimateGameSecondsFromTc } from "../data/baselines";
 import type { NormalizedGame } from "../data/platformGames";
 
 const SECONDS_PER_MOVE: Record<string, number> = {
@@ -18,6 +20,14 @@ const SECONDS_PER_MOVE: Record<string, number> = {
   rapid: 20,
   classical: 60,
   daily: 60,
+};
+
+const PIECE_WEIGHT_G: Record<string, number> = {
+  p: 4,
+  n: 8,
+  b: 8,
+  r: 12,
+  q: 16,
 };
 
 const DAY_NAMES = [
@@ -32,6 +42,54 @@ const DAY_NAMES = [
 
 function winRate(wins: number, total: number): number {
   return total ? Number(((wins / total) * 100).toFixed(1)) : 0;
+}
+
+function gameSans(game: NormalizedGame): string[] {
+  if (game.moves_str?.trim()) {
+    return game.moves_str.trim().split(/\s+/).filter(Boolean);
+  }
+  if (!game.pgn_str?.trim()) return [];
+  try {
+    const board = new Chess();
+    board.loadPgn(game.pgn_str, { strict: false });
+    return board.history();
+  } catch {
+    return [];
+  }
+}
+
+function capturedPieceWeightG(games: NormalizedGame[]): number {
+  let total = 0;
+  for (const game of games) {
+    const sans = gameSans(game);
+    if (!sans.length) continue;
+    const board = new Chess();
+    const userIsWhite = String(game.user_color || "white").toLowerCase() === "white";
+    for (const san of sans) {
+      const isUserTurn =
+        (board.turn() === "w" && userIsWhite) ||
+        (board.turn() === "b" && !userIsWhite);
+      let move;
+      try {
+        move = board.move(san);
+      } catch {
+        break;
+      }
+      if (!move) break;
+      if (isUserTurn && move.captured) {
+        total += PIECE_WEIGHT_G[move.captured] || 0;
+      }
+    }
+  }
+  return Math.round(total * 10) / 10;
+}
+
+function estimateActivitySeconds(game: NormalizedGame): number {
+  const tc = estimateGameSecondsFromTc(game.time_control);
+  if (tc != null && tc > 0) return tc;
+  const speed = String(game.speed || "blitz").toLowerCase();
+  const per = SECONDS_PER_MOVE[speed] ?? 8;
+  return Number(game.move_count || 0) * per;
 }
 
 function buildHeadline(games: NormalizedGame[]) {
@@ -49,6 +107,17 @@ function buildHeadline(games: NormalizedGame[]) {
     const per = SECONDS_PER_MOVE[speed] ?? 8;
     return sum + Number(g.move_count || 0) * per;
   }, 0);
+  const gamesBySpeed: Record<string, number> = {};
+  const activityEstSecondsBySpeed: Record<string, number> = {};
+  let activityEstSeconds = 0;
+  for (const g of games) {
+    const speed = String(g.speed || "blitz").toLowerCase();
+    const est = estimateActivitySeconds(g);
+    gamesBySpeed[speed] = (gamesBySpeed[speed] || 0) + 1;
+    activityEstSecondsBySpeed[speed] =
+      (activityEstSecondsBySpeed[speed] || 0) + est;
+    activityEstSeconds += est;
+  }
 
   let maxWin = 0;
   let curWin = 0;
@@ -104,6 +173,9 @@ function buildHeadline(games: NormalizedGame[]) {
     total_games: games.length,
     total_moves: totalMoves,
     total_hours: Number((totalSeconds / 3600).toFixed(1)),
+    activity_est_seconds: Number(activityEstSeconds.toFixed(1)),
+    games_by_speed: gamesBySpeed,
+    activity_est_seconds_by_speed: activityEstSecondsBySpeed,
     max_win_streak: maxWin,
     max_unbeaten_streak: maxUnbeaten,
     current_win_streak: currentWinStreak,
@@ -528,7 +600,7 @@ export function buildLocalRecap(
         (((headline.total_hours as number) || 0) / 2).toFixed(1)
       ),
       km_walked: Number((((headline.total_moves as number) || 0) * 0.001).toFixed(2)),
-      captured_piece_weight_g: 0,
+      captured_piece_weight_g: capturedPieceWeightG(games),
     },
     rating_series,
     rating_series_by_speed: buildRatingSeriesBySpeed(games),

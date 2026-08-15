@@ -5,7 +5,14 @@ export {
   retrieveDerivedCoachNuggets,
   mergeHybridKnowledgeNuggets,
 } from "./retrieve";
-export { DERIVED_COACH_PACK } from "./derivedCoachPack";
+export { collectGameKeys, pickMomentKey } from "./keyRetrieve";
+export { cleanBookProse } from "./derivedPolish";
+export type {
+  DerivedCoachPack,
+  DerivedCoachEntry,
+  DerivedFrequentLine,
+} from "./derivedCoachPack";
+export { loadCoachPack, getCachedCoachPack } from "./loadCoachPack";
 export { composeCoachNote, expandCoachThemes, classifyUserError } from "./noteCompose";
 export {
   lookupCoachGameMetrics,
