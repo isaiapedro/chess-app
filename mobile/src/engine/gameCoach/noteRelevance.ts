@@ -156,6 +156,7 @@ export function textFitsBoard(text: string, facts: BoardFacts): boolean {
   if (
     /minority attack|b4–b5|b4-b5|carlsbad/.test(t) &&
     !facts.themes.includes("minority_attack") &&
+    !facts.themes.includes("carlsbad") &&
     facts.ply < 22
   ) {
     return false;

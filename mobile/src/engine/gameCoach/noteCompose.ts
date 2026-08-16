@@ -1,4 +1,5 @@
 import { Chess } from "chess.js";
+import type { CoachMark } from "./coachMarks";
 import type { CoachGameMetrics, CoachMetricMoment } from "./gameMetricsLookup";
 import {
   assessPositionPov,
@@ -9,18 +10,18 @@ import {
   type PositionPov,
 } from "./positionPov";
 
+import { adaptNoteSquares } from "./adaptNoteSquares";
+import { isCorruptPackNote } from "./derivedPolish";
 import { adaptCoachTipForSide, phasePlanNote } from "./phasePlans";
+import { cleanBookProse } from "./derivedPolish";
 import {
-  assessBoardFacts,
   claimNoteText,
   isWeakFillerNote,
   noteHasSubstance,
   noteTextAlreadySaid,
-  textFitsBoard,
 } from "./noteRelevance";
 import {
   describeStructureFeatures,
-  WINDOWED_STRUCTURE_THEMES,
   type StructureFeature,
 } from "./structureDetect";
 import {
@@ -245,7 +246,13 @@ export function expandCoachThemes(args: {
     themes.add("opening_plan");
     for (const t of args.openingTags) themes.add(t);
   }
-  if (args.phase === "middlegame" && args.noteWorthy) {
+  // Avoid flooding critical-moment picks with generic midgame tags.
+  if (
+    args.phase === "middlegame" &&
+    args.noteWorthy &&
+    !args.moment &&
+    args.deltaCp < 80
+  ) {
     themes.add("piece_activity");
     themes.add("planning");
     themes.add("imbalances");
@@ -261,26 +268,30 @@ export function expandCoachThemes(args: {
     themes.add("imbalances");
   }
 
-  // Metrics: drop sticky king-safety labels when motif is dead on this board.
-  // Structural labels must also survive the ply window (board structure set).
+  // Metrics themes drive soft-key weights — do not require live board structure
+  // or a critical eval swing to keep durable themes (iqp, space, sacrifice…).
   for (const t of args.metricsThemes || []) {
-    if (!(args.moment || args.deltaCp >= 80)) continue;
     if (KING_MOTIF_THEMES.has(t) && !citeKing) continue;
-    if (WINDOWED_STRUCTURE_THEMES.has(t) && !args.structure.includes(t)) {
-      continue;
-    }
     themes.add(t);
   }
 
   if (args.moment) {
     themes.add("initiative");
+    themes.add("tactics");
+    if (args.moment.dropCp >= 80) themes.add("forcing_moves");
     if (args.moment.severity === "blunder") {
       if (citeKing && pov?.userKingExposed) {
         themes.add("user_king_exposed");
         themes.add("defense");
       } else {
         themes.add("forcing_moves");
+        themes.add("prophylaxis");
       }
+    } else if (args.moment.severity === "mistake") {
+      themes.add("prophylaxis");
+      themes.add("piece_activity");
+    } else if (args.moment.severity === "inaccuracy") {
+      themes.add("piece_activity");
     }
   }
 
@@ -364,45 +375,22 @@ export function classifyUserError(args: {
   userColor: "white" | "black";
   moment?: CoachMetricMoment | null;
   pov?: PositionPov | null;
+  /** Coach mark already resolved (missed vs mistake). */
+  coachMark?: CoachMark | null;
 }): UserErrorKind {
+  if (args.coachMark === "missed") return "missed_opportunity";
+  if (args.coachMark === "mistake" || args.coachMark === "blunder") {
+    return "mistake";
+  }
   const threshold = args.moment ? 60 : 80;
   if (args.deltaCp < threshold && !args.moment) return null;
   if (args.bestSan && args.bestSan === args.playedSan) return null;
 
-  const pov = args.pov || assessPositionPov(args.fenBefore, args.userColor);
-  const oppColor = pov.oppColor;
-  const aggressive = bestLooksAggressive({
-    fenBefore: args.fenBefore,
-    bestSan: args.bestSan,
-    oppColor,
-  });
-  const motifHit =
-    pov.kingMotifLive &&
-    (moveRelatesToKingMotif({
-      fenBefore: args.fenBefore,
-      san: args.bestSan,
-      pov,
-    }) ||
-      moveRelatesToKingMotif({
-        fenBefore: args.fenBefore,
-        san: args.playedSan,
-        pov,
-      }));
-  const weakness = playedCreatesWeakness({
-    fenBefore: args.fenBefore,
-    playedSan: args.playedSan,
-    pov,
-  });
+  // Missed = failed to punish opp mistake/blunder on the prior ply.
+  if (args.moment?.severity === "missed") return "missed_opportunity";
+  if (args.moment?.inputs?.missed_after_opp) return "missed_opportunity";
 
-  // Motif only steers classification when the move actually touches it
-  if (motifHit && pov.oppKingExposed && aggressive) return "missed_opportunity";
-  if (aggressive && !weakness) return "missed_opportunity";
-  if (weakness && !aggressive) return "mistake";
-  if (aggressive && weakness) {
-    return args.deltaCp >= 150 ? "mistake" : "missed_opportunity";
-  }
-  if (motifHit && pov.userKingExposed) return "mistake";
-  return aggressive ? "missed_opportunity" : "mistake";
+  return "mistake";
 }
 
 function lineHint(bestSan: string | null, bestPvSan: string[]): string {
@@ -525,6 +513,12 @@ function explainUserMissed(args: {
           ],
       args.usedTips
     );
+  }
+
+  if (skipStructure) {
+    return line
+      ? `${args.playedSan} misses the forcing idea; ${line} was the shot.`
+      : `${args.playedSan} misses the forcing idea on this board.`;
   }
 
   return assetsVulnerabilitiesNote({
@@ -892,6 +886,17 @@ function structureDepthNote(args: {
   return "";
 }
 
+const POSITIONAL_ASSET_BLOCK_THEMES = new Set([
+  "tactics",
+  "forcing_moves",
+  "missed_opportunity",
+  "attack",
+  "sacrifice",
+  "king_safety",
+  "opp_king_exposed",
+  "user_king_exposed",
+]);
+
 function assetsVulnerabilitiesNote(args: {
   themes: string[];
   san: string;
@@ -905,13 +910,19 @@ function assetsVulnerabilitiesNote(args: {
     return "";
   }
 
+  const tacticalMoment = args.themes.some((t) =>
+    POSITIONAL_ASSET_BLOCK_THEMES.has(t)
+  );
   const assets: string[] = [];
   const vulns: string[] = [];
 
-  if (args.themes.includes("bishop_pair")) assets.push("the bishop pair");
-  if (args.themes.includes("space")) assets.push("the space advantage");
-  if (args.themes.includes("open_c_file")) assets.push("the open c-file");
-  else if (args.themes.includes("open_file")) assets.push("the open file");
+  // Positional assets (bishop pair, space, files) never narrate tactical moments.
+  if (!tacticalMoment) {
+    if (args.themes.includes("bishop_pair")) assets.push("the bishop pair");
+    if (args.themes.includes("space")) assets.push("the space advantage");
+    if (args.themes.includes("open_c_file")) assets.push("the open c-file");
+    else if (args.themes.includes("open_file")) assets.push("the open file");
+  }
 
   if (args.citeKing && args.pov.userKingExposed) vulns.push("your king safety");
   if (args.citeKing && args.pov.oppKingExposed) vulns.push("their exposed king");
@@ -1089,6 +1100,12 @@ function explainUserMistake(args: {
           ],
       args.usedTips
     );
+  }
+
+  if (skipStructure) {
+    return line
+      ? `${args.playedSan} drifts from the forcing line; ${line} stays concrete.`
+      : `${args.playedSan} drifts from the forcing idea in this position.`;
   }
 
   return assetsVulnerabilitiesNote({
@@ -1298,6 +1315,11 @@ function rephraseConcept(
   return out;
 }
 
+function userPlySlot(args: { ply: number; userPlyCount?: number }): boolean {
+  const n = args.userPlyCount ?? Math.ceil(args.ply / 2);
+  return n % 4 === 1;
+}
+
 export function shouldComposeNote(args: {
   perspective: NotePerspective;
   deltaCp: number;
@@ -1305,28 +1327,85 @@ export function shouldComposeNote(args: {
   moment?: CoachMetricMoment | null;
   structure: string[];
   errorKind?: UserErrorKind;
+  mark?: CoachMark | null;
   ply: number;
   userPlyCount?: number;
 }): boolean {
-  const hasStructure = STRUCTURE_NOTE_THEMES.some((t) =>
-    args.structure.includes(t)
-  );
   if (args.perspective === "user") {
     if (args.moment) return true;
-    if (args.errorKind === "mistake" || args.errorKind === "missed_opportunity") {
+    if (args.mark === "inaccuracy") return false;
+    if (
+      args.mark === "blunder" ||
+      args.mark === "mistake" ||
+      args.mark === "missed"
+    ) {
       return true;
     }
-    if (args.deltaCp >= 80) return true;
-    if (hasStructure) return true;
+    if (
+      args.errorKind === "mistake" ||
+      args.errorKind === "missed_opportunity"
+    ) {
+      return true;
+    }
+    if (args.deltaCp >= 50) return true;
     const good =
       args.playedBest || args.deltaCp < 40 || args.errorKind === "good";
     if (good) {
-      const n = args.userPlyCount ?? Math.ceil(args.ply / 2);
-      return n % 4 === 1;
+      return userPlySlot(args);
     }
     return false;
   }
-  return args.deltaCp >= 80;
+  return args.deltaCp >= 70;
+}
+
+/** Pack-key note gate: full prose, topic-once + text fingerprint (no sentence crop). */
+export function acceptKeyNote(
+  text: string,
+  usedTips: Set<string>,
+  topicCtx?: {
+    themes?: string[];
+    fenBefore?: string;
+    san?: string;
+    bestSan?: string | null;
+    bestPvSan?: string[];
+    userColor?: "white" | "black";
+    phase?: "opening" | "middlegame" | "endgame";
+    noteId?: string;
+  }
+): string {
+  const raw = (text || "").replace(/\s+/g, " ").trim();
+  if (!raw || isCorruptPackNote(raw)) return "";
+  const hasSquares = /\b[a-h][1-8]\b/i.test(raw);
+  const adapted = (
+    hasSquares
+      ? adaptNoteSquares({
+          text: raw,
+          fenBefore: topicCtx?.fenBefore,
+          playedSan: topicCtx?.san,
+          bestSan: topicCtx?.bestSan,
+          bestPvSan: topicCtx?.bestPvSan,
+          userColor: topicCtx?.userColor,
+        })
+      : raw
+  ).trim();
+  const out = adapted;
+  if (out.length < 40) return "";
+  if (topicCtx?.noteId && usedTips.has(`noteId:${topicCtx.noteId}`)) {
+    return "";
+  }
+  if (noteTextAlreadySaid(out, usedTips)) return "";
+  const topic = classifyNoteTopic({
+    text: out,
+    themes: topicCtx?.themes,
+    fenBefore: hasSquares ? topicCtx?.fenBefore : undefined,
+    san: hasSquares ? topicCtx?.san : undefined,
+    phase: topicCtx?.phase,
+  });
+  if (topicAlreadyUsed(usedTips, topic)) return "";
+  claimNoteText(out, usedTips);
+  claimNoteTopic(usedTips, topic);
+  if (topicCtx?.noteId) usedTips.add(`noteId:${topicCtx.noteId}`);
+  return out;
 }
 
 function finalizeNote(
@@ -1378,6 +1457,7 @@ export function composeCoachNote(args: {
   metrics?: CoachGameMetrics | null;
   moment?: CoachMetricMoment | null;
   errorKind?: UserErrorKind;
+  mark?: CoachMark | null;
   pov?: PositionPov | null;
   playedBest?: boolean;
   userPlyCount?: number;
@@ -1417,28 +1497,30 @@ export function composeCoachNote(args: {
       userColor: args.userColor,
     });
 
-  const facts = assessBoardFacts({
-    fenAfter: args.fenAfter || args.fenBefore,
-    playedSan: args.san,
-    ply: args.ply,
-    phase: args.phase,
-    themes: args.themes,
-  });
   const buildConcepts = () =>
     args.concepts
-      .slice(0, 2)
+      .slice(0, 1)
       .map((c) => {
-        const sided = adaptCoachTipForSide(c, args.userColor);
-        if (!sided) return "";
-        return rephraseConcept(
-          sided,
-          pov.attackSide,
-          pov,
-          args.usedTips,
-          citeKing
-        );
+        const cleaned = cleanBookProse(c);
+        if (!cleaned || cleaned.length < 36) return "";
+        const sidedRaw =
+          adaptCoachTipForSide(cleaned, args.userColor) || cleaned;
+        const sided = adaptNoteSquares({
+          text: sidedRaw,
+          fenBefore: args.fenBefore,
+          playedSan: args.san,
+          bestSan: args.bestSan,
+          bestPvSan: args.bestPvSan,
+          userColor: args.userColor,
+        });
+        // Knowledge tips: no king-ban / textFitsBoard kill — book prose stays.
+        const fp = sided.slice(0, 48);
+        if (args.usedTips.has(`concept:${fp}`)) return "";
+        if (noteTextAlreadySaid(sided, args.usedTips)) return "";
+        args.usedTips.add(`concept:${fp}`);
+        return sided;
       })
-      .filter((c) => c && textFitsBoard(c, facts) && noteHasSubstance(c));
+      .filter((c) => c && noteHasSubstance(c));
 
   if (perspective === "opponent") {
     if (args.deltaCp < 80) return "";
@@ -1488,6 +1570,7 @@ export function composeCoachNote(args: {
       userColor: args.userColor,
       moment,
       pov,
+      coachMark: args.mark,
     });
 
   const wantGood =

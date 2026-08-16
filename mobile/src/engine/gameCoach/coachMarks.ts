@@ -1,7 +1,6 @@
 import { Chess, type Color, type Move } from "chess.js";
 import type { ImageSourcePropType } from "react-native";
 import {
-  SACRIFICE_MIN_OFFER,
   STYLE_PIECE_VALUE,
   sacrificeOfferAfterMove,
 } from "../styleMetrics";
@@ -43,9 +42,23 @@ export const COACH_THEORY_LEAVE_MARKS = new Set<CoachMark>([
   "missed",
 ]);
 
-const IMPORTANT_PV_GAP = 0.1;
+const IMPORTANT_PV_GAP = 0.05;
 const BRILLIANT_WP_BEFORE_MAX = 0.85;
-const BRILLIANT_WP_AFTER_MIN = 0.4;
+const BRILLIANT_WP_AFTER_MIN = 0.2;
+/** Lost before the move — brilliant only if it salvages to equal-or-better. */
+const BRILLIANT_LOST_WP = 0.25;
+const BRILLIANT_EQUAL_WP = 0.45;
+/** Exchange / pawn-comp sacs (Nxf7 ≈ 2) still count as brilliant offers. */
+const BRILLIANT_SAC_MIN = 2;
+/** Marks that stay visible through opening theory paint. */
+export const COACH_MARKS_KEEP_OVER_BOOK = new Set<CoachMark>([
+  "brilliant",
+  "important",
+  "missed",
+  "mistake",
+  "blunder",
+  "inaccuracy",
+]);
 
 export type CoachEngineLine = {
   rank: number;
@@ -130,13 +143,20 @@ function brilliantSacrifice(args: {
 }): boolean {
   if (args.wpBefore >= BRILLIANT_WP_BEFORE_MAX) return false;
   if (args.wpAfter < BRILLIANT_WP_AFTER_MIN) return false;
+  // Still lost after the sac → not brilliant (need equal or better).
+  if (
+    args.wpBefore < BRILLIANT_LOST_WP &&
+    args.wpAfter < BRILLIANT_EQUAL_WP
+  ) {
+    return false;
+  }
   if (!(args.playedBest || args.wpDrop < 0.02)) return false;
   try {
     const board = new Chess(args.fenBefore);
     const color: Color = args.side === "white" ? "w" : "b";
     const move = board.move(args.playedSan) as Move | null;
     if (!move) return false;
-    return sacrificeOfferAfterMove(board, move, color) >= SACRIFICE_MIN_OFFER;
+    return sacrificeOfferAfterMove(board, move, color) >= BRILLIANT_SAC_MIN;
   } catch {
     return false;
   }
@@ -152,9 +172,44 @@ export function classifyCoachMark(args: {
   playedSan?: string;
   missedOpportunity?: boolean;
 }): CoachMark | null {
+  // Best move is never a miss / error — even right after an opp gift.
+  if (args.playedBest) {
+    if (args.evalBeforeCp == null || args.evalAfterCp == null) return "best";
+    const userIsWhite = args.side === "white";
+    const wpBefore = userWinProbability(args.evalBeforeCp, userIsWhite);
+    const wpAfter = userWinProbability(args.evalAfterCp, userIsWhite);
+    const wpDrop = coachWpDrop(wpBefore, wpAfter);
+    if (
+      args.fenBefore &&
+      args.playedSan &&
+      brilliantSacrifice({
+        fenBefore: args.fenBefore,
+        playedSan: args.playedSan,
+        side: args.side,
+        playedBest: true,
+        wpDrop,
+        wpBefore,
+        wpAfter,
+      })
+    ) {
+      return "brilliant";
+    }
+    const forcedRecapture =
+      Boolean(args.fenBefore) &&
+      Boolean(args.playedSan) &&
+      isForcingEqualOrHigherRecapture(args.fenBefore!, args.playedSan!);
+    if (
+      !forcedRecapture &&
+      importantFromLines(args.lines, true, args.side)
+    ) {
+      return "important";
+    }
+    return "best";
+  }
+
   if (args.missedOpportunity) return "missed";
   if (args.evalBeforeCp == null || args.evalAfterCp == null) {
-    return args.playedBest ? "best" : null;
+    return null;
   }
 
   const userIsWhite = args.side === "white";
@@ -169,27 +224,13 @@ export function classifyCoachMark(args: {
       fenBefore: args.fenBefore,
       playedSan: args.playedSan,
       side: args.side,
-      playedBest: args.playedBest,
+      playedBest: false,
       wpDrop,
       wpBefore,
       wpAfter,
     })
   ) {
     return "brilliant";
-  }
-
-  if (args.playedBest) {
-    if (
-      importantFromLines(args.lines, true, args.side) &&
-      !(
-        args.fenBefore &&
-        args.playedSan &&
-        isForcingEqualOrHigherRecapture(args.fenBefore, args.playedSan)
-      )
-    ) {
-      return "important";
-    }
-    return "best";
   }
 
   return classifyCoachWpBand(wpDrop);
@@ -199,10 +240,17 @@ export function coachMissedFromPending(args: {
   wpBefore: number;
   wpAfter: number;
   pendingPeakWp: number;
+  playedBest?: boolean;
 }): boolean {
-  const band = classifyCoachWpBand(coachWpDrop(args.wpBefore, args.wpAfter));
-  if (isCoachMistakeOrWorse(band)) return true;
-  return wpDropPp(args.pendingPeakWp, args.wpAfter) >= 10;
+  if (args.playedBest) return false;
+  // Opp just gifted WP (mistake/blunder). User eval drop → missed opportunity,
+  // not a raw "mistake" mark.
+  const drop = coachWpDrop(args.wpBefore, args.wpAfter);
+  const band = classifyCoachWpBand(drop);
+  if (band === "blunder" || band === "mistake" || band === "inaccuracy") {
+    return true;
+  }
+  return wpDropPp(args.pendingPeakWp, args.wpAfter) >= 5;
 }
 
 export type { EvalDropKind };

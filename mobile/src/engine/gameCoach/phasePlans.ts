@@ -351,7 +351,16 @@ export function phasePlanNote(args: {
   });
 
   if (args.phase === "opening") {
-    for (const tag of args.openingTags) {
+    const tagRank = (tag: string): number => {
+      if (tag === "named_opening" || tag === "opening_plan") return -1;
+      if (tag === "opening_indian") return 1;
+      if (tag.startsWith("opening_") && OPENING_FAMILY_PLANS[tag]) return 3;
+      return 0;
+    };
+    const orderedTags = [...args.openingTags].sort(
+      (a, b) => tagRank(b) - tagRank(a)
+    );
+    for (const tag of orderedTags) {
       if (tag === "named_opening" || tag === "opening_plan") continue;
       const pool = OPENING_FAMILY_PLANS[tag];
       if (pool) {

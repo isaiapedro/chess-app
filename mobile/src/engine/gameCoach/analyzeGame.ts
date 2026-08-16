@@ -1,8 +1,11 @@
 import { Chess, type Square } from "chess.js";
 import {
+  COACH_ANALYZE_DEPTH,
+  COACH_ANALYZE_MOVETIME,
   COACH_ANALYZE_MULTIPV,
-  REFINE_DEPTH,
-  REFINE_MOVETIME,
+  COACH_CRITICAL_DEPTH,
+  COACH_CRITICAL_MOVETIME,
+  COACH_CRITICAL_MULTIPV,
 } from "../analysisConfig";
 import { applyUciMove, fenKey, sanToUci, uciFromMove } from "../chessMoves";
 import { toWhiteCp } from "../analyzeMistakes";
@@ -10,7 +13,10 @@ import type { StudyGame } from "../analyzeMistakes";
 import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
 import {
   analyzeEvalBucketMetrics,
+  mergeEndgameHeuristicWithBucket,
 } from "../evalBucketMetrics";
+import { mergeMiddlegameHeuristicWithBucket } from "../middlegamePhase";
+import { analyzeHeuristicGame } from "../heuristicMetricsPass";
 import {
   getSharedGameRecord,
   loadPermanentEvalStore,
@@ -18,51 +24,86 @@ import {
   type GlobalGameRecord,
   type PositionEval,
 } from "../globalAnalysis";
+import { upsertHeuristicGame } from "../../storage/analyticsLoaders";
 import type { MistakeItem } from "../../api/client";
 import {
   classifyCoachMark,
   coachMissedFromPending,
-  isCoachMistakeOrWorse,
+  COACH_MARKS_KEEP_OVER_BOOK,
   type CoachMark,
 } from "./coachMarks";
 import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
 import { formatOpeningLabel } from "./ecoLabels";
 import {
-  emptyCoachGameMetrics,
-  lookupCoachGameMetrics,
+  buildCoachGameMetrics,
+  enrichMomentsWithPlies,
+  ensureFixedOpeningMoments,
+  upsertLiveMoment,
   type CoachGameMetrics,
+  type CoachMetricMoment,
 } from "./gameMetricsLookup";
-import { composeCoachNote, expandCoachThemes, classifyUserError, shouldComposeNote } from "./noteCompose";
+import { expandCoachThemes, classifyUserError, shouldComposeNote, acceptKeyNote } from "./noteCompose";
 import { composeGameSummaryNote } from "./gameSummary";
-import { phasePlanSlotOpen } from "./phasePlans";
 import { assessPositionPov } from "./positionPov";
-import {
-  mergeHybridKnowledgeNuggets,
-  type KnowledgeNugget,
-  type RetrieveContext,
-  type VectorRetrieveFn,
-} from "./retrieve";
+import type { VectorRetrieveFn } from "./retrieve";
 import {
   collectGameKeys,
-  pickMomentKey,
+  collectGameKeysByPhase,
+  PHASE_NOTE_LIMITS,
   type KeyTip,
-  type MomentEvent,
+  type PhaseGameKeys,
+  type PhaseName,
 } from "./keyRetrieve";
-import { loadCoachPack } from "./loadCoachPack";
-import { missedForcingLine } from "./tacticalFact";
+import {
+  pickMetricTip,
+  shouldAttachMetricTip,
+  buildCoachNoteRequest,
+  lineComparisonMomentInputs,
+  coachRequestMetaInputs,
+  durableUnusedStructureThemes,
+  isPraiseMark,
+  openingEvalGapAllowsEngineLine,
+  engineLineSansBudget,
+  composePlayedAltLine,
+  COACH_NOTE_REQUEST_CONFIG,
+  isFixedCheckpointMoment,
+  requestAlwaysAttaches,
+} from "./metricNotes";
+import {
+  mergeOpeningTipPrior,
+  type OpeningTipPrior,
+} from "./openingJudgmentTip";
+import {
+  emptyGamePlanState,
+  advanceGamePlan,
+  formatGamePlanShort,
+  markPlanKeysTaught,
+  mergeOpeningPlanKeys,
+} from "./gamePlanState";
+import { detectSituations, mergeStickySituations } from "./situationProfiles";
+import type { DetectedSituation } from "./situationProfiles";
+import { PawnStormTracker } from "./tier3Metrics";
+import { isPawnBreakMove } from "../phaseTacticalMetrics";
+import { loadCoachPack, getCoachPackByKey } from "./loadCoachPack";
+import { extendEnginePvUci } from "./extendEnginePv";
 import {
   detectOpeningFamily,
+  resolveOpeningPackKey,
   StructureThemeTracker,
 } from "./structureDetect";
+import {
+  enrichOpeningCoachMoments,
+  type OpeningPeerContext,
+} from "./openingCoachInputs";
+import {
+  enrichMiddlegameCoachMoments,
+  enrichLiveMiddlegamePeerGaps,
+} from "./middlegameCoachInputs";
+import { enrichMiddlegameStrategicMoments } from "./middlegameStructure";
+import { enrichEndgameCoachMoments } from "./endgameContext";
+import { loadBaselineStore } from "../../data/baselines";
 import type { Platform } from "../../api/types";
-import { claimNoteText } from "./noteRelevance";
-import { claimNoteTopic } from "./noteTopics";
-
-const KING_FILTER = new Set([
-  "king_safety",
-  "opp_king_exposed",
-  "user_king_exposed",
-]);
+import type { OpeningGameRow } from "../openingPhase";
 
 const MAX_PRO_THEORY_PLIES = 40;
 const BOOK_MIN_LOCAL_PCT = 2;
@@ -170,17 +211,72 @@ function formatEval(cp: number | null): string {
   return `${cp >= 0 ? "+" : ""}${(cp / 100).toFixed(2)}`;
 }
 
-function phaseForPly(ply: number, pieceCount: number): "opening" | "middlegame" | "endgame" {
+function phaseForPly(
+  ply: number,
+  pieceCount: number,
+  bounds?: { middlegameStartPly0: number | null; endgameStartPly0: number | null } | null
+): "opening" | "middlegame" | "endgame" {
+  const eg0 = bounds?.endgameStartPly0;
+  const mg0 = bounds?.middlegameStartPly0;
+  // Prefer heuristic bounds (0-based) vs display ply (1-based).
+  if (eg0 != null && ply - 1 >= eg0) return "endgame";
+  if (mg0 != null && ply - 1 >= mg0) return "middlegame";
+  if (mg0 != null && ply - 1 < mg0) return "opening";
   if (ply <= 16 && pieceCount >= 28) return "opening";
   if (pieceCount <= 12) return "endgame";
   return "middlegame";
 }
 
-function shouldSamplePly(ply: number, totalPlies: number): boolean {
-  if (totalPlies <= 0) return false;
-  if (ply <= 24) return true;
-  if (ply >= totalPlies - 1) return true;
-  return ply % 2 === 0;
+function studyGameFromOptions(args: {
+  gameId: string;
+  pgn?: string | null;
+  moves?: string | null;
+  eco?: string | null;
+  opening?: string | null;
+  userColor: "white" | "black";
+  userRating?: number | null;
+  speed?: string | null;
+  timeControl?: string | null;
+}): StudyGame {
+  return {
+    id: args.gameId,
+    created_at: new Date().toISOString(),
+    speed: args.speed || "blitz",
+    user_color: args.userColor,
+    result: "Unknown",
+    opening_name: args.opening != null ? args.opening : undefined,
+    opening_eco: args.eco != null ? args.eco : undefined,
+    opponent_name: "Opponent",
+    pgn_str: args.pgn || "",
+    moves_str: args.moves || "",
+    time_control: args.timeControl != null ? args.timeControl : undefined,
+    user_rating: args.userRating ?? undefined,
+  };
+}
+
+
+function momentAlignedToPly(
+  moment: CoachMetricMoment | null | undefined,
+  fenBefore: string,
+  san: string
+): CoachMetricMoment | null {
+  if (!moment) return null;
+  if (moment.fen) {
+    const a = moment.fen.split(" ")[0] || "";
+    const b = fenBefore.split(" ")[0] || "";
+    if (a && b && a !== b) return null;
+  }
+  if (moment.playedSan && moment.playedSan !== san) {
+    return null;
+  }
+  return moment;
+}
+
+function severityFromMark(mark: CoachMark | null): CoachMetricMoment["severity"] {
+  if (mark === "blunder") return "blunder";
+  if (mark === "missed") return "missed";
+  if (mark === "mistake") return "mistake";
+  return null;
 }
 
 function sanFromUci(fen: string, uci: string | null): string | null {
@@ -459,14 +555,24 @@ type EngineEvalResult = {
 };
 
 function evalFromSharedPosition(hit: PositionEval): EngineEvalResult {
-  const pv = hit.bestUci ? [hit.bestUci] : [];
+  const stored =
+    hit.multipv && hit.multipv.length
+      ? hit.multipv
+      : hit.bestUci
+        ? [{ uci: hit.bestUci, cpWhite: hit.cpWhite, pv: [hit.bestUci] }]
+        : [];
+  const best = stored[0];
+  const bestUci = hit.bestUci || best?.uci || null;
+  const pv = best?.pv?.length
+    ? best.pv
+    : bestUci
+      ? [bestUci]
+      : [];
   return {
     cpWhite: hit.cpWhite,
-    bestUci: hit.bestUci,
+    bestUci,
     bestPv: pv,
-    multipv: hit.bestUci
-      ? [{ uci: hit.bestUci, cpWhite: hit.cpWhite, pv }]
-      : [],
+    multipv: stored,
   };
 }
 
@@ -535,13 +641,38 @@ function buildVaultProductFromPlies(args: {
 
     const beforeKey = fenKey(ply.fenBefore);
     if (ply.evalBeforeCp != null) {
+      const prev = positions[beforeKey];
       const bestUci =
-        positions[beforeKey]?.bestUci ||
+        prev?.bestUci ||
         (ply.bestSan ? sanToUci(ply.fenBefore, ply.bestSan) : null) ||
         null;
+      const fromLines =
+        ply.lines?.length >= 2
+          ? ply.lines.slice(0, 3).map((line) => {
+              const uci =
+                sanToUci(ply.fenBefore, line.san) ||
+                (line.pvSan?.[0]
+                  ? sanToUci(ply.fenBefore, line.pvSan[0])
+                  : null) ||
+                "";
+              return {
+                uci,
+                cpWhite: stmCpFromWhite(ply.fenBefore, line.cpWhite),
+                pv: line.pvSan?.length
+                  ? undefined
+                  : uci
+                    ? [uci]
+                    : undefined,
+              };
+            }).filter((row) => row.uci)
+          : undefined;
       positions[beforeKey] = {
         cpWhite: stmCpFromWhite(ply.fenBefore, ply.evalBeforeCp),
         bestUci,
+        multipv:
+          (fromLines && fromLines.length >= 2
+            ? fromLines
+            : prev?.multipv) || undefined,
       };
     }
 
@@ -697,6 +828,10 @@ export async function analyzeSelectedGame(options: {
   userColor?: string | null;
   platform?: Platform;
   username?: string;
+  /** User rating for peer baseline cell (rating×speed). */
+  userRating?: number | null;
+  speed?: string | null;
+  timeControl?: string | null;
   metrics?: CoachGameMetrics | null;
   evaluate: EvalFn;
   depth?: number;
@@ -708,9 +843,10 @@ export async function analyzeSelectedGame(options: {
   onProgress?: (p: AnalyzeProgress) => void;
   signal?: { cancelled: boolean };
 }): Promise<GameCoachResult> {
-  const depth = options.depth ?? REFINE_DEPTH;
+  void options.retrieveKnowledge;
+  const depth = options.depth ?? COACH_ANALYZE_DEPTH;
   const multiPv = options.multiPv ?? COACH_ANALYZE_MULTIPV;
-  const movetimeMs = options.movetimeMs ?? REFINE_MOVETIME;
+  const movetimeMs = options.movetimeMs ?? COACH_ANALYZE_MOVETIME;
   const source = options.pgn || options.moves || "";
   const skeleton = parseGamePlies(source);
   const openingLabel = formatOpeningLabel(options.eco, options.opening);
@@ -721,40 +857,47 @@ export async function analyzeSelectedGame(options: {
     skeleton.map((s) => s.san)
   );
   const userColor = normalizeUserColor(options.userColor);
-  const usedKnowledge = new Set<string>();
   const usedTips = new Set<string>();
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
   let userPlyCount = 0;
-  let pendingOppChance = false;
+      let pendingOppChance = false;
   let pendingOppWp: number | null = null;
+  let pendingOppKind: "mistake" | "blunder" | null = null;
   const structureTracker = new StructureThemeTracker();
+  const sfPawnStormTracker = new PawnStormTracker(4);
   const userIsWhite = userColor === "white";
+  const usedKeyTips: KeyTip[] = [];
+  const selectedNotes: string[] = [];
+  const usedNoteIds = new Set<string>();
+  const structureThemeUsed = new Set<string>();
+  let openingPriorTopics: OpeningTipPrior | null = null;
+  const phaseNoteCounts: Record<PhaseName, number> = {
+    opening: 0,
+    middlegame: 0,
+    endgame: 0,
+  };
 
-  let metrics = options.metrics || null;
-  if (!metrics && options.platform && options.username) {
-    try {
-      metrics = await lookupCoachGameMetrics({
-        platform: options.platform,
-        username: options.username,
-        gameId: options.gameId,
-        userColor,
-      });
-    } catch {
-      metrics = emptyCoachGameMetrics();
-    }
-  }
-  if (!metrics) metrics = emptyCoachGameMetrics();
-
-  const coachPack = await loadCoachPack();
-  const gameKeys = collectGameKeys({
-    entries: coachPack.entries,
+  // ——— Pass A: recalculate heuristics + bundled peers (tips later) ———
+  options.onProgress?.({
+    ply: 0,
+    total: skeleton.length,
+    status: "Recalculating game metrics…",
+  });
+  const studyGame = studyGameFromOptions({
+    gameId: options.gameId,
+    pgn: options.pgn,
+    moves: options.moves,
     eco: options.eco,
     opening: options.opening,
-    themesByPhase: metrics.themesByPhase,
-    globalThemes: metrics.globalThemes,
+    userColor,
+    userRating: options.userRating,
+    speed: options.speed,
+    timeControl: options.timeControl,
   });
-  const usedKeyTips: KeyTip[] = [];
+  const heuristicRows = await analyzeHeuristicGame(studyGame, {
+    signal: options.signal,
+  });
 
   const sharedPositions: Record<string, PositionEval> = {};
   const collectedPositions: Record<string, PositionEval> = {};
@@ -778,24 +921,120 @@ export async function analyzeSelectedGame(options: {
     }
   }
 
+  let metrics: CoachGameMetrics =
+    heuristicRows.opening && heuristicRows.middlegame && heuristicRows.endgame
+      ? buildCoachGameMetrics({
+          record: vaultRecord,
+          heuristics: {
+            opening: heuristicRows.opening,
+            middlegame: heuristicRows.middlegame,
+            endgame: heuristicRows.endgame,
+          },
+          userColor,
+        })
+      : buildCoachGameMetrics({
+          record: vaultRecord,
+          heuristics: null,
+          userColor,
+        });
+  enrichMomentsWithPlies(metrics.momentsByPly, skeleton);
+  ensureFixedOpeningMoments(metrics.momentsByPly, userIsWhite, skeleton.length, {
+    eco: options.eco || null,
+    opening: options.opening || null,
+  });
+
+  const openingRow: OpeningGameRow | null = heuristicRows.opening;
+  const baselines = await loadBaselineStore();
+  const peerRatingRaw = options.userRating;
+  const peerRating =
+    peerRatingRaw == null || peerRatingRaw === ("" as unknown)
+      ? null
+      : Number(peerRatingRaw);
+  const peerCtx: OpeningPeerContext = {
+    baselines,
+    rating: Number.isFinite(peerRating as number) ? peerRating : null,
+    speed: options.speed ?? null,
+    timeControl: options.timeControl ?? null,
+  };
+  enrichOpeningCoachMoments({
+    momentsByPly: metrics.momentsByPly,
+    opening: openingRow,
+    userColor,
+    badAccuracyMoves: vaultRecord?.openingCandidates?.length ?? null,
+    peer: peerCtx,
+    openingName:
+      formatOpeningLabel(options.eco, options.opening) ||
+      options.opening ||
+      null,
+  });
+  enrichMiddlegameCoachMoments({
+    momentsByPly: metrics.momentsByPly,
+    middlegame: heuristicRows.middlegame,
+    peer: peerCtx,
+    styleExtras: {
+      brilliant_moves: null,
+      excellent_moves: null,
+      important_moves: null,
+    },
+  });
+  enrichMiddlegameStrategicMoments({
+    momentsByPly: metrics.momentsByPly,
+    userColor: userIsWhite ? "w" : "b",
+  });
+  enrichEndgameCoachMoments({
+    momentsByPly: metrics.momentsByPly,
+    userColor: userIsWhite ? "w" : "b",
+    eg: heuristicRows.endgame,
+    style: null,
+  });
+
+  const openingKeyId: string | null = resolveOpeningPackKey(
+    options.eco,
+    options.opening
+  );
+  let gamePlan = emptyGamePlanState(openingKeyId);
+  let stickySituations: DetectedSituation[] = [];
+
+  // Pack keys loaded in Pass C after line metrics stamped.
+
   const resolveEval = async (
     fen: string,
     evalDepth: number,
-    evalMultiPv: number
+    evalMultiPv: number,
+    evalMovetimeMs: number = movetimeMs,
+    force = false
   ): Promise<EngineEvalResult> => {
     const key = fenKey(fen);
     const hit = sharedPositions[key] || collectedPositions[key];
-    if (hit) {
+    // Vault/study scans often store MultiPV 1. Important needs ≥2 lines —
+    // re-run Stockfish when the caller asked for MultiPV and vault is thin.
+    const hitLines = hit?.multipv?.length ?? (hit?.bestUci ? 1 : 0);
+    if (
+      !force &&
+      hit &&
+      (evalMultiPv <= 1 || hitLines >= Math.min(2, evalMultiPv))
+    ) {
       return evalFromSharedPosition(hit);
     }
     const raw = await options.evaluate(
       fen,
       evalDepth,
       evalMultiPv,
-      movetimeMs
+      evalMovetimeMs
     );
     const bestUci = raw.bestUci || null;
-    collectedPositions[key] = { cpWhite: raw.cpWhite, bestUci };
+    const multipv = (raw.multipv || [])
+      .slice(0, Math.max(1, evalMultiPv))
+      .map((row) => ({
+        uci: row.uci,
+        cpWhite: row.cpWhite,
+        pv: row.pv,
+      }));
+    collectedPositions[key] = {
+      cpWhite: raw.cpWhite,
+      bestUci,
+      multipv: multipv.length ? multipv : undefined,
+    };
     sharedPositions[key] = collectedPositions[key];
     return {
       cpWhite: raw.cpWhite,
@@ -836,15 +1075,18 @@ export async function analyzeSelectedGame(options: {
     if (options.signal?.cancelled) break;
     const sk = skeleton[i];
     const isUserPly = sk.side === userColor;
-    const momentAtPly = isUserPly ? metrics.momentsByPly[sk.ply] || null : null;
-    const sample =
-      shouldSamplePly(sk.ply, skeleton.length) || Boolean(momentAtPly);
+    let momentAtPly = isUserPly
+      ? momentAlignedToPly(
+          metrics.momentsByPly[sk.ply] || null,
+          sk.fenBefore,
+          sk.san
+        )
+      : null;
+    const sample = true;
     options.onProgress?.({
       ply: i + 1,
       total: skeleton.length,
-      status: sample
-        ? `Evaluating ${sk.fullmove}${sk.side === "white" ? "." : "..."} ${sk.san}`
-        : "Replaying…",
+      status: `Evaluating ${sk.fullmove}${sk.side === "white" ? "." : "..."} ${sk.san}`,
     });
 
     let evalBefore: number | null =
@@ -875,17 +1117,37 @@ export async function analyzeSelectedGame(options: {
           evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
         }
         bestSan = sanFromUci(sk.fenBefore, before.bestUci);
-        bestPvSan = pvToSan(sk.fenBefore, before.bestPv);
+        bestPvSan = pvToSan(
+          sk.fenBefore,
+          before.bestPv,
+          engineLineSansBudget()
+        );
         lines = linesFromEval(sk.fenBefore, before);
       } else if (hasBeforePos) {
         const hit =
           sharedPositions[beforeKey] || collectedPositions[beforeKey];
-        if (hit?.bestUci) bestSan = sanFromUci(sk.fenBefore, hit.bestUci);
+        if (hit) {
+          const fromHit = evalFromSharedPosition(hit);
+          if (hit.bestUci) bestSan = sanFromUci(sk.fenBefore, hit.bestUci);
+          bestPvSan = pvToSan(
+            sk.fenBefore,
+            fromHit.bestPv,
+            engineLineSansBudget()
+          );
+          lines = linesFromEval(sk.fenBefore, fromHit);
+        }
       }
 
+      let afterEval: EngineEvalResult | null = null;
       if (evalAfter == null || hasAfterPos) {
-        const after = await resolveEval(sk.fenAfter, depth, 1);
-        evalAfter = toWhiteCp(sk.fenAfter, after.cpWhite);
+        afterEval = await resolveEval(sk.fenAfter, depth, 1);
+        evalAfter = toWhiteCp(sk.fenAfter, afterEval.cpWhite);
+      } else if (isUserPly) {
+        // Need fenAfter PV for played-move + engine-continuation alt line.
+        afterEval = await resolveEval(sk.fenAfter, depth, 1);
+        if (evalAfter == null) {
+          evalAfter = toWhiteCp(sk.fenAfter, afterEval.cpWhite);
+        }
       }
       analyzed = evalAfter != null;
 
@@ -897,10 +1159,12 @@ export async function analyzeSelectedGame(options: {
         deltaCp = Math.max(0, Math.round(loss));
       }
 
-      const playedBest = Boolean(bestSan && bestSan === sk.san);
+      let playedBest = Boolean(bestSan && bestSan === sk.san);
       if (isUserPly) userPlyCount += 1;
 
       let missedOpportunity = false;
+      let missedAfterOpp: "mistake" | "blunder" | null = null;
+      let pendingPeakForMissed: number | null = null;
       if (
         isUserPly &&
         pendingOppChance &&
@@ -908,18 +1172,21 @@ export async function analyzeSelectedGame(options: {
         evalBefore != null &&
         evalAfter != null
       ) {
-        const wpBeforeUser = userWinProbability(evalBefore, userIsWhite);
-        const wpAfterUser = userWinProbability(evalAfter, userIsWhite);
+        pendingPeakForMissed = pendingOppWp;
         missedOpportunity = coachMissedFromPending({
-          wpBefore: wpBeforeUser,
-          wpAfter: wpAfterUser,
+          wpBefore: userWinProbability(evalBefore, userIsWhite),
+          wpAfter: userWinProbability(evalAfter, userIsWhite),
           pendingPeakWp: pendingOppWp,
+          playedBest: Boolean(bestSan && bestSan === sk.san),
         });
+        if (missedOpportunity) missedAfterOpp = pendingOppKind;
         pendingOppChance = false;
         pendingOppWp = null;
+        pendingOppKind = null;
       } else if (isUserPly && pendingOppChance) {
         pendingOppChance = false;
         pendingOppWp = null;
+        pendingOppKind = null;
       }
 
       mark =
@@ -936,6 +1203,368 @@ export async function analyzeSelectedGame(options: {
             })
           : null;
 
+      const pieceCountEarly = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
+      const phaseEarly = phaseForPly(
+        sk.ply,
+        pieceCountEarly,
+        metrics.phaseBounds
+      );
+
+      const criticalBad =
+        isUserPly &&
+        !playedBest &&
+        (mark === "blunder" || mark === "mistake" || mark === "missed");
+      const metricCoachCall =
+        criticalBad ||
+        (isUserPly && isFixedCheckpointMoment(momentAtPly)) ||
+        (isUserPly && isPraiseMark(mark));
+
+      const runStrongEngine = async () => {
+        options.onProgress?.({
+          ply: i + 1,
+          total: skeleton.length,
+          status: `Deepening ${sk.fullmove}${sk.side === "white" ? "." : "..."} ${sk.san}`,
+        });
+        const deepBefore = await resolveEval(
+          sk.fenBefore,
+          COACH_CRITICAL_DEPTH,
+          COACH_CRITICAL_MULTIPV,
+          COACH_CRITICAL_MOVETIME,
+          true
+        );
+        evalBefore = toWhiteCp(sk.fenBefore, deepBefore.cpWhite);
+        bestSan = sanFromUci(sk.fenBefore, deepBefore.bestUci);
+        const extendedBeforePv = await extendEnginePvUci({
+          fen: sk.fenBefore,
+          pvUci: deepBefore.bestPv || [],
+          evaluate: options.evaluate,
+          depth: COACH_CRITICAL_DEPTH,
+          movetimeMs: COACH_CRITICAL_MOVETIME,
+          signal: options.signal,
+        });
+        bestPvSan = pvToSan(
+          sk.fenBefore,
+          extendedBeforePv,
+          engineLineSansBudget()
+        );
+        lines = linesFromEval(sk.fenBefore, {
+          ...deepBefore,
+          bestPv: extendedBeforePv,
+        });
+
+        const deepAfter = await resolveEval(
+          sk.fenAfter,
+          COACH_CRITICAL_DEPTH,
+          COACH_CRITICAL_MULTIPV,
+          COACH_CRITICAL_MOVETIME,
+          true
+        );
+        const extendedAfterPv = await extendEnginePvUci({
+          fen: sk.fenAfter,
+          pvUci: deepAfter.bestPv || [],
+          evaluate: options.evaluate,
+          depth: COACH_CRITICAL_DEPTH,
+          movetimeMs: COACH_CRITICAL_MOVETIME,
+          signal: options.signal,
+        });
+        afterEval = { ...deepAfter, bestPv: extendedAfterPv };
+        evalAfter = toWhiteCp(sk.fenAfter, deepAfter.cpWhite);
+        if (evalBefore != null && evalAfter != null) {
+          const loss =
+            sk.side === "white"
+              ? evalBefore - evalAfter
+              : evalAfter - evalBefore;
+          deltaCp = Math.max(0, Math.round(loss));
+        }
+
+        if (vaultSeries.length > 0 && evalBefore != null && evalAfter != null) {
+          const beforeIdx = sk.ply - 1;
+          if (beforeIdx >= 0 && beforeIdx < vaultSeries.length) {
+            vaultSeries[beforeIdx] = evalBefore;
+          }
+          if (sk.ply < vaultSeries.length) {
+            vaultSeries[sk.ply] = evalAfter;
+          }
+        }
+
+        playedBest = Boolean(bestSan && bestSan === sk.san);
+      };
+
+      let usedStrongEngine = false;
+      if (metricCoachCall) {
+        await runStrongEngine();
+        usedStrongEngine = true;
+        if (
+          criticalBad &&
+          pendingPeakForMissed != null &&
+          evalBefore != null &&
+          evalAfter != null
+        ) {
+          missedOpportunity = coachMissedFromPending({
+            wpBefore: userWinProbability(evalBefore, userIsWhite),
+            wpAfter: userWinProbability(evalAfter, userIsWhite),
+            pendingPeakWp: pendingPeakForMissed,
+            playedBest,
+          });
+          if (!missedOpportunity) missedAfterOpp = null;
+        }
+        // Reclassify after deepen — praise/brilliant must use deep evals too.
+        mark = classifyCoachMark({
+          side: sk.side,
+          evalBeforeCp: evalBefore,
+          evalAfterCp: evalAfter,
+          playedBest,
+          lines,
+          fenBefore: sk.fenBefore,
+          playedSan: sk.san,
+          missedOpportunity,
+        });
+      }
+
+      const playedContSans = afterEval?.bestPv?.length
+        ? pvToSan(
+            sk.fenAfter,
+            afterEval.bestPv,
+            Math.max(1, engineLineSansBudget() - 1)
+          )
+        : [];
+      const playedAltLine = composePlayedAltLine({
+        playedSan: sk.san,
+        continuationSans: playedContSans,
+      });
+
+      if (criticalBad) {
+        const severity = severityFromMark(mark) || "mistake";
+        const prevLive = metrics.momentsByPly[sk.ply];
+        const keepStructural =
+          prevLive?.structuralKind === "decisive_pawn_break" ||
+          isFixedCheckpointMoment(prevLive)
+            ? prevLive!.structuralKind
+            : null;
+        const previewReq = buildCoachNoteRequest({
+          ply: sk.ply,
+          phase: phaseEarly,
+          mark,
+          moment: prevLive || null,
+          deltaCp,
+          fenBefore: sk.fenBefore,
+          fenAfter: sk.fenAfter,
+          bestPvSan,
+          playedLineSans: playedAltLine,
+          playedSan: sk.san,
+          playedContinuationSans: playedContSans,
+          userColor,
+          evalBeforeCp: evalBefore,
+          evalAfterCp: evalAfter,
+        });
+        const lineInputs = previewReq
+          ? lineComparisonMomentInputs(previewReq)
+          : bestPvSan.length
+            ? { engine_line: bestPvSan.join(" ") }
+            : {};
+        momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
+          ply: sk.ply,
+          moveNumber: sk.fullmove,
+          severity,
+          dropCp: Math.max(
+            deltaCp,
+            severity === "blunder" ? 300 : 150,
+            prevLive?.dropCp || 0
+          ),
+          playedSan: sk.san,
+          bestSan,
+          fen: sk.fenBefore,
+          evalBeforeCp: evalBefore ?? undefined,
+          evalAfterCp: evalAfter ?? undefined,
+          source: "live",
+          structuralKind: keepStructural || undefined,
+          inputs: {
+            ...(prevLive?.inputs || {}),
+            ...lineInputs,
+            critical_mark: mark || "mistake",
+            ...(missedAfterOpp ? { missed_after_opp: missedAfterOpp } : {}),
+          },
+        });
+      } else if (isUserPly && isPraiseMark(mark)) {
+        const praiseDrop = mark === "brilliant" ? 35 : 28;
+        momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
+          ply: sk.ply,
+          moveNumber: sk.fullmove,
+          severity: null,
+          dropCp: Math.max(momentAtPly?.dropCp || 0, praiseDrop),
+          playedSan: sk.san,
+          bestSan,
+          fen: sk.fenBefore,
+          evalBeforeCp: evalBefore ?? undefined,
+          evalAfterCp: evalAfter ?? undefined,
+          source: momentAtPly?.source || "live",
+          inputs: {
+            ...(momentAtPly?.inputs || {}),
+            praise_mark: mark,
+          },
+        });
+      } else if (isUserPly && momentAtPly) {
+        const enrichLineCompare =
+          !playedBest &&
+          (momentAtPly.structuralKind === "opening_name" ||
+            (momentAtPly.structuralKind === "opening_aggregate" &&
+              openingEvalGapAllowsEngineLine({
+                mark,
+                deltaCp,
+                fenBefore: sk.fenBefore,
+                userColor,
+                evalBeforeCp: evalBefore,
+                evalAfterCp: evalAfter,
+              })));
+        const enrichReq = enrichLineCompare
+          ? buildCoachNoteRequest({
+              ply: sk.ply,
+              phase: phaseEarly,
+              mark,
+              moment: momentAtPly,
+              deltaCp,
+              fenBefore: sk.fenBefore,
+              fenAfter: sk.fenAfter,
+              bestPvSan,
+              playedLineSans: playedAltLine,
+              playedSan: sk.san,
+              playedContinuationSans: playedContSans,
+              userColor,
+              evalBeforeCp: evalBefore,
+              evalAfterCp: evalAfter,
+            })
+          : null;
+        const lineInputs = enrichReq
+          ? lineComparisonMomentInputs(enrichReq)
+          : {};
+        // Quiet opening checkpoint / best move: never stamp engine-vs-played noise.
+        // Pawn-break keeps horizon structure Δ even when the break was best.
+        if (
+          (momentAtPly.structuralKind === "opening_aggregate" &&
+            !enrichLineCompare) ||
+          (playedBest &&
+            (momentAtPly.structuralKind === "opening_name" ||
+              momentAtPly.structuralKind === "opening_aggregate"))
+        ) {
+          if (momentAtPly.inputs) {
+            const cleaned = { ...momentAtPly.inputs };
+            delete cleaned.engine_line;
+            delete cleaned.engine_line_metrics;
+            delete cleaned.played_line;
+            delete cleaned.played_line_metrics;
+            delete cleaned.engine_vs_played;
+            delete cleaned.why_better;
+            delete cleaned.metric_keys;
+            delete cleaned.primary_metric_keys;
+            delete cleaned.primary_field;
+            delete cleaned.metric_signals;
+            momentAtPly = { ...momentAtPly, inputs: cleaned };
+          }
+        }
+        momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
+          ...momentAtPly,
+          fen: momentAtPly.fen || sk.fenBefore,
+          playedSan: momentAtPly.playedSan || sk.san,
+          bestSan:
+            momentAtPly.structuralKind === "opening_aggregate" &&
+            !enrichLineCompare
+              ? momentAtPly.bestSan
+              : momentAtPly.bestSan || bestSan,
+          source: momentAtPly.source,
+          inputs: {
+            ...(momentAtPly.inputs || {}),
+            ...lineInputs,
+          },
+        });
+      }
+
+      // Middlegame: decisive pawn break (structure lever — not only best move).
+      if (isUserPly && phaseEarly === "middlegame" && evalBefore != null) {
+        try {
+          const afterBoard = new Chess(sk.fenAfter);
+          const probe = new Chess(sk.fenBefore);
+          const mv = probe.move(sk.san);
+          if (
+            mv &&
+            isPawnBreakMove(afterBoard, mv, userIsWhite ? "w" : "b")
+          ) {
+            if (!usedStrongEngine) {
+              await runStrongEngine();
+              usedStrongEngine = true;
+              playedBest = Boolean(bestSan && bestSan === sk.san);
+            }
+            const openingTheme = metrics.themesByPhase.opening[0] || null;
+            const breakContSans =
+              afterEval?.bestPv?.length
+                ? pvToSan(
+                    sk.fenAfter,
+                    afterEval.bestPv,
+                    Math.max(1, engineLineSansBudget() - 1)
+                  )
+                : playedContSans;
+            const breakAltLine = composePlayedAltLine({
+              playedSan: sk.san,
+              continuationSans: breakContSans,
+            });
+            momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
+              ply: sk.ply,
+              moveNumber: sk.fullmove,
+              severity: null,
+              dropCp: Math.max(momentAtPly?.dropCp || 0, 40),
+              playedSan: sk.san,
+              bestSan,
+              fen: sk.fenBefore,
+              evalBeforeCp: evalBefore ?? undefined,
+              evalAfterCp: evalAfter ?? undefined,
+              source: momentAtPly?.source || "structural",
+              structuralKind: "decisive_pawn_break",
+              inputs: {
+                opening: options.opening || openingTheme,
+                eco: options.eco || null,
+                pawn_break: true,
+                played_best: playedBest,
+                san: sk.san,
+              },
+            });
+            const breakReq = buildCoachNoteRequest({
+              ply: sk.ply,
+              phase: phaseEarly,
+              mark,
+              moment: momentAtPly,
+              deltaCp,
+              fenBefore: sk.fenBefore,
+              fenAfter: sk.fenAfter,
+              bestPvSan,
+              playedLineSans: breakAltLine,
+              playedSan: sk.san,
+              playedContinuationSans: breakContSans,
+              userColor,
+              evalBeforeCp: evalBefore,
+              evalAfterCp: evalAfter,
+            });
+            if (breakReq) {
+              momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
+                ...momentAtPly,
+                inputs: {
+                  ...(momentAtPly.inputs || {}),
+                  ...lineComparisonMomentInputs({
+                    ...breakReq,
+                    bestSan,
+                    phase: phaseEarly,
+                    openingKeyId,
+                    openingName: options.opening || null,
+                  }),
+                  ...coachRequestMetaInputs(breakReq),
+                },
+              });
+            }
+          }
+        } catch {
+          /* ignore illegal probe */
+        }
+      }
+
+      // Opponent WP gift → pending missed-mark only (no coach moment / tip).
       if (
         !isUserPly &&
         evalBefore != null &&
@@ -946,171 +1575,90 @@ export async function analyzeSelectedGame(options: {
         if (wpAfterUser - wpBeforeUser >= 0.1) {
           pendingOppChance = true;
           pendingOppWp = wpAfterUser;
+          pendingOppKind =
+            wpAfterUser - wpBeforeUser >= 0.2 ? "blunder" : "mistake";
         }
       }
 
       const structure = structureTracker.update(sk.fenBefore, sk.fenAfter);
-
-      if (sample) {
-        const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
-        const phase = phaseForPly(sk.ply, pieceCount);
-        const pov = assessPositionPov(sk.fenAfter, userColor);
-        const moment = momentAtPly;
-        const perspective = isUserPly ? "user" : "opponent";
-        const provisionalThemes = [
-          ...structure,
-          ...(pov.kingMotifLive ? pov.themes : []),
-          ...openingTags,
-          ...(isUserPly ? metrics.themesByPhase[phase] : []),
-        ];
-        const errorKind = isUserPly
-          ? classifyUserError({
-              fenBefore: sk.fenBefore,
-              playedSan: sk.san,
-              bestSan,
-              bestPvSan,
-              deltaCp,
-              themes: provisionalThemes,
-              userColor,
-              moment,
-              pov,
-            })
-          : null;
-        const noteWorthy = shouldComposeNote({
-          perspective,
-          deltaCp,
-          playedBest,
-          moment,
-          structure,
-          errorKind,
-          ply: sk.ply,
-          userPlyCount,
-        });
-        const wantPhasePlan =
-          isUserPly && phasePlanSlotOpen(phase, sk.ply);
-        if (!noteWorthy && !wantPhasePlan) {
-          note = "";
-        } else {
-          const metricsThemes = isUserPly
-            ? moment || deltaCp >= 80 || playedBest
-              ? [
-                  ...metrics.themesByPhase[phase],
-                  ...(moment ? metrics.globalThemes : []),
-                ]
-              : []
-            : [];
-          const themes = expandCoachThemes({
-            structure,
-            openingTags,
-            phase,
-            deltaCp,
-            playedBest,
-            metricsThemes,
-            moment,
-            perspective,
-            errorKind,
-            noteWorthy: noteWorthy || wantPhasePlan,
-            pov,
-            fenBefore: sk.fenBefore,
-            playedSan: sk.san,
-            bestSan,
-            usedTips,
-          });
-          const ragThemes = themes.filter((t) => {
-            if (!KING_FILTER.has(t)) return true;
-            return (
-              themes.includes("opp_king_exposed") ||
-              themes.includes("user_king_exposed") ||
-              themes.includes("attack") ||
-              pov.kingMotifLive
-            );
-          });
-          const wantCount =
-            noteWorthy &&
-            ((!isUserPly && deltaCp >= 80) ||
-              (isUserPly &&
-                (errorKind || moment || playedBest || deltaCp < 40)))
-              ? 1
-              : 0;
-          let momentEvent: MomentEvent = "accuracy";
-          if (deltaCp >= 150 || (moment && deltaCp >= 120)) {
-            momentEvent = "blunder";
-          } else if (
-            errorKind === "mistake" ||
-            errorKind === "missed_opportunity" ||
-            (moment && deltaCp >= 80)
-          ) {
-            momentEvent = "mistake";
-          } else if (deltaCp >= 40 && !playedBest) {
-            momentEvent = "inaccuracy";
-          } else {
-            momentEvent = "accuracy";
-          }
-          const retrieveCtx: RetrieveContext = {
-            themes: ragThemes.length ? ragThemes : themes,
-            phase,
-            wantCount,
-            strict: true,
-            fen: sk.fenBefore,
-            san: sk.san,
-            bestSan,
-            eco: options.eco,
-            opening: options.opening,
-            recentSans: skeleton.slice(0, i + 1).map((p) => p.san),
-            gameKeys,
-            momentEvent,
-          };
-          const nuggets: KnowledgeNugget[] =
-            wantCount > 0
-              ? await mergeHybridKnowledgeNuggets(
-                  retrieveCtx,
-                  usedKnowledge,
-                  options.retrieveKnowledge || null
-                )
-              : [];
-          // Capture full tip metadata for finale (games cites)
-          if (wantCount > 0 && isUserPly) {
-            const tip = pickMomentKey({
-              gameKeys,
-              packEntries: coachPack.entries,
-              phase,
-              themes: ragThemes.length ? ragThemes : themes,
-              recentSans: skeleton.slice(0, i + 1).map((p) => p.san),
-              eco: options.eco,
-              event: momentEvent,
-            });
-            if (tip && !usedKeyTips.some((t) => t.keyId === tip.keyId)) {
-              usedKeyTips.push(tip);
-            }
-          }
-          note = composeCoachNote({
-            side: sk.side,
-            userColor,
-            san: sk.san,
-            fenBefore: sk.fenBefore,
-            fenAfter: sk.fenAfter,
-            deltaCp,
-            bestSan,
-            bestPvSan,
-            themes,
-            concepts: nuggets.map((n) => n.text),
-            usedTips,
-            openingLabel,
-            openingTags,
-            ply: sk.ply,
-            phase,
-            metrics,
-            moment,
-            errorKind,
-            pov,
-            playedBest,
-            userPlyCount,
-            evalBeforeWhite: evalBefore,
-            evalAfterWhite: evalAfter,
-            opponentReplySan: skeleton[i + 1]?.san ?? null,
-          });
+      let stormTempo = 0;
+      if (isUserPly) {
+        try {
+          const afterBoard = new Chess(sk.fenAfter);
+          stormTempo = sfPawnStormTracker.update(
+            afterBoard,
+            userIsWhite ? "w" : "b"
+          );
+        } catch {
+          stormTempo = 0;
         }
       }
+
+      if (sample && isUserPly) {
+        const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
+        const phase = phaseForPly(sk.ply, pieceCount, metrics.phaseBounds);
+        const moment = momentAtPly;
+        const phaseThemesEarly = metrics.themesByPhase[phase] || [];
+        const liveSituations = detectSituations({
+          fen: sk.fenAfter,
+          phase,
+          userColor,
+          structureThemes: structure,
+          pawnStormTempo: stormTempo,
+        });
+        stickySituations = mergeStickySituations(
+          stickySituations,
+          liveSituations
+        );
+        const planSituations = stickySituations;
+        const unusedStructure = durableUnusedStructureThemes({
+          windowedStructure: structure,
+          situations: planSituations,
+          structureThemeUsed,
+          phaseThemesFallback: phaseThemesEarly,
+        });
+        const noteRequest = buildCoachNoteRequest({
+          ply: sk.ply,
+          phase,
+          mark,
+          moment,
+          deltaCp,
+          fenBefore: sk.fenBefore,
+          fenAfter: sk.fenAfter,
+          bestPvSan,
+          playedLineSans: playedAltLine,
+          playedSan: sk.san,
+          playedContinuationSans: playedContSans,
+          userColor,
+          evalBeforeCp: evalBefore,
+          evalAfterCp: evalAfter,
+          unusedStructureThemes: unusedStructure,
+          structureThemes: structure,
+          pawnStormTempo: stormTempo,
+          situations: planSituations,
+        });
+        if (noteRequest && moment) {
+          const lineInputs = lineComparisonMomentInputs(noteRequest);
+          const metaInputs = coachRequestMetaInputs(noteRequest);
+          if (
+            Object.keys(lineInputs).length ||
+            Object.keys(metaInputs).length
+          ) {
+            moment.inputs = {
+              ...(moment.inputs || {}),
+              ...lineInputs,
+              ...metaInputs,
+            };
+            if (!moment.bestSan && bestSan) {
+              moment.bestSan = bestSan;
+            }
+            metrics.momentsByPly[sk.ply] = moment;
+            momentAtPly = moment;
+          }
+        }
+        void structure;
+      }
+      note = "";
     } catch {
       analyzed = false;
       note = "";
@@ -1118,31 +1666,6 @@ export async function analyzeSelectedGame(options: {
     }
 
     prevEval = evalAfter ?? evalBefore ?? prevEval;
-
-    // Opponent missed a forcing shot that existed because of the prior user
-    // blunder → put "walks into …" on the user move; opponent only "misses".
-    if (!isUserPly && plies.length) {
-      const forcing = missedForcingLine({
-        playedSan: sk.san,
-        bestSan,
-        bestPvSan,
-        deltaCp,
-      });
-      const prev = plies[plies.length - 1];
-      if (
-        forcing &&
-        prev &&
-        prev.side === userColor &&
-        isCoachMistakeOrWorse(prev.mark)
-      ) {
-        const walkIn = `${prev.san} walks into ${forcing}.`;
-        prev.note = walkIn;
-        claimNoteText(walkIn, usedTips);
-        claimNoteTopic(usedTips, "tactic");
-        // One tactic topic per game — teach it on the user blunder, not again on the miss.
-        note = "";
-      }
-    }
 
     plies.push({
       ...sk,
@@ -1160,6 +1683,130 @@ export async function analyzeSelectedGame(options: {
     await new Promise((r) => setTimeout(r, 0));
   }
 
+  // Opp gifts never become coach moments (strip legacy / accidental injects).
+  for (const [plyKey, m] of Object.entries(metrics.momentsByPly)) {
+    if (m.structuralKind !== "opponent_mistake") continue;
+    if (m.inputs?.critical_mark) {
+      delete m.structuralKind;
+      metrics.momentsByPly[Number(plyKey)] = m;
+    } else {
+      delete metrics.momentsByPly[Number(plyKey)];
+    }
+  }
+
+  // Drop terminal eval explosions / non-deviations (annotate parity).
+  for (const [ply, m] of Object.entries(metrics.momentsByPly)) {
+    if (m.structuralKind || m.inputs?.praise_mark) continue;
+    if (m.severity && m.source === "live") {
+      if (m.dropCp >= 500 || Math.abs(m.evalBeforeCp || 0) >= 9000) {
+        delete metrics.momentsByPly[Number(ply)];
+      }
+      continue;
+    }
+    if (
+      m.dropCp >= 500 ||
+      Math.abs(m.evalBeforeCp || 0) >= 9000 ||
+      (m.playedSan && m.bestSan && m.bestSan === m.playedSan)
+    ) {
+      delete metrics.momentsByPly[Number(ply)];
+    }
+  }
+
+  // Rebuild metrics with eval buckets + style (move effects already in heuristics).
+  const evalsCp: number[] = [];
+  if (plies.length) {
+    evalsCp.push(plies[0]!.evalBeforeCp ?? 0);
+    for (const p of plies) {
+      evalsCp.push(p.evalAfterCp ?? evalsCp[evalsCp.length - 1]!);
+    }
+  }
+  const evalMetrics = analyzeEvalBucketMetrics(studyGame, evalsCp);
+  const openingMerged = heuristicRows.opening
+    ? {
+        ...heuristicRows.opening,
+        opening_accuracy_pct:
+          evalMetrics.opening_accuracy_pct ??
+          heuristicRows.opening.opening_accuracy_pct,
+        accuracy_moves:
+          evalMetrics.opening_accuracy_moves ||
+          heuristicRows.opening.accuracy_moves,
+      }
+    : null;
+  const mergedMg =
+    heuristicRows.middlegame && evalMetrics.middlegameEval
+      ? mergeMiddlegameHeuristicWithBucket(
+          heuristicRows.middlegame,
+          evalMetrics.middlegameEval
+        )
+      : heuristicRows.middlegame;
+  const mergedEg =
+    heuristicRows.endgame && evalMetrics.endgameEval
+      ? mergeEndgameHeuristicWithBucket(
+          heuristicRows.endgame,
+          evalMetrics.endgameEval
+        )
+      : heuristicRows.endgame;
+  const liveMoments = { ...metrics.momentsByPly };
+  if (openingMerged && mergedMg && mergedEg) {
+    metrics = buildCoachGameMetrics({
+      record: {
+        evalsWhiteCp: evalsCp,
+        openingCandidates: vaultRecord?.openingCandidates,
+        mistakeCandidates: vaultRecord?.mistakeCandidates,
+        opening_accuracy_pct: evalMetrics.opening_accuracy_pct,
+        opening_accuracy_moves: evalMetrics.opening_accuracy_moves,
+        middlegameEval: evalMetrics.middlegameEval,
+        endgameEval: evalMetrics.endgameEval,
+        style: evalMetrics.style,
+      },
+      heuristics: {
+        opening: openingMerged,
+        middlegame: mergedMg,
+        endgame: mergedEg,
+      },
+      userColor,
+    });
+    for (const [ply, m] of Object.entries(liveMoments)) {
+      metrics.momentsByPly[Number(ply)] = m;
+    }
+    enrichOpeningCoachMoments({
+      momentsByPly: metrics.momentsByPly,
+      opening: openingMerged,
+      userColor,
+      badAccuracyMoves: vaultRecord?.openingCandidates?.length ?? null,
+      peer: peerCtx,
+      openingName:
+        formatOpeningLabel(options.eco, options.opening) ||
+        options.opening ||
+        null,
+    });
+    enrichMiddlegameCoachMoments({
+      momentsByPly: metrics.momentsByPly,
+      middlegame: mergedMg,
+      peer: peerCtx,
+      styleExtras: {
+        brilliant_moves: evalMetrics.style?.brilliant_moves ?? null,
+        excellent_moves: evalMetrics.style?.excellent_moves ?? null,
+        important_moves: evalMetrics.style?.important_moves ?? null,
+      },
+    });
+    enrichLiveMiddlegamePeerGaps({
+      momentsByPly: metrics.momentsByPly,
+      middlegame: mergedMg,
+      peer: peerCtx,
+    });
+    enrichMiddlegameStrategicMoments({
+      momentsByPly: metrics.momentsByPly,
+      userColor: userIsWhite ? "w" : "b",
+    });
+    enrichEndgameCoachMoments({
+      momentsByPly: metrics.momentsByPly,
+      userColor: userIsWhite ? "w" : "b",
+      eg: mergedEg || heuristicRows.endgame,
+      style: evalMetrics.style,
+    });
+  }
+
   const theoryEndPly = resolveBookEndPly({
     mapEndPly,
     namedEndPly,
@@ -1169,22 +1816,303 @@ export async function analyzeSelectedGame(options: {
   const bookEndPly = trimBookEndByWinProb(plies, theoryEndPly, userIsWhite);
   if (bookEndPly != null) {
     for (const ply of plies) {
-      if (ply.ply <= bookEndPly) ply.mark = "book";
+      if (ply.ply > bookEndPly) continue;
+      if (ply.mark && COACH_MARKS_KEEP_OVER_BOOK.has(ply.mark)) continue;
+      ply.mark = "book";
     }
   }
 
+  // ——— Pass C: soft keys / themes / pack tips (after full metric context) ———
+  options.onProgress?.({
+    ply: skeleton.length,
+    total: skeleton.length,
+    status: "Selecting coach comments…",
+  });
+  const coachPack = await loadCoachPack();
+  const packByKey = getCoachPackByKey();
+  const phaseKeys: PhaseGameKeys = collectGameKeysByPhase({
+    entries: coachPack.entries,
+    byKey: packByKey,
+    eco: options.eco,
+    opening: options.opening,
+    themesByPhase: metrics.themesByPhase,
+    globalThemes: metrics.globalThemes,
+  });
+  const gameKeys = collectGameKeys({
+    entries: coachPack.entries,
+    byKey: packByKey,
+    eco: options.eco,
+    opening: options.opening,
+    themesByPhase: metrics.themesByPhase,
+    globalThemes: metrics.globalThemes,
+  });
+  if (openingKeyId) {
+    const hit =
+      packByKey?.get(openingKeyId) ||
+      coachPack.entries.find((e) => (e.keyId || e.id) === openingKeyId);
+    if (hit) {
+      phaseKeys.opening = [
+        hit,
+        ...phaseKeys.opening.filter(
+          (e) => (e.keyId || e.id) !== openingKeyId
+        ),
+      ];
+    }
+  }
+
+  const tipStructureTracker = new StructureThemeTracker();
+  const pawnStormTracker = new PawnStormTracker(4);
+  for (let i = 0; i < plies.length; i += 1) {
+    if (options.signal?.cancelled) break;
+    const ply = plies[i]!;
+    const isUserPly = ply.side === userColor;
+    if (!isUserPly) {
+      tipStructureTracker.update(ply.fenBefore, ply.fenAfter);
+      continue;
+    }
+    const structure = tipStructureTracker.update(ply.fenBefore, ply.fenAfter);
+    let stormTempo = 0;
+    try {
+      const afterBoard = new Chess(ply.fenAfter);
+      stormTempo = pawnStormTracker.update(
+        afterBoard,
+        userColor === "white" ? "w" : "b"
+      );
+    } catch {
+      stormTempo = 0;
+    }
+    const pieceCount = ply.fenAfter.split(" ")[0].replace(/\d/g, "").length;
+    const phase = phaseForPly(ply.ply, pieceCount, metrics.phaseBounds);
+    const moment = metrics.momentsByPly[ply.ply] || null;
+    const playedBest = Boolean(ply.bestSan && ply.bestSan === ply.san);
+    const pov = assessPositionPov(ply.fenAfter, userColor);
+    const provisionalThemes = [
+      ...structure,
+      ...(pov.kingMotifLive ? pov.themes : []),
+      ...openingTags,
+      ...metrics.themesByPhase[phase],
+    ];
+    const errorKind = classifyUserError({
+      fenBefore: ply.fenBefore,
+      playedSan: ply.san,
+      bestSan: ply.bestSan,
+      bestPvSan: ply.bestPvSan,
+      deltaCp: ply.deltaCp,
+      themes: provisionalThemes,
+      userColor,
+      moment,
+      pov,
+      coachMark: ply.mark,
+    });
+    const phaseThemes = metrics.themesByPhase[phase] || [];
+    const liveSituations = detectSituations({
+      fen: ply.fenAfter,
+      phase,
+      userColor,
+      structureThemes: structure,
+      pawnStormTempo: stormTempo,
+    });
+    stickySituations = mergeStickySituations(
+      stickySituations,
+      liveSituations
+    );
+    const planSituations = stickySituations;
+    const unusedStructure = durableUnusedStructureThemes({
+      windowedStructure: structure,
+      situations: planSituations,
+      structureThemeUsed,
+      phaseThemesFallback: phaseThemes,
+    });
+    const playedContSans =
+      ply.bestPvSan.length > 1 ? ply.bestPvSan.slice(1) : [];
+    gamePlan = advanceGamePlan(gamePlan, {
+      situations: planSituations,
+      structureThemes: structure,
+      phase,
+    });
+    const noteRequest = buildCoachNoteRequest({
+      ply: ply.ply,
+      phase,
+      mark: ply.mark,
+      moment,
+      deltaCp: ply.deltaCp,
+      fenBefore: ply.fenBefore,
+      fenAfter: ply.fenAfter,
+      bestPvSan: ply.bestPvSan,
+      playedSan: ply.san,
+      playedContinuationSans: playedContSans,
+      userColor,
+      evalBeforeCp: ply.evalBeforeCp,
+      evalAfterCp: ply.evalAfterCp,
+      unusedStructureThemes: unusedStructure,
+      structureThemes: structure,
+      pawnStormTempo: stormTempo,
+      situations: planSituations,
+    });
+    const noteWorthy = shouldComposeNote({
+      perspective: "user",
+      deltaCp: ply.deltaCp,
+      playedBest,
+      moment,
+      structure,
+      errorKind,
+      mark: ply.mark,
+      ply: ply.ply,
+      userPlyCount: Math.ceil(ply.ply / 2),
+    });
+    const metricTipOk = shouldAttachMetricTip({
+      phase,
+      moment,
+      mark: ply.mark,
+      deltaCp: ply.deltaCp,
+      phaseThemes,
+      structureThemeUsed,
+      request: noteRequest,
+    });
+    if (!metricTipOk) continue;
+
+    const metricsThemes = [
+      ...metrics.themesByPhase[phase],
+      ...(moment || ply.deltaCp >= 50 ? metrics.globalThemes : []),
+    ];
+    const themes = expandCoachThemes({
+      structure,
+      openingTags,
+      phase,
+      deltaCp: ply.deltaCp,
+      playedBest,
+      metricsThemes,
+      moment,
+      perspective: "user",
+      errorKind,
+      noteWorthy: noteWorthy || metricTipOk,
+      pov,
+      fenBefore: ply.fenBefore,
+      playedSan: ply.san,
+      bestSan: ply.bestSan,
+      usedTips,
+    });
+    void noteWorthy;
+    // Always-attach coach calls (praise / bad / structural / fixed) skip phase cap.
+    const alwaysCall =
+      (noteRequest != null && requestAlwaysAttaches(noteRequest.kind)) ||
+      isFixedCheckpointMoment(moment);
+    if (
+      !alwaysCall &&
+      phaseNoteCounts[phase] >= PHASE_NOTE_LIMITS[phase]
+    ) {
+      continue;
+    }
+
+    const tip = pickMetricTip({
+      entries: phaseKeys[phase],
+      byKey: packByKey,
+      metrics,
+      phase,
+      mark: ply.mark,
+      deltaCp: ply.deltaCp,
+      moment,
+      openingKeyId,
+      eco: options.eco,
+      opening: options.opening,
+      themes,
+      excludeNoteIds: usedNoteIds,
+      structureThemeUsed,
+      allowStructureQuiet: false,
+      request: noteRequest,
+      userColor,
+      priorTopics: openingPriorTopics,
+      gamePlan,
+      onOpeningTipUsed: (meta) => {
+        openingPriorTopics = mergeOpeningTipPrior(openingPriorTopics, meta);
+        gamePlan = mergeOpeningPlanKeys(
+          gamePlan,
+          meta.softKeys,
+          openingKeyId
+        );
+      },
+    });
+    if (!tip) continue;
+    if (tip.keyIds?.length || tip.keyId) {
+      gamePlan = markPlanKeysTaught(
+        gamePlan,
+        tip.keyIds?.length ? tip.keyIds : tip.keyId ? [tip.keyId] : []
+      );
+    }
+    if (moment) {
+      const ids =
+        tip.keyIds?.length
+          ? tip.keyIds.slice(0, 3)
+          : tip.keyId
+            ? [tip.keyId]
+            : [];
+      const metaStamp = coachRequestMetaInputs(noteRequest);
+      if (ids.length || Object.keys(metaStamp).length) {
+        moment.inputs = {
+          ...(moment.inputs || {}),
+          ...metaStamp,
+          ...(ids.length
+            ? {
+                key_id: ids[0]!,
+                key_ids: ids.join(","),
+                game_plan: formatGamePlanShort(gamePlan) || null,
+              }
+            : {
+                game_plan: formatGamePlanShort(gamePlan) || null,
+              }),
+        };
+      }
+    }
+    const tipHasSquares = /\b[a-h][1-8]\b/i.test(tip.text || "");
+    const note = acceptKeyNote(tip.text, usedTips, {
+      themes,
+      fenBefore: tipHasSquares ? ply.fenBefore : undefined,
+      san: tipHasSquares ? ply.san : undefined,
+      bestSan: tipHasSquares ? ply.bestSan : undefined,
+      bestPvSan: tipHasSquares ? ply.bestPvSan : undefined,
+      userColor,
+      phase,
+      noteId: tip.noteId,
+    });
+    if (!note) continue;
+    tip.text = note;
+    ply.note = note;
+    usedKeyTips.push(tip);
+    phaseNoteCounts[phase] += 1;
+    if (tip.noteId) usedNoteIds.add(tip.noteId);
+    selectedNotes.push(note);
+    for (const t of structure) structureThemeUsed.add(t);
+  }
+
   if (plies.length) {
-    plies[plies.length - 1].note = composeGameSummaryNote({
+    plies[plies.length - 1]!.note = composeGameSummaryNote({
       plies,
       userColor,
       metrics,
       openingLabel,
+      openingPackKey: openingKeyId,
       usedKeyTips,
       gameKeys,
+      selectedNotes,
     });
   }
 
   if (options.platform && options.username && plies.length) {
+    const filters = {
+      platform: options.platform,
+      username: options.username,
+    };
+    try {
+      if (openingMerged && mergedMg && mergedEg) {
+        await upsertHeuristicGame(filters, options.gameId, {
+          opening: openingMerged,
+          middlegame: mergedMg,
+          endgame: mergedEg,
+        });
+      }
+    } catch {
+      /* heuristics store write optional */
+    }
     try {
       const product = buildVaultProductFromPlies({
         gameId: options.gameId,
@@ -1196,27 +2124,18 @@ export async function analyzeSelectedGame(options: {
         plies,
         positions: { ...sharedPositions, ...collectedPositions },
       });
-      await upsertSharedGameEvals(
-        { platform: options.platform, username: options.username },
-        options.gameId,
-        {
-          positions: product.positions,
-          evalsWhiteCp: product.evalsWhiteCp,
-          mistakeCandidates: product.mistakeCandidates,
-          openingCandidates: product.openingCandidates,
-          opening_accuracy_pct: product.opening_accuracy_pct,
-          opening_accuracy_moves: product.opening_accuracy_moves,
-          endgameEval: product.endgameEval,
-          middlegameEval: product.middlegameEval,
-          style: product.style,
-          // Keep Study/Insights candidates/metrics if they already scanned deeper meta
-          preferExistingMeta: Boolean(
-            vaultRecord?.mistakeCandidates?.length ||
-              vaultRecord?.openingCandidates?.length ||
-              vaultRecord?.style
-          ),
-        }
-      );
+      await upsertSharedGameEvals(filters, options.gameId, {
+        positions: product.positions,
+        evalsWhiteCp: product.evalsWhiteCp,
+        mistakeCandidates: product.mistakeCandidates,
+        openingCandidates: product.openingCandidates,
+        opening_accuracy_pct: product.opening_accuracy_pct,
+        opening_accuracy_moves: product.opening_accuracy_moves,
+        endgameEval: product.endgameEval ?? evalMetrics.endgameEval,
+        middlegameEval: product.middlegameEval ?? evalMetrics.middlegameEval,
+        style: product.style ?? evalMetrics.style,
+        preferExistingMeta: false,
+      });
     } catch {
       /* vault write optional */
     }

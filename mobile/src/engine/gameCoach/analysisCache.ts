@@ -1,8 +1,14 @@
 import { PERMANENT_CACHE_TTL_MS, readCache, writeCache } from "../../storage/cache";
 import type { GameCoachResult } from "./analyzeGame";
 
-function cacheKey(platform: string, username: string, gameId: string): string {
-  return `game-coach:v51:${platform}|${username.trim().toLowerCase()}|${gameId}`;
+export const GAME_COACH_CACHE_VERSION = "v127";
+
+export function gameCoachAnalysisCacheKey(
+  platform: string,
+  username: string,
+  gameId: string
+): string {
+  return `game-coach:${GAME_COACH_CACHE_VERSION}:${platform}|${username.trim().toLowerCase()}|${gameId}`;
 }
 
 export async function loadCachedGameAnalysis(
@@ -12,7 +18,7 @@ export async function loadCachedGameAnalysis(
 ): Promise<GameCoachResult | null> {
   if (!username.trim() || !gameId) return null;
   return readCache<GameCoachResult>(
-    cacheKey(platform, username, gameId),
+    gameCoachAnalysisCacheKey(platform, username, gameId),
     PERMANENT_CACHE_TTL_MS
   );
 }
@@ -23,5 +29,8 @@ export async function saveCachedGameAnalysis(
   result: GameCoachResult
 ): Promise<void> {
   if (!username.trim() || !result.gameId) return;
-  await writeCache(cacheKey(platform, username, result.gameId), result);
+  await writeCache(
+    gameCoachAnalysisCacheKey(platform, username, result.gameId),
+    result
+  );
 }

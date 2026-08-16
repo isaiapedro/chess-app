@@ -68,10 +68,15 @@ function moverHasMate(cpWhite: number, moverIsWhite: boolean): boolean {
 }
 
 export function forcingPrefix(pvSan: string[]): string {
-  const bits: string[] = [];
-  for (const san of pvSan.slice(0, 6)) {
+  if (!pvSan.length) return "";
+  const bits: string[] = [pvSan[0]!];
+  let quietStreak =
+    /[+#]$/.test(pvSan[0]!) || pvSan[0]!.includes("x") ? 0 : 1;
+  for (const san of pvSan.slice(1, 8)) {
     bits.push(san);
-    if (!/[+#]$/.test(san) && !san.includes("x")) break;
+    const force = /[+#]$/.test(san) || san.includes("x");
+    quietStreak = force ? 0 : quietStreak + 1;
+    if (quietStreak >= 2 && bits.length >= 2) break;
   }
   return bits.join(" ");
 }
@@ -408,3 +413,115 @@ export function detectTacticalFact(args: {
 
   return empty;
 }
+
+/** Soft keys for didactic pack when a tactical fact fires. */
+export function softKeysForTacticalFact(
+  fact: TacticalFact | null | undefined
+): string[] {
+  if (!fact?.kind) return [];
+  switch (fact.kind) {
+    case "missed_mate":
+    case "hung_mate":
+      return [
+        "methodology.visualization",
+        "methodology.candidate_moves",
+        "attack.initiative",
+      ];
+    case "missed_capture":
+      return [
+        "methodology.candidate_moves",
+        "attack.initiative",
+        "methodology.visualization",
+      ];
+    case "missed_tactic":
+      return [
+        "motif.intermediate_move",
+        "methodology.visualization",
+        "methodology.candidate_moves",
+      ];
+    case "gave_piece":
+      return [
+        "methodology.candidate_moves",
+        "positional.prophylaxis",
+        "methodology.visualization",
+      ];
+    case "bad_trade":
+      return [
+        "methodology.comparison_and_elimination",
+        "methodology.candidate_moves",
+        "piece.simplification",
+      ];
+    case "sacrifice":
+      return ["motif.sacrifice", "attack.initiative", "methodology.visualization"];
+    default:
+      return ["methodology.candidate_moves"];
+  }
+}
+
+/** One-line accurate diagnosis (no book story). */
+export function formatTacticalFactHead(fact: TacticalFact): string {
+  if (!fact.kind) return "";
+  const piece = fact.pieceLabel || "material";
+  const line = fact.captureSan ? ` Best: ${fact.captureSan}.` : "";
+  switch (fact.kind) {
+    case "missed_mate":
+      return fact.mateIn != null
+        ? `Missed mate in ${fact.mateIn}.${line}`
+        : `Missed a forced mate.${line}`;
+    case "hung_mate":
+      return fact.mateIn != null
+        ? `Allowed mate in ${fact.mateIn}.`
+        : `Allowed a forced mate.`;
+    case "missed_capture":
+      return `Missed capture of the ${piece}.${line}`;
+    case "missed_tactic":
+      return `Missed a forcing line.${line}`;
+    case "gave_piece":
+      return fact.takenNext
+        ? `Hung the ${piece} — taken next.`
+        : `Left the ${piece} hanging.`;
+    case "bad_trade":
+      return `Bad trade of the ${piece}.`;
+    case "sacrifice":
+      return `Sacrificed the ${piece}${fact.takenNext ? " (taken)" : ""}.`;
+    default:
+      return "";
+  }
+}
+
+export function formatTacticalFactShort(fact: TacticalFact | null | undefined): string {
+  if (!fact?.kind) return "";
+  const bits = [fact.kind];
+  if (fact.pieceLabel) bits.push(fact.pieceLabel);
+  if (fact.captureSan) bits.push(fact.captureSan);
+  if (fact.mateIn != null) bits.push(`m${fact.mateIn}`);
+  return bits.join(":");
+}
+
+/** Moment / request input stamps. */
+export function tacticalFactInputs(
+  fact: TacticalFact | null | undefined
+): Record<string, string | number | boolean | null> {
+  if (!fact?.kind) return {};
+  return {
+    tactical_kind: fact.kind,
+    tactical_line: fact.captureSan,
+    tactical_piece: fact.pieceLabel,
+    tactical_mate_in: fact.mateIn,
+    tactical_taken_next: fact.takenNext ? 1 : 0,
+    tactical_head: formatTacticalFactHead(fact),
+  };
+}
+
+/** Weight boost when ranking soft keys for an active tactical fact. */
+export function tacticalLockBoostForKey(
+  keyId: string,
+  fact: TacticalFact | null | undefined
+): number {
+  const keys = softKeysForTacticalFact(fact);
+  if (!keys.length) return 0;
+  const idx = keys.indexOf(keyId);
+  if (idx < 0) return 0;
+  return Math.max(8, 26 - idx * 4);
+}
+

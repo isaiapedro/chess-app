@@ -7,6 +7,24 @@ export type DerivedFrequentLine = {
   eco: string;
 };
 
+export type DerivedCoachNote = {
+  id: string;
+  text: string;
+  book: string;
+  themes: string[];
+  ecoHints: string[];
+  patterns?: string[];
+  principle?: string;
+  phase?: string;
+  fens?: string[];
+  sanLines?: string[];
+  openings?: string[];
+  games?: string[];
+  specificity?: number;
+  features?: string[];
+  compact?: string;
+};
+
 export type DerivedCoachEntry = {
   id: string;
   text: string;
@@ -16,12 +34,15 @@ export type DerivedCoachEntry = {
   motifs: string[];
   ecoHints: string[];
   frequentLines: DerivedFrequentLine[];
+  notes?: DerivedCoachNote[];
   keyId?: string;
   keyType?: string;
   label?: string;
   games?: string[];
   books?: string[];
   sourceKind?: string;
+  compactDefinition?: string;
+  modelGame?: string;
 };
 
 export type DerivedCoachPack = {

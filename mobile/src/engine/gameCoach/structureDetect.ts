@@ -5,6 +5,15 @@ import {
   hasDoubledPawns,
   hasIsolatedQueenPawn,
 } from "../middlegamePhase";
+import {
+  isClosedCenter,
+  isOppositeSideCastling,
+  isMaroczyBind,
+  isCarlsbad,
+  isMinorityAttack,
+  isCaroSlav,
+  pickSicilianShell,
+} from "./situationProfiles";
 
 const FILES = "abcdefgh";
 
@@ -15,6 +24,12 @@ const PERSIST_STRUCTURE = new Set([
   "hanging_pawns",
   "passed_pawn",
   "pawn_chain",
+  "maroczy_bind",
+  "carlsbad",
+  "caro_slav",
+  "hedgehog",
+  "scheveningen",
+  "dragon_formation",
 ]);
 
 /** Board structures that must survive a ply window before notes cite them. */
@@ -29,6 +44,12 @@ export const WINDOWED_STRUCTURE_THEMES = new Set([
   "bishop_pair",
   "space",
   "minority_attack",
+  "maroczy_bind",
+  "carlsbad",
+  "caro_slav",
+  "hedgehog",
+  "scheveningen",
+  "dragon_formation",
 ]);
 
 const STRUCTURE_WINDOW = 3;
@@ -183,6 +204,16 @@ export function detectStructureThemes(fen: string): string[] {
       }
     }
     if (Math.abs(wAdv - bAdv) >= 3) themes.push("space");
+    if (isClosedCenter(board)) themes.push("closed_center");
+    if (isOppositeSideCastling(board)) themes.push("opposite_side_castling");
+    if (isMaroczyBind(board)) themes.push("maroczy_bind");
+    if (isCarlsbad(board)) {
+      themes.push("carlsbad");
+      if (isMinorityAttack(board)) themes.push("minority_attack");
+    }
+    if (isCaroSlav(board)) themes.push("caro_slav");
+    const shell = pickSicilianShell(board);
+    if (shell) themes.push(shell.id);
   } catch {
     /* ignore */
   }
@@ -493,4 +524,63 @@ export function detectOpeningFamily(
   if (name.includes("dragon")) tags.push("opening_dragon");
 
   return [...new Set(tags)];
+}
+
+const OPENING_TAG_TO_PACK: Record<string, string> = {
+  opening_sicilian: "opening.sicilian",
+  opening_najdorf: "opening.sicilian",
+  opening_dragon: "opening.sicilian",
+  opening_scheveningen: "opening.sicilian",
+  opening_french: "opening.french",
+  opening_french_defence: "opening.french",
+  opening_caro_kann: "opening.caro_kann",
+  opening_queens_gambit: "opening.queens_gambit",
+  opening_qgd: "opening.queens_gambit",
+  opening_kings_indian: "opening.kings_indian",
+  opening_london: "opening.london_system",
+  opening_ruy_lopez: "opening.ruy_lopez",
+  opening_italian: "opening.italian",
+  opening_scandinavian: "opening.scandinavian",
+  opening_petroff: "opening.petroff",
+  opening_english: "opening.english",
+};
+
+const ECO_FAMILY_TO_PACK: Record<string, string> = {
+  "b-sicilian": "opening.sicilian",
+  "c-french": "opening.french",
+  "b-caro-kann": "opening.caro_kann",
+  "d-qgd": "opening.queens_gambit",
+  "d-qga": "opening.queens_gambit",
+  "d-slav": "opening.queens_gambit",
+  "e-kings-indian": "opening.kings_indian",
+  "a-london": "opening.london_system",
+  "a-anti-indian": "opening.london_system",
+  "c-ruy-lopez": "opening.ruy_lopez",
+  "c-italian": "opening.italian",
+  "b-scandinavian": "opening.scandinavian",
+  "c-petroff": "opening.petroff",
+  "a-english": "opening.english",
+};
+
+/**
+ * Hard pack key for this game's opening from ECO / opening name.
+ * Prefer specific tags from detectOpeningFamily, then ECO family map.
+ */
+export function resolveOpeningPackKey(
+  eco?: string | null,
+  opening?: string | null
+): string | null {
+  const tags = detectOpeningFamily(eco, opening);
+  for (const t of tags) {
+    const kid = OPENING_TAG_TO_PACK[t];
+    if (kid) return kid;
+  }
+  const fam = resolveEcoFamily(
+    String(eco || "").trim().toUpperCase() || null,
+    opening || null
+  );
+  if (fam?.key && ECO_FAMILY_TO_PACK[fam.key]) {
+    return ECO_FAMILY_TO_PACK[fam.key];
+  }
+  return null;
 }
