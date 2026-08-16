@@ -2,6 +2,7 @@
  * Smoke checks for seventh-rank + open-file utilization + board metric snaps
  * (run: npx tsx scripts/test-phase-tactical-metrics.mjs)
  */
+import { readFileSync } from "node:fs";
 import { Chess } from "chess.js";
 import {
   applyUserTacticalMove,
@@ -24,14 +25,19 @@ import { toPhaseMetricKeys, themeTagToMetricKey } from "../src/engine/gameCoach/
 import { keysForMetricFields, softKeysForNoteRequest } from "../src/engine/gameCoach/metricNoteKeys.ts";
 import {
   boardMetricSnap,
+  buildCoachNoteRequest,
+  coachRequestMetaInputs,
   diffMetricSnaps,
+  formatCoachNoteRequest,
   metricDeltaAlongSans,
 } from "../src/engine/gameCoach/coachNoteRequest.ts";
 import {
   detectSituations,
+  mergeStickySituations,
   isCarlsbad,
   isCaroSlav,
   isClosedCenter,
+  centerFluidityIndex,
   isDragonFormation,
   isHedgehog,
   isMaroczyBind,
@@ -43,14 +49,29 @@ import {
   softKeysFromSituations,
 } from "../src/engine/gameCoach/situationProfiles.ts";
 import { weightKeyBreakdown } from "../src/engine/gameCoach/metricNoteWeights.ts";
-import { detectStructureThemes } from "../src/engine/gameCoach/structureDetect.ts";
+import { detectStructureThemes, StructureThemeTracker } from "../src/engine/gameCoach/structureDetect.ts";
+import { HEURISTICS_STRUCTURE_PERSIST_PLIES, structurePersistStartPly1 } from "../src/engine/analysisConfig.ts";
 import {
   detectTacticalFact,
   formatTacticalFactHead,
   softKeysForTacticalFact,
   tacticalLockBoostForKey,
 } from "../src/engine/gameCoach/tacticalFact.ts";
-import { buildCoachNoteRequest } from "../src/engine/gameCoach/coachNoteRequest.ts";
+import { shouldDropNoiseCoachMoment } from "../src/engine/gameCoach/coachMomentNoise.ts";
+import {
+  forcedMateMoves,
+  hungMateAfterPlayedMove,
+} from "../src/engine/forcedMate.ts";
+import { formatEvalCp, formatPgnEvalCp } from "../src/engine/winProb.ts";
+import { detectBoardMotif } from "../src/engine/gameCoach/boardMotif.ts";
+import {
+  forcingRatio,
+  measureTacticSharpness,
+  mergeMultiPvGapLines,
+  rankLinesByStm,
+  multipvWpGap,
+} from "../src/engine/gameCoach/tacticSharpness.ts";
+import { composeMomentJudgmentTip } from "../src/engine/gameCoach/momentJudgmentTip.ts";
 import {
   advanceGamePlan,
   emptyGamePlanState,
@@ -63,6 +84,14 @@ import {
   goodVsBadBishopSnap,
   knightVsBishopSnap,
 } from "../src/engine/gameCoach/tier3Metrics.ts";
+import {
+  safeMobilityForSquare,
+  findZeroSafeMobilityPieces,
+  pieceLabelFor,
+  sampleMaterialAlongSans,
+  detectDelayedPieceCapture,
+  isLosingTrapCapture,
+} from "../src/engine/trappedPiece.ts";
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -556,11 +585,11 @@ function play(fen, san) {
 }
 
 {
-  // Closed centre: both sides have d+e pawns
   const closed = new Chess(
-    "rnbqkbnr/pp3ppp/2p1p3/3p4/3PP3/2N5/PPP2PPP/R1BQKBNR w KQkq - 0 4"
+    "rnbqkbnr/ppp2ppp/4p3/3pP3/3P4/8/PPP2PPP/RNBQKBNR w KQkq - 0 4"
   );
-  assert(isClosedCenter(closed), "closed center d+e both sides");
+  assert(isClosedCenter(closed), "closed center French Advance d+e heads");
+  assert(centerFluidityIndex(closed) === 0, "locked centre fluidity 0");
   assert(
     boardMetricSnap(closed, "white").closed_center === 1,
     "snap closed_center"
@@ -572,6 +601,17 @@ function play(fen, san) {
       userColor: "white",
     }).some((s) => s.id === "closed_center"),
     "profile closed_center"
+  );
+  const italian = new Chess(
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4"
+  );
+  assert(!isClosedCenter(italian), "e4-e5 with mobile d-pawns is not closed");
+  const whiteCastled = new Chess(
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQ1RK1 w kq - 5 5"
+  );
+  assert(
+    !isOppositeSideCastling(whiteCastled),
+    "O-O vs king on e8 is not opposite-side"
   );
 }
 
@@ -598,6 +638,10 @@ function play(fen, san) {
   assert(
     keysForMetricFields(["blockade_square_control"]).includes("piece.blockade"),
     "blockade maps to piece.blockade"
+  );
+  assert(
+    !keysForMetricFields(["blockade_square_control"]).includes("structure.iqp"),
+    "blockade does not alias IQP"
   );
   assert(
     keysForMetricFields(["opposite_side_castling"]).includes(
@@ -835,6 +879,92 @@ function play(fen, san) {
 }
 
 {
+  const hung = detectTacticalFact({
+    fenBefore: "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+    playedSan: "Kd2",
+    bestSan: "Ke2",
+    bestPvSan: ["Ke2"],
+    userColor: "white",
+    deltaCp: 98000,
+    evalBeforeWhite: 20,
+    evalAfterWhite: -98000,
+  });
+  assert(hung.kind === "hung_mate", `equal→mate-in-2 is hung_mate, got ${hung.kind}`);
+  assert(hung.mateIn === 2, `mateIn 2, got ${hung.mateIn}`);
+  assert(formatEvalCp(-98000) === "Mate in 2", "app formatEval mate in 2");
+  assert(formatPgnEvalCp(-98000) === "-#2", "script PGN eval mate in 2");
+  assert(
+    /mate/i.test(formatTacticalFactHead(hung)),
+    `hung_mate head: ${formatTacticalFactHead(hung)}`
+  );
+  const hungLoose = detectTacticalFact({
+    fenBefore: "4k3/8/8/8/8/8/8/4K3 w - - 0 1",
+    playedSan: "Kd2",
+    bestSan: "Ke2",
+    bestPvSan: ["Ke2"],
+    userColor: "white",
+    deltaCp: 10000,
+    evalBeforeWhite: 0,
+    evalAfterWhite: -10000,
+  });
+  assert(
+    hungLoose.kind === "hung_mate",
+    `±10000 mate blob is hung_mate, got ${hungLoose.kind}`
+  );
+  assert(
+    !shouldDropNoiseCoachMoment({
+      source: "live",
+      severity: "blunder",
+      evalBeforeCp: 20,
+      dropCp: 98000,
+      playedSan: "Kd2",
+      bestSan: "Ke2",
+    }),
+    "live equal→mate blunder is not terminal noise"
+  );
+
+  const qxa2Fen = "8/3R4/6k1/8/2qR2K1/p7/P7/8 b - - 7 56";
+  const qxa2After = new Chess(qxa2Fen);
+  qxa2After.move("Qxa2");
+  assert(forcedMateMoves(qxa2After.fen()) === 2, "Qxa2 hangs mate in 2");
+  assert(
+    hungMateAfterPlayedMove({
+      fenBefore: qxa2Fen,
+      playedSan: "Qxa2",
+      evalBeforeCp: 0,
+      evalAfterCp: 0,
+      side: "black",
+    }) === 98000,
+    "equal SF eval still sees mate in 2 for white"
+  );
+  const hungQxa2 = detectTacticalFact({
+    fenBefore: qxa2Fen,
+    playedSan: "Qxa2",
+    bestSan: "Qe2+",
+    bestPvSan: ["Qe2+", "Kh3"],
+    userColor: "black",
+    deltaCp: 98000,
+    evalBeforeWhite: 0,
+    evalAfterWhite: 98000,
+  });
+  assert(
+    hungQxa2.kind === "hung_mate" && hungQxa2.mateIn === 2,
+    `Qxa2 hung_mate, got ${hungQxa2.kind} mateIn=${hungQxa2.mateIn}`
+  );
+  assert(
+    shouldDropNoiseCoachMoment({
+      source: "live",
+      severity: "blunder",
+      evalBeforeCp: 98000,
+      dropCp: 50,
+      playedSan: "Kd2",
+      bestSan: "Ke2",
+    }),
+    "already-mating position is terminal noise"
+  );
+}
+
+{
   // Missed free queen (Kxe2)
   const fen = "4k3/8/8/8/8/8/4q3/4K3 w - - 0 1";
   const fact = detectTacticalFact({
@@ -960,6 +1090,7 @@ function play(fen, san) {
     fen: whiteIqp,
     phase: "middlegame",
     userColor: "white",
+    structureThemes: ["iqp"],
   });
   const iqpOwner = sitsOwner.find((s) => s.id === "iqp");
   assert(iqpOwner?.role === "iqp_owner", `expected iqp_owner got ${iqpOwner?.role}`);
@@ -974,6 +1105,7 @@ function play(fen, san) {
     fen: blackIqp,
     phase: "middlegame",
     userColor: "white",
+    structureThemes: ["iqp"],
   });
   const iqpBlock = sitsBlock.find((s) => s.id === "iqp");
   assert(iqpBlock?.role === "blockader", `expected blockader got ${iqpBlock?.role}`);
@@ -985,6 +1117,68 @@ function play(fen, san) {
       "blockader"
     )[0] === "piece.blockade",
     "applyRoleSoftKeys blockader"
+  );
+
+  const liveOnly = detectSituations({
+    fen: whiteIqp,
+    phase: "middlegame",
+    userColor: "white",
+  });
+  assert(
+    !liveOnly.some((s) => s.id === "iqp"),
+    "one-frame IQP is not a situation without windowed theme"
+  );
+
+  const noIqpFen = "4k3/8/8/4P3/3P4/8/8/4K3 w - - 0 1";
+  const flicker = new StructureThemeTracker();
+  assert(
+    !flicker.update(noIqpFen, whiteIqp).includes("iqp"),
+    "IQP appearing this ply is not a theme"
+  );
+  assert(
+    !flicker.update(whiteIqp, noIqpFen).includes("iqp"),
+    "one-ply IQP flicker is not a theme"
+  );
+
+  const durable = new StructureThemeTracker();
+  for (let i = 0; i < HEURISTICS_STRUCTURE_PERSIST_PLIES - 1; i += 1) {
+    assert(
+      !durable.update(whiteIqp, whiteIqp).includes("iqp"),
+      `IQP ply ${i + 1} below persist window`
+    );
+  }
+  assert(
+    durable.update(whiteIqp, whiteIqp).includes("iqp"),
+    `IQP theme after ${HEURISTICS_STRUCTURE_PERSIST_PLIES} consecutive plies`
+  );
+  const backdated = durable.confirmedByPly();
+  assert(
+    backdated.length === HEURISTICS_STRUCTURE_PERSIST_PLIES &&
+      backdated.every((row) => row.includes("iqp")),
+    "confirmed IQP backdates to the first ply of the run"
+  );
+
+  const born = new StructureThemeTracker();
+  born.update(noIqpFen, whiteIqp);
+  born.update(whiteIqp, whiteIqp);
+  born.update(whiteIqp, whiteIqp);
+  born.update(whiteIqp, whiteIqp);
+  assert(
+    born.confirmedByPly()[0]?.includes("iqp"),
+    "birth ply (IQP appears this move) is confirmed after persist window"
+  );
+  assert(
+    structurePersistStartPly1(44) === 41,
+    "had_iqp event backdates 4-ply confirm to birth ply"
+  );
+
+  const stickyDrop = mergeStickySituations(
+    [{ id: "iqp", confidence: 1, softKeys: ["structure.iqp"], metricHints: [], lockBoost: 11, role: "iqp_owner" }],
+    liveOnly
+  );
+  assert(
+    !stickyDrop.some((s) => s.id === "iqp"),
+    "sticky IQP drops when live board has no windowed isolani"
   );
   void fen;
   void iqpFen;
@@ -1106,6 +1300,755 @@ function play(fen, san) {
     unusedStructureThemes: ["open_file"],
   });
   assert(spam == null, "open_file alone must not phase_structure");
+}
+
+{
+  // Safe mobility / trapped-piece primitive (step 1)
+  assert(
+    pieceLabelFor("b", "g3") === "dark_squared_bishop",
+    "g3 is dark-square bishop"
+  );
+
+  const open = new Chess("4k3/8/8/8/3N4/8/8/4K3 w - - 0 1");
+  const knight = safeMobilityForSquare(open, "d4");
+  assert(knight && knight.safeMobility > 0, "central knight has safe moves");
+
+  // Boxed rook: no legal moves at all
+  const boxed = new Chess("4k3/8/8/8/8/8/PP6/RK6 w - - 0 1");
+  const rook = safeMobilityForSquare(boxed, "a1");
+  assert(rook && rook.safeMobility === 0, "boxed rook safeMobility 0");
+  assert(rook.legalMoves.length === 0, "boxed rook no legal moves");
+  assert(
+    rook.blockedBy.includes("no_legal_moves"),
+    "boxed rook blocked_by no_legal_moves"
+  );
+
+  // Escapes exist but all unsafe (Nb3 hit by rook)
+  const corner = new Chess("4k3/1R6/8/8/8/8/2K5/n7 b - - 0 1");
+  const trappedN = safeMobilityForSquare(corner, "a1");
+  assert(trappedN, "corner knight snap");
+  assert(
+    trappedN.safeMobility === 0,
+    `corner knight safe want 0 got ${trappedN.safeMobility} legal=${trappedN.legalMoves.join(",")} blocked=${trappedN.blockedBy.join(",")}`
+  );
+  assert(
+    trappedN.blockedBy.some((r) => r.includes("controlled_by_rook")),
+    `blocked_by rook control: ${trappedN.blockedBy.join(",")}`
+  );
+
+  const zeros = findZeroSafeMobilityPieces(boxed, "w");
+  assert(
+    zeros.some((z) => z.square === "a1" && z.piece === "r"),
+    "scan finds boxed rook"
+  );
+
+  // Delayed PV material drop (step 2)
+  const trapFen = "4k3/1R6/8/8/8/8/8/nB2K3 w - - 0 1";
+  const pv = ["Ra7", "Kd8", "Rxa1"];
+  const samples = sampleMaterialAlongSans({
+    fen: trapFen,
+    sans: pv,
+    color: "b",
+  });
+  assert(samples.length === 3, "PV material samples length 3");
+  assert(
+    samples[2].materialBalance === samples[0].materialBalance - 3,
+    "material drops by knight value at capture ply"
+  );
+  const delayed = detectDelayedPieceCapture({
+    fen: trapFen,
+    sans: pv,
+    victimColor: "b",
+  });
+  assert(delayed, "detect delayed knight capture");
+  assert(delayed.capturePlyDelay === 3, "capture delay ply 3");
+  assert(delayed.captureSan === "Rxa1", "capture san");
+  assert(delayed.winningLine === "Ra7 Kd8 Rxa1", "winning line");
+  assert(delayed.finalMaterialDelta === -3, "delta -3");
+  assert(delayed.mobility.safeMobility === 0, "bound to zero-safe piece");
+  assert(
+    !detectDelayedPieceCapture({
+      fen: trapFen,
+      sans: ["Rxa1"],
+      victimColor: "b",
+    }),
+    "immediate ply-1 capture is not delayed trap"
+  );
+
+  const fact = detectTacticalFact({
+    fenBefore: trapFen,
+    playedSan: "Kd2",
+    bestSan: "Ra7",
+    bestPvSan: pv,
+    userColor: "white",
+    deltaCp: 300,
+  });
+  assert(
+    fact.kind === "trapped_piece",
+    `expected trapped_piece got ${fact.kind}`
+  );
+  assert(fact.trapSquare === "a1", "trap square stamped");
+  assert(
+    !fact.selfInflicted,
+    "opp-piece trap is not self-inflicted"
+  );
+  assert(
+    formatTacticalFactHead(fact).toLowerCase().includes("trapped"),
+    "tactical head names trapped"
+  );
+  assert(
+    softKeysForTacticalFact(fact)[0] === "motif.trapped_piece",
+    "trapped soft key leads motif.trapped_piece"
+  );
+  assert(
+    softKeysForTacticalFact(fact).includes("positional.restriction"),
+    "trapped soft keys keep restriction fallback"
+  );
+  const tip = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 300,
+    kind: "bad_move",
+    fact,
+    engineLineSans: pv,
+    situations: [
+      {
+        id: "dragon_formation",
+        confidence: 1,
+        role: "cramped",
+        softKeys: ["imbalance.space"],
+        lockBoost: 12,
+      },
+    ],
+  });
+  assert(!/dragon/i.test(tip.text), `trap tip skips Dragon: ${tip.text}`);
+  assert(
+    /trapped/i.test(tip.text) && /knight/i.test(tip.text),
+    `tip names trapped knight: ${tip.text}`
+  );
+
+  const dragonSit = [
+    {
+      id: "dragon_formation",
+      confidence: 1,
+      role: "cramped",
+      softKeys: ["imbalance.space", "structure.dragon_formation"],
+      lockBoost: 12,
+    },
+  ];
+  const missedTip = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 180,
+    kind: "bad_move",
+    fact: {
+      kind: "missed_tactic",
+      pieceLabel: null,
+      captureSan: "Nxh7+ Kxh7 Qh5+",
+      takenNext: false,
+      mateIn: null,
+    },
+    engineLineSans: ["Nxh7+", "Kxh7", "Qh5+"],
+    situations: dragonSit,
+    gamePlan: {
+      openingKeyId: null,
+      stickyKeys: ["imbalance.space"],
+      situationIds: [],
+      taughtKeys: [],
+      keyColdPlies: {},
+    },
+  });
+  assert(
+    !/dragon/i.test(missedTip.text),
+    `missed_tactic tip skips Dragon: ${missedTip.text}`
+  );
+  assert(
+    !/space/i.test(missedTip.text),
+    `missed_tactic tip skips space plan: ${missedTip.text}`
+  );
+  assert(
+    /forcing/i.test(missedTip.text),
+    `missed_tactic tip stays tactical: ${missedTip.text}`
+  );
+  assert(
+    !missedTip.softKeys.includes("imbalance.space"),
+    `missed_tactic drops sit/plan soft keys: ${missedTip.softKeys.join(",")}`
+  );
+
+  const pack = JSON.parse(
+    readFileSync(
+      new URL("../assets/coach/mobile_coach_pack.json", import.meta.url),
+      "utf8"
+    )
+  );
+  const trapEntry = (pack.entries || []).find(
+    (e) => e.keyId === "motif.trapped_piece"
+  );
+  assert(trapEntry, "pack ships motif.trapped_piece");
+  assert(
+    /trapped/i.test(String(trapEntry.text || "")),
+    "pack trap entry mentions trapped"
+  );
+
+  const req = buildCoachNoteRequest({
+    ply: 40,
+    phase: "middlegame",
+    mark: "mistake",
+    moment: {
+      ply: 40,
+      moveNumber: 20,
+      severity: "mistake",
+      dropCp: 300,
+      playedSan: "Kd2",
+      bestSan: "Ra7",
+      fen: trapFen,
+      source: "live",
+      inputs: {},
+    },
+    deltaCp: 300,
+    fenBefore: trapFen,
+    bestPvSan: pv,
+    playedSan: "Kd2",
+    userColor: "white",
+  });
+  assert(
+    req?.tacticalFact?.kind === "trapped_piece",
+    "buildCoachNoteRequest stamps trapped_piece"
+  );
+  assert(
+    /trapped_piece:knight@a1/.test(formatCoachNoteRequest(req)),
+    `noteRequest fmt shows trap detail: ${formatCoachNoteRequest(req)}`
+  );
+  const meta = coachRequestMetaInputs(req);
+  assert(
+    meta.tactical_trap_square === "a1" &&
+      meta.tactical_capture_ply_delay === 3,
+    "meta inputs stamp trap square + delay"
+  );
+}
+
+{
+  const crampedFen = "4k3/8/8/8/8/8/PP6/R1K5 w - - 0 1";
+  const huntFen = "4k3/8/8/8/8/8/Pb6/R1K5 w - - 0 1";
+  const hunt = ["Bxa1"];
+  const cramped = detectTacticalFact({
+    fenBefore: crampedFen,
+    playedSan: "Kb1",
+    bestSan: "Kc2",
+    bestPvSan: ["Kc2"],
+    userColor: "white",
+    deltaCp: 300,
+  });
+  assert(
+    cramped.kind !== "trapped_piece",
+    `unattacked boxed rook is not a trap, got ${cramped.kind}`
+  );
+
+  const hunted = detectTacticalFact({
+    fenBefore: huntFen,
+    playedSan: "Kb1",
+    bestSan: "Kxb2",
+    bestPvSan: ["Kxb2"],
+    userColor: "white",
+    deltaCp: 900,
+    playedContinuationSans: hunt,
+  });
+  assert(
+    hunted.kind === "trapped_piece" && hunted.selfInflicted,
+    `played continuation hunt still self-trap, got ${hunted.kind}`
+  );
+  assert(
+    hunted.captureSan === "Bxa1",
+    `hunt line stamped ${hunted.captureSan}`
+  );
+
+  const attackedFen = "4k3/8/5b2/8/8/8/P1PN4/R1K5 w - - 0 1";
+  const afterNb1 = new Chess(attackedFen);
+  afterNb1.move("Nb1");
+  assert(
+    isLosingTrapCapture(afterNb1, "a1", "w"),
+    "bishop vs boxed undefended rook is a losing trap capture"
+  );
+  const boxedHit = detectTacticalFact({
+    fenBefore: attackedFen,
+    playedSan: "Nb1",
+    bestSan: "Kc2",
+    bestPvSan: ["Kc2"],
+    userColor: "white",
+    deltaCp: 300,
+  });
+  assert(
+    boxedHit.kind === "trapped_piece" && boxedHit.selfInflicted,
+    `cheaper underdefended boxed rook is self-trap, got ${boxedHit.kind}`
+  );
+  assert(boxedHit.trapSquare === "a1", `attacked trap square ${boxedHit.trapSquare}`);
+
+  const stareFen = "4k3/8/5b2/8/8/8/P1P5/R1K5 w - - 0 1";
+  const equalStare = detectTacticalFact({
+    fenBefore: stareFen,
+    playedSan: "Kb1",
+    bestSan: "Kc2",
+    bestPvSan: ["Kc2"],
+    userColor: "white",
+    deltaCp: 300,
+  });
+  assert(
+    equalStare.kind !== "trapped_piece",
+    `equal attacker/defender stare is not a trap, got ${equalStare.kind}`
+  );
+
+  const queenOverFen = "4k3/8/8/8/3q4/8/q1P5/R1K5 w - - 0 1";
+  const queenOver = detectTacticalFact({
+    fenBefore: queenOverFen,
+    playedSan: "Kb1",
+    bestSan: "Kc2",
+    bestPvSan: ["Kc2"],
+    userColor: "white",
+    deltaCp: 300,
+  });
+  assert(
+    queenOver.kind !== "trapped_piece",
+    `higher-value attackers are not a trap, got ${queenOver.kind}`
+  );
+
+  const e4Fen =
+    "4nr1k/1p4bP/3p4/4pPP1/p5r1/4B3/PP2N2K/3R1R2 b - - 2 29";
+  const afterE4 = new Chess(e4Fen);
+  afterE4.move("e4");
+  assert(
+    (safeMobilityForSquare(afterE4, "g4")?.safeMobility || 0) > 0,
+    "g4 rook still has a flight square after e4"
+  );
+  afterE4.move("Kh3");
+  assert(
+    safeMobilityForSquare(afterE4, "g4")?.safeMobility === 0,
+    "Kh3 boxes the g4 rook"
+  );
+  assert(
+    isLosingTrapCapture(afterE4, "g4", "b"),
+    "undefended rook hunted by king is a losing trap"
+  );
+  const e4Trap = detectTacticalFact({
+    fenBefore: e4Fen,
+    playedSan: "e4",
+    bestSan: "Re4",
+    bestPvSan: ["Re4", "Rd3", "Bf6"],
+    userColor: "black",
+    deltaCp: 226,
+    evalBeforeWhite: 272,
+    evalAfterWhite: 498,
+    playedContinuationSans: [
+      "Kh3",
+      "Rxg5",
+      "Bxg5",
+      "Bxb2",
+      "Ng3",
+      "b5",
+      "Nxe4",
+      "b4",
+    ],
+  });
+  assert(
+    e4Trap.kind === "trapped_piece" && e4Trap.selfInflicted,
+    `e4 then Kh3 is self-trap rook, got ${e4Trap.kind}`
+  );
+  assert(e4Trap.trapSquare === "g4", `trap square ${e4Trap.trapSquare}`);
+  assert(e4Trap.pieceLabel === "rook", `trap piece ${e4Trap.pieceLabel}`);
+  const e4NoReply = detectTacticalFact({
+    fenBefore: e4Fen,
+    playedSan: "e4",
+    bestSan: "Re4",
+    bestPvSan: ["Re4", "Rd3", "Bf6"],
+    userColor: "black",
+    deltaCp: 226,
+    evalBeforeWhite: 272,
+    evalAfterWhite: 498,
+  });
+  assert(
+    e4NoReply.kind !== "trapped_piece",
+    "rook still has a flight square immediately after e4"
+  );
+  const e4EngineTail = detectTacticalFact({
+    fenBefore: e4Fen,
+    playedSan: "e4",
+    bestSan: "Re4",
+    bestPvSan: ["Re4", "Rd3", "Bf6"],
+    userColor: "black",
+    deltaCp: 226,
+    evalBeforeWhite: 272,
+    evalAfterWhite: 498,
+    playedContinuationSans: ["Rd3", "Bf6"],
+  });
+  assert(
+    e4EngineTail.kind !== "trapped_piece",
+    "Re4's tail from the position after e4 is not a rook trap"
+  );
+  const e4Req = buildCoachNoteRequest({
+    ply: 58,
+    phase: "middlegame",
+    mark: "mistake",
+    moment: {
+      ply: 58,
+      moveNumber: 29,
+      severity: "mistake",
+      dropCp: 226,
+      playedSan: "e4",
+      bestSan: "Re4",
+      fen: e4Fen,
+      source: "live",
+      inputs: {},
+    },
+    deltaCp: 226,
+    fenBefore: e4Fen,
+    bestPvSan: ["Re4", "Rd3", "Bf6"],
+    playedSan: "e4",
+    playedLineSans: ["e4", "Kh3", "Rxg5", "Bxg5"],
+    playedContinuationSans: ["Kh3", "Rxg5", "Bxg5"],
+    userColor: "black",
+    evalBeforeCp: 272,
+    evalAfterCp: 498,
+  });
+  assert(
+    e4Req?.tacticalFact?.kind === "trapped_piece" &&
+      e4Req.tacticalFact.pieceLabel === "rook" &&
+      e4Req.tacticalFact.trapSquare === "g4",
+    `note request must stamp trapped rook not hanging bishop, got ${e4Req?.tacticalFact?.kind} ${e4Req?.tacticalFact?.pieceLabel}`
+  );
+
+  const huntTip = composeMomentJudgmentTip({
+    mark: "blunder",
+    deltaCp: 900,
+    kind: "bad_move",
+    fact: hunted,
+    engineLineSans: ["Kxb2"],
+  });
+  assert(
+    /bxa1/i.test(huntTip.text) && !/Kxb2/.test(huntTip.text),
+    `hunt tip uses played failure not engine grab: ${huntTip.text}`
+  );
+  const huntReq = buildCoachNoteRequest({
+    ply: 58,
+    phase: "middlegame",
+    mark: "blunder",
+    moment: {
+      ply: 58,
+      moveNumber: 29,
+      severity: "blunder",
+      dropCp: 900,
+      playedSan: "Kb1",
+      bestSan: "Kxb2",
+      fen: huntFen,
+      source: "live",
+      inputs: {},
+    },
+    deltaCp: 900,
+    fenBefore: huntFen,
+    bestPvSan: ["Kxb2"],
+    playedSan: "Kb1",
+    playedContinuationSans: hunt,
+    userColor: "white",
+  });
+  assert(
+    huntReq?.tacticalFact?.kind === "trapped_piece" &&
+      huntReq.tacticalFact.selfInflicted,
+    "buildCoachNoteRequest stamps self-inflicted trap"
+  );
+  assert(
+    /trapped_piece:own:rook@a1/.test(formatCoachNoteRequest(huntReq)),
+    `noteRequest fmt marks own trap: ${formatCoachNoteRequest(huntReq)}`
+  );
+  assert(
+    coachRequestMetaInputs(huntReq).tactical_self_inflicted === 1,
+    "meta stamps tactical_self_inflicted"
+  );
+
+  const dragonNe8 = "r1b2rk1/pp1nppbp/3p1np1/2qP2P1/2P4P/2N5/PP1BBP2/R2QK1NR b KQ - 0 11";
+  const falseTrap = detectTacticalFact({
+    fenBefore: dragonNe8,
+    playedSan: "Ne8",
+    bestSan: "Nh5",
+    bestPvSan: ["Nh5", "Nf3", "Qb6"],
+    userColor: "black",
+    deltaCp: 150,
+    evalBeforeWhite: -32,
+    evalAfterWhite: 58,
+    playedContinuationSans: ["h5", "Ne5", "h6", "Bh8"],
+  });
+  assert(
+    falseTrap.kind !== "trapped_piece",
+    `Ne8 must not flag unattacked f8 rook, got ${falseTrap.kind} ${falseTrap.trapSquare || ""}`
+  );
+}
+
+{
+  assert(forcingRatio(["Qh5+", "g6", "Qxf7#"]) === 0.67, "checks/mates count as force");
+  assert(forcingRatio(["a3", "a6", "h3"]) === 0, "quiet PV ratio 0");
+  assert(forcingRatio(["Nxe5", "Bxe5"]) === 0, "recaptures are not forcing");
+  assert(forcingRatio(["Qh5+", "a6"]) === 0.5, "half-force PV ratio 0.5");
+  assert(
+    multipvWpGap(
+      [
+        { cpWhite: 200 },
+        { cpWhite: 180 },
+      ],
+      "white"
+    ) < 0.05,
+    "small MultiPV gap below important"
+  );
+  const onlyMoveGap = multipvWpGap(
+    [
+      { cpWhite: 400 },
+      { cpWhite: 50 },
+    ],
+    "white"
+  );
+  assert(onlyMoveGap >= 0.05, `only-move gap ${onlyMoveGap}`);
+
+  const merged = mergeMultiPvGapLines(
+    [
+      { san: "e4", cpWhite: 40, rank: 1, pvSan: ["e4"] },
+      { san: "d4", cpWhite: -20, rank: 2, pvSan: ["d4"] },
+    ],
+    [{ san: "e4", cpWhite: 55, rank: 1, pvSan: ["e4", "e5"] }]
+  );
+  assert(merged.length >= 2, "deepen MultiPV 1 keeps PV2");
+  assert(merged[0].san === "e4" && merged[1].san === "d4", "PV1 deep + PV2 shallow");
+
+  const mateFen = "8/3R4/6k1/8/3R2K1/p7/q7/8 w - - 0 57";
+  const mateMerged = mergeMultiPvGapLines(
+    [
+      { san: "Rd1", cpWhite: 0 },
+      { san: "R4d6+", cpWhite: 98000 },
+    ],
+    [{ san: "Rd1", cpWhite: 0 }],
+    mateFen
+  );
+  assert(
+    mateMerged[0]?.san === "R4d6+" && mateMerged[0]?.cpWhite === 98000,
+    `mate line is PV1 after merge, got ${mateMerged[0]?.san}`
+  );
+  const ranked = rankLinesByStm(mateFen, [
+    { san: "Rd1", cpWhite: 0 },
+    { san: "Ra7", cpWhite: 50 },
+    { san: "R4d6+", cpWhite: 98000 },
+  ]);
+  assert(
+    ranked[0]?.san === "R4d6+",
+    `live lines rank mate first, not Ta7/Ra7, got ${ranked[0]?.san}`
+  );
+
+  const start = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  const quiet = detectTacticalFact({
+    fenBefore: start,
+    playedSan: "a4",
+    bestSan: "e4",
+    bestPvSan: ["e4", "e5", "Nf3"],
+    userColor: "white",
+    deltaCp: 150,
+  });
+  assert(
+    quiet.kind !== "missed_tactic",
+    `quiet 2-move PV is not missed_tactic, got ${quiet.kind}`
+  );
+
+  const forceLine = detectTacticalFact({
+    fenBefore: start,
+    playedSan: "a4",
+    bestSan: "Qh5+",
+    bestPvSan: ["Qh5+", "g6", "Qxf7#"],
+    userColor: "white",
+    deltaCp: 200,
+  });
+  assert(
+    forceLine.kind === "missed_tactic",
+    `forcing PV is missed_tactic, got ${forceLine.kind}`
+  );
+
+  const ne8Fen =
+    "r1b2rk1/pp1nppbp/3p1np1/2qP2P1/2P4P/2N5/PP1BBP2/R2QK1NR b KQ - 0 11";
+  const ne8Fact = detectTacticalFact({
+    fenBefore: ne8Fen,
+    playedSan: "Ne8",
+    bestSan: "Nh5",
+    bestPvSan: ["Nh5", "Nf3", "Ne5", "Nxe5", "Bxe5", "Be3", "Bxc3+", "bxc3"],
+    userColor: "black",
+    deltaCp: 150,
+    lines: [{ cpWhite: -45 }, { cpWhite: 62 }],
+  });
+  assert(
+    ne8Fact.kind !== "missed_tactic",
+    `Ne8 vs Nh5 exchange PV is positional, got ${ne8Fact.kind}`
+  );
+  assert(
+    !softKeysForTacticalFact(ne8Fact).includes("motif.intermediate_move"),
+    "no intermediate_move on a knight retreat"
+  );
+  const ne8Sharp = measureTacticSharpness({
+    pvSan: ["Nh5", "Nf3", "Ne5", "Nxe5", "Bxe5", "Be3", "Bxc3+", "bxc3"],
+    lines: [{ cpWhite: -45 }, { cpWhite: 62 }],
+    side: "black",
+  });
+  assert(
+    !ne8Sharp.forcingSharp && !ne8Sharp.sharp,
+    "recapture PV with one late check is not tactical-sharp"
+  );
+
+  const gapOnly = measureTacticSharpness({
+    pvSan: ["e4", "e5", "Nf3"],
+    lines: [
+      { cpWhite: 400 },
+      { cpWhite: 50 },
+    ],
+    side: "white",
+  });
+  assert(gapOnly.pvGapWp >= 0.05 && !gapOnly.forcingSharp && !gapOnly.sharp, "PV gap stamps without calling it sharp");
+  const forceSharp = measureTacticSharpness({
+    pvSan: ["Nxh7+", "Kxh7", "Qh5+"],
+    lines: [
+      { cpWhite: 80 },
+      { cpWhite: 70 },
+    ],
+    side: "white",
+  });
+  assert(forceSharp.forcingSharp && forceSharp.forcingRatio >= 0.5, "ratio stamps forcing-sharp");
+
+  const sharpReq = buildCoachNoteRequest({
+    ply: 12,
+    phase: "middlegame",
+    mark: "mistake",
+    moment: {
+      ply: 12,
+      moveNumber: 6,
+      severity: "mistake",
+      dropCp: 200,
+      playedSan: "a4",
+      bestSan: "Qh5+",
+      fen: start,
+      source: "live",
+      inputs: {},
+    },
+    deltaCp: 200,
+    fenBefore: start,
+    bestPvSan: ["Qh5+", "g6", "Qxf7#"],
+    playedSan: "a4",
+    userColor: "white",
+    lines: [
+      { san: "Qh5+", cpWhite: 400 },
+      { san: "d4", cpWhite: 50 },
+    ],
+  });
+  assert(sharpReq?.inputs?.tactical_sharp === 1, "request stamps tactical_sharp");
+  assert(
+    Number(sharpReq?.inputs?.tactical_forcing_ratio) >= 0.5,
+    `stamps forcing ratio, got ${sharpReq?.inputs?.tactical_forcing_ratio}`
+  );
+  assert(
+    Number(sharpReq?.inputs?.tactical_pv_gap_wp) >= 0.05,
+    `stamps pv gap, got ${sharpReq?.inputs?.tactical_pv_gap_wp}`
+  );
+  const sharpMeta = coachRequestMetaInputs(sharpReq);
+  assert(sharpMeta.tactical_sharp === 1, "meta copies tactical_sharp");
+}
+
+{
+  const pinFen = "6k1/5n2/8/8/8/1B6/8/4K3 w - - 0 1";
+  const pinHit = detectBoardMotif({ fen: pinFen, san: "Bc4", color: "w" });
+  assert(pinHit?.kind === "pin", `pin motif, got ${pinHit?.kind}`);
+  assert(pinHit?.pieceLabel === "knight", `pin victim knight, got ${pinHit?.pieceLabel}`);
+  const pinFact = detectTacticalFact({
+    fenBefore: pinFen,
+    playedSan: "Ke2",
+    bestSan: "Bc4",
+    bestPvSan: ["Bc4", "Kg7"],
+    userColor: "white",
+    deltaCp: 150,
+  });
+  assert(
+    pinFact.kind === "missed_tactic" && pinFact.motif === "pin",
+    `quiet pin is missed_tactic+pin, got ${pinFact.kind}/${pinFact.motif}`
+  );
+  assert(
+    formatTacticalFactHead(pinFact).toLowerCase().includes("pin"),
+    `head names pin: ${formatTacticalFactHead(pinFact)}`
+  );
+  assert(
+    softKeysForTacticalFact(pinFact)[0] === "motif.pin_and_skewer",
+    `pin soft key ${softKeysForTacticalFact(pinFact)[0]}`
+  );
+  const pinReq = buildCoachNoteRequest({
+    ply: 12,
+    phase: "middlegame",
+    mark: "mistake",
+    moment: {
+      ply: 12,
+      moveNumber: 6,
+      severity: "mistake",
+      dropCp: 150,
+      playedSan: "Ke2",
+      bestSan: "Bc4",
+      fen: pinFen,
+      source: "live",
+      inputs: {},
+    },
+    deltaCp: 150,
+    fenBefore: pinFen,
+    bestPvSan: ["Bc4", "Kg7"],
+    playedSan: "Ke2",
+    userColor: "white",
+  });
+  assert(
+    /tactical=missed_tactic:pin/.test(formatCoachNoteRequest(pinReq)),
+    `fmt shows pin motif: ${formatCoachNoteRequest(pinReq)}`
+  );
+
+  const forkFen = "r3k3/8/8/1N6/8/4K3/8/8 w - - 0 1";
+  const forkHit = detectBoardMotif({ fen: forkFen, san: "Nc7+", color: "w" });
+  assert(forkHit?.kind === "fork", `fork motif, got ${forkHit?.kind}`);
+  const forkFact = detectTacticalFact({
+    fenBefore: forkFen,
+    playedSan: "Ke2",
+    bestSan: "Nc7+",
+    bestPvSan: ["Nc7+", "Kd8"],
+    userColor: "white",
+    deltaCp: 200,
+  });
+  assert(
+    forkFact.kind === "missed_tactic" && forkFact.motif === "fork",
+    `fork is missed_tactic+fork, got ${forkFact.kind}/${forkFact.motif}`
+  );
+
+  const hangFen = "4k3/8/8/8/7r/4N3/8/4K3 w - - 0 1";
+  const hangHit = detectBoardMotif({ fen: hangFen, san: "Nf5", color: "w" });
+  assert(hangHit?.kind === "hang", `hang motif, got ${hangHit?.kind}`);
+  const hangFact = detectTacticalFact({
+    fenBefore: hangFen,
+    playedSan: "Ke2",
+    bestSan: "Nf5",
+    bestPvSan: ["Nf5"],
+    userColor: "white",
+    deltaCp: 150,
+  });
+  assert(
+    hangFact.kind === "missed_tactic" && hangFact.motif === "hang",
+    `hang is missed_tactic+hang, got ${hangFact.kind}/${hangFact.motif}`
+  );
+
+  const pinTip = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 150,
+    kind: "bad_move",
+    fact: pinFact,
+    engineLineSans: ["Bc4", "Kg7"],
+    situations: [
+      {
+        id: "dragon_formation",
+        confidence: 1,
+        role: "cramped",
+        softKeys: ["imbalance.space"],
+        lockBoost: 12,
+      },
+    ],
+  });
+  assert(!/dragon/i.test(pinTip.text), `pin tip skips Dragon: ${pinTip.text}`);
+  assert(/pin/i.test(pinTip.text), `pin tip names pin: ${pinTip.text}`);
 }
 
 console.log("phase tactical metrics smoke OK");

@@ -8,7 +8,8 @@ import {
   COACH_CRITICAL_MULTIPV,
 } from "../analysisConfig";
 import { applyUciMove, fenKey, sanToUci, uciFromMove } from "../chessMoves";
-import { toWhiteCp } from "../analyzeMistakes";
+import { formatEval, toWhiteCp } from "../analyzeMistakes";
+import { applyForcedMateWhiteCp, bestStmCp } from "../forcedMate";
 import type { StudyGame } from "../analyzeMistakes";
 import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
 import {
@@ -31,8 +32,10 @@ import {
   coachMissedFromPending,
   COACH_MARKS_KEEP_OVER_BOOK,
   type CoachMark,
-} from "./coachMarks";
+} from "./coachMarkClassify";
+import { mergeMultiPvGapLines, rankLinesByStm } from "./tacticSharpness";
 import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
+import { shouldDropNoiseCoachMoment } from "./coachMomentNoise";
 import { formatOpeningLabel } from "./ecoLabels";
 import {
   buildCoachGameMetrics,
@@ -44,6 +47,10 @@ import {
 } from "./gameMetricsLookup";
 import { expandCoachThemes, classifyUserError, shouldComposeNote, acceptKeyNote } from "./noteCompose";
 import { composeGameSummaryNote } from "./gameSummary";
+import {
+  buildCommentRefs,
+  type CommentRefs,
+} from "./commentRefs";
 import { assessPositionPov } from "./positionPov";
 import type { VectorRetrieveFn } from "./retrieve";
 import {
@@ -61,14 +68,19 @@ import {
   lineComparisonMomentInputs,
   coachRequestMetaInputs,
   durableUnusedStructureThemes,
-  isPraiseMark,
   openingEvalGapAllowsEngineLine,
+  pawnBreakEvalGapAllowsRecommend,
   engineLineSansBudget,
   composePlayedAltLine,
   COACH_NOTE_REQUEST_CONFIG,
   isFixedCheckpointMoment,
   requestAlwaysAttaches,
 } from "./metricNotes";
+import {
+  rankMetricNoteWeights,
+  formatWeightBreakdown,
+  themesForPly,
+} from "./metricNoteWeights";
 import {
   mergeOpeningTipPrior,
   type OpeningTipPrior,
@@ -89,7 +101,7 @@ import { extendEnginePvUci } from "./extendEnginePv";
 import {
   detectOpeningFamily,
   resolveOpeningPackKey,
-  StructureThemeTracker,
+  confirmedStructureThemesByPly,
 } from "./structureDetect";
 import {
   enrichOpeningCoachMoments,
@@ -101,6 +113,7 @@ import {
 } from "./middlegameCoachInputs";
 import { enrichMiddlegameStrategicMoments } from "./middlegameStructure";
 import { enrichEndgameCoachMoments } from "./endgameContext";
+import { phaseForCoachMoment } from "./phaseSplits";
 import { loadBaselineStore } from "../../data/baselines";
 import type { Platform } from "../../api/types";
 import type { OpeningGameRow } from "../openingPhase";
@@ -169,6 +182,8 @@ export type GameCoachPly = {
   note: string;
   analyzed: boolean;
   mark: CoachMark | null;
+  /** Coach-moment refs the note actually uses (filtered). */
+  noteRefs?: CommentRefs | null;
 };
 
 export type GameCoachResult = {
@@ -186,45 +201,18 @@ export type AnalyzeProgress = {
   status: string;
 };
 
-const MATE_CP_THRESHOLD = 50000;
-const EVAL_CLAMP = 2000;
-const MATE_MOVE_SPAN = 100;
-
-function mateMovesFromCp(cp: number): number | null {
-  const abs = Math.abs(cp);
-  if (abs >= MATE_CP_THRESHOLD) {
-    return Math.max(0, Math.min(99, Math.round((100000 - abs) / 1000)));
-  }
-  if (abs > EVAL_CLAMP) {
-    return Math.max(0, Math.round(MATE_MOVE_SPAN - (abs - EVAL_CLAMP)));
-  }
-  return null;
-}
-
-function formatEval(cp: number | null): string {
-  if (cp == null) return "n/a";
-  const moves = mateMovesFromCp(cp);
-  if (moves != null) {
-    if (moves === 0) return "Checkmate";
-    return `Mate in ${moves}`;
-  }
-  return `${cp >= 0 ? "+" : ""}${(cp / 100).toFixed(2)}`;
-}
-
 function phaseForPly(
   ply: number,
   pieceCount: number,
-  bounds?: { middlegameStartPly0: number | null; endgameStartPly0: number | null } | null
+  bounds?: { middlegameStartPly0: number | null; endgameStartPly0: number | null } | null,
+  structuralKind?: string | null
 ): "opening" | "middlegame" | "endgame" {
-  const eg0 = bounds?.endgameStartPly0;
-  const mg0 = bounds?.middlegameStartPly0;
-  // Prefer heuristic bounds (0-based) vs display ply (1-based).
-  if (eg0 != null && ply - 1 >= eg0) return "endgame";
-  if (mg0 != null && ply - 1 >= mg0) return "middlegame";
-  if (mg0 != null && ply - 1 < mg0) return "opening";
-  if (ply <= 16 && pieceCount >= 28) return "opening";
-  if (pieceCount <= 12) return "endgame";
-  return "middlegame";
+  return phaseForCoachMoment({
+    ply1: ply,
+    pieceCount,
+    bounds,
+    structuralKind,
+  });
 }
 
 function studyGameFromOptions(args: {
@@ -315,6 +303,19 @@ function pvToSan(fen: string, pv: string[] | undefined, max = 14): string[] {
   } catch {
     return [];
   }
+}
+
+function sansAfterIndex(
+  moves: { san: string }[],
+  index: number,
+  maxPly = 6
+): string[] {
+  const out: string[] = [];
+  for (let j = index + 1; j < moves.length && out.length < maxPly; j += 1) {
+    const san = moves[j]?.san;
+    if (san) out.push(san);
+  }
+  return out;
 }
 
 function explorerMoveGames(m: {
@@ -532,19 +533,24 @@ export function linesFromEval(
 ): EngineLine[] {
   const rows =
     result.multipv && result.multipv.length
-      ? result.multipv
+      ? [...result.multipv]
       : result.bestUci
         ? [{ uci: result.bestUci, cpWhite: result.cpWhite, pv: result.bestPv }]
         : [];
-  return rows.slice(0, 3).map((row, i) => {
+  const mapped = rows.map((row) => {
     const pvSan = pvToSan(fen, row.pv?.length ? row.pv : row.uci ? [row.uci] : []);
     return {
-      rank: i + 1,
       san: pvSan[0] || sanFromUci(fen, row.uci) || row.uci || "—",
       cpWhite: toWhiteCp(fen, row.cpWhite),
       pvSan,
     };
   });
+  return rankLinesByStm(fen, mapped)
+    .slice(0, 3)
+    .map((line, i) => ({
+      rank: i + 1,
+      ...line,
+    }));
 }
 
 type EngineEvalResult = {
@@ -557,19 +563,23 @@ type EngineEvalResult = {
 function evalFromSharedPosition(hit: PositionEval): EngineEvalResult {
   const stored =
     hit.multipv && hit.multipv.length
-      ? hit.multipv
+      ? [...hit.multipv].sort((a, b) => b.cpWhite - a.cpWhite)
       : hit.bestUci
         ? [{ uci: hit.bestUci, cpWhite: hit.cpWhite, pv: [hit.bestUci] }]
         : [];
   const best = stored[0];
-  const bestUci = hit.bestUci || best?.uci || null;
+  const stmBest = bestStmCp([
+    hit.cpWhite,
+    ...stored.map((row) => row.cpWhite),
+  ]);
+  const bestUci = best?.uci || hit.bestUci || null;
   const pv = best?.pv?.length
     ? best.pv
     : bestUci
       ? [bestUci]
       : [];
   return {
-    cpWhite: hit.cpWhite,
+    cpWhite: stmBest,
     bestUci,
     bestPv: pv,
     multipv: stored,
@@ -864,7 +874,12 @@ export async function analyzeSelectedGame(options: {
       let pendingOppChance = false;
   let pendingOppWp: number | null = null;
   let pendingOppKind: "mistake" | "blunder" | null = null;
-  const structureTracker = new StructureThemeTracker();
+  const structureByPly = confirmedStructureThemesByPly(
+    skeleton.map((s) => ({
+      fenBefore: s.fenBefore,
+      fenAfter: s.fenAfter,
+    }))
+  );
   const sfPawnStormTracker = new PawnStormTracker(4);
   const userIsWhite = userColor === "white";
   const usedKeyTips: KeyTip[] = [];
@@ -1030,14 +1045,18 @@ export async function analyzeSelectedGame(options: {
         cpWhite: row.cpWhite,
         pv: row.pv,
       }));
+    const stmBest = bestStmCp([
+      raw.cpWhite,
+      ...multipv.map((row) => row.cpWhite),
+    ]);
     collectedPositions[key] = {
-      cpWhite: raw.cpWhite,
+      cpWhite: stmBest,
       bestUci,
       multipv: multipv.length ? multipv : undefined,
     };
     sharedPositions[key] = collectedPositions[key];
     return {
-      cpWhite: raw.cpWhite,
+      cpWhite: stmBest,
       bestUci,
       bestPv: raw.bestPv,
       multipv: raw.multipv,
@@ -1111,11 +1130,8 @@ export async function analyzeSelectedGame(options: {
       );
 
       if (sample) {
-        // Vault hit returns immediately; SF only when fen missing from vault.
         const before = await resolveEval(sk.fenBefore, depth, multiPv);
-        if (evalBefore == null) {
-          evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
-        }
+        evalBefore = toWhiteCp(sk.fenBefore, before.cpWhite);
         bestSan = sanFromUci(sk.fenBefore, before.bestUci);
         bestPvSan = pvToSan(
           sk.fenBefore,
@@ -1140,14 +1156,17 @@ export async function analyzeSelectedGame(options: {
 
       let afterEval: EngineEvalResult | null = null;
       if (evalAfter == null || hasAfterPos) {
-        afterEval = await resolveEval(sk.fenAfter, depth, 1);
-        evalAfter = toWhiteCp(sk.fenAfter, afterEval.cpWhite);
+        afterEval = await resolveEval(sk.fenAfter, depth, multiPv);
+        evalAfter = applyForcedMateWhiteCp(
+          sk.fenAfter,
+          toWhiteCp(sk.fenAfter, afterEval.cpWhite)
+        );
       } else if (isUserPly) {
-        // Need fenAfter PV for played-move + engine-continuation alt line.
-        afterEval = await resolveEval(sk.fenAfter, depth, 1);
-        if (evalAfter == null) {
-          evalAfter = toWhiteCp(sk.fenAfter, afterEval.cpWhite);
-        }
+        afterEval = await resolveEval(sk.fenAfter, depth, multiPv);
+        evalAfter = applyForcedMateWhiteCp(
+          sk.fenAfter,
+          toWhiteCp(sk.fenAfter, afterEval.cpWhite)
+        );
       }
       analyzed = evalAfter != null;
 
@@ -1207,7 +1226,8 @@ export async function analyzeSelectedGame(options: {
       const phaseEarly = phaseForPly(
         sk.ply,
         pieceCountEarly,
-        metrics.phaseBounds
+        metrics.phaseBounds,
+        momentAtPly?.structuralKind
       );
 
       const criticalBad =
@@ -1217,7 +1237,7 @@ export async function analyzeSelectedGame(options: {
       const metricCoachCall =
         criticalBad ||
         (isUserPly && isFixedCheckpointMoment(momentAtPly)) ||
-        (isUserPly && isPraiseMark(mark));
+        (isUserPly && mark === "brilliant");
 
       const runStrongEngine = async () => {
         options.onProgress?.({
@@ -1232,6 +1252,7 @@ export async function analyzeSelectedGame(options: {
           COACH_CRITICAL_MOVETIME,
           true
         );
+        const shallowLines = lines.slice();
         evalBefore = toWhiteCp(sk.fenBefore, deepBefore.cpWhite);
         bestSan = sanFromUci(sk.fenBefore, deepBefore.bestUci);
         const extendedBeforePv = await extendEnginePvUci({
@@ -1247,10 +1268,14 @@ export async function analyzeSelectedGame(options: {
           extendedBeforePv,
           engineLineSansBudget()
         );
-        lines = linesFromEval(sk.fenBefore, {
-          ...deepBefore,
-          bestPv: extendedBeforePv,
-        });
+        lines = mergeMultiPvGapLines(
+          shallowLines,
+          linesFromEval(sk.fenBefore, {
+            ...deepBefore,
+            bestPv: extendedBeforePv,
+          }),
+          sk.fenBefore
+        );
 
         const deepAfter = await resolveEval(
           sk.fenAfter,
@@ -1268,7 +1293,10 @@ export async function analyzeSelectedGame(options: {
           signal: options.signal,
         });
         afterEval = { ...deepAfter, bestPv: extendedAfterPv };
-        evalAfter = toWhiteCp(sk.fenAfter, deepAfter.cpWhite);
+        evalAfter = applyForcedMateWhiteCp(
+          sk.fenAfter,
+          toWhiteCp(sk.fenAfter, deepAfter.cpWhite)
+        );
         if (evalBefore != null && evalAfter != null) {
           const loss =
             sk.side === "white"
@@ -1328,6 +1356,8 @@ export async function analyzeSelectedGame(options: {
             Math.max(1, engineLineSansBudget() - 1)
           )
         : [];
+      const trapContSans = sansAfterIndex(skeleton, i, 6);
+      const factContSans = trapContSans.length ? trapContSans : playedContSans;
       const playedAltLine = composePlayedAltLine({
         playedSan: sk.san,
         continuationSans: playedContSans,
@@ -1350,9 +1380,10 @@ export async function analyzeSelectedGame(options: {
           fenBefore: sk.fenBefore,
           fenAfter: sk.fenAfter,
           bestPvSan,
+          lines,
           playedLineSans: playedAltLine,
           playedSan: sk.san,
-          playedContinuationSans: playedContSans,
+          playedContinuationSans: factContSans,
           userColor,
           evalBeforeCp: evalBefore,
           evalAfterCp: evalAfter,
@@ -1385,7 +1416,7 @@ export async function analyzeSelectedGame(options: {
             ...(missedAfterOpp ? { missed_after_opp: missedAfterOpp } : {}),
           },
         });
-      } else if (isUserPly && isPraiseMark(mark)) {
+      } else if (isUserPly && mark === "brilliant") {
         const praiseDrop = mark === "brilliant" ? 35 : 28;
         momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
           ply: sk.ply,
@@ -1426,9 +1457,10 @@ export async function analyzeSelectedGame(options: {
               fenBefore: sk.fenBefore,
               fenAfter: sk.fenAfter,
               bestPvSan,
+              lines,
               playedLineSans: playedAltLine,
               playedSan: sk.san,
-              playedContinuationSans: playedContSans,
+              playedContinuationSans: factContSans,
               userColor,
               evalBeforeCp: evalBefore,
               evalAfterCp: evalAfter,
@@ -1523,6 +1555,14 @@ export async function analyzeSelectedGame(options: {
                 eco: options.eco || null,
                 pawn_break: true,
                 played_best: playedBest,
+                engine_recommend: pawnBreakEvalGapAllowsRecommend({
+                  mark,
+                  deltaCp,
+                  userColor,
+                  evalBeforeCp: evalBefore,
+                  evalAfterCp: evalAfter,
+                  playedBest,
+                }),
                 san: sk.san,
               },
             });
@@ -1535,9 +1575,12 @@ export async function analyzeSelectedGame(options: {
               fenBefore: sk.fenBefore,
               fenAfter: sk.fenAfter,
               bestPvSan,
+              lines,
               playedLineSans: breakAltLine,
               playedSan: sk.san,
-              playedContinuationSans: breakContSans,
+              playedContinuationSans: factContSans.length
+                ? factContSans
+                : breakContSans,
               userColor,
               evalBeforeCp: evalBefore,
               evalAfterCp: evalAfter,
@@ -1580,7 +1623,7 @@ export async function analyzeSelectedGame(options: {
         }
       }
 
-      const structure = structureTracker.update(sk.fenBefore, sk.fenAfter);
+      const structure = structureByPly[i] || [];
       let stormTempo = 0;
       if (isUserPly) {
         try {
@@ -1596,7 +1639,12 @@ export async function analyzeSelectedGame(options: {
 
       if (sample && isUserPly) {
         const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
-        const phase = phaseForPly(sk.ply, pieceCount, metrics.phaseBounds);
+        const phase = phaseForPly(
+          sk.ply,
+          pieceCount,
+          metrics.phaseBounds,
+          momentAtPly?.structuralKind
+        );
         const moment = momentAtPly;
         const phaseThemesEarly = metrics.themesByPhase[phase] || [];
         const liveSituations = detectSituations({
@@ -1626,9 +1674,10 @@ export async function analyzeSelectedGame(options: {
           fenBefore: sk.fenBefore,
           fenAfter: sk.fenAfter,
           bestPvSan,
+          lines,
           playedLineSans: playedAltLine,
           playedSan: sk.san,
-          playedContinuationSans: playedContSans,
+          playedContinuationSans: factContSans,
           userColor,
           evalBeforeCp: evalBefore,
           evalAfterCp: evalAfter,
@@ -1694,20 +1743,10 @@ export async function analyzeSelectedGame(options: {
     }
   }
 
-  // Drop terminal eval explosions / non-deviations (annotate parity).
+  // Drop already-decided mate conversions / non-deviations.
+  // Keep live blunders — including equal → mate-in-N.
   for (const [ply, m] of Object.entries(metrics.momentsByPly)) {
-    if (m.structuralKind || m.inputs?.praise_mark) continue;
-    if (m.severity && m.source === "live") {
-      if (m.dropCp >= 500 || Math.abs(m.evalBeforeCp || 0) >= 9000) {
-        delete metrics.momentsByPly[Number(ply)];
-      }
-      continue;
-    }
-    if (
-      m.dropCp >= 500 ||
-      Math.abs(m.evalBeforeCp || 0) >= 9000 ||
-      (m.playedSan && m.bestSan && m.bestSan === m.playedSan)
-    ) {
+    if (shouldDropNoiseCoachMoment(m)) {
       delete metrics.momentsByPly[Number(ply)];
     }
   }
@@ -1860,17 +1899,15 @@ export async function analyzeSelectedGame(options: {
     }
   }
 
-  const tipStructureTracker = new StructureThemeTracker();
   const pawnStormTracker = new PawnStormTracker(4);
   for (let i = 0; i < plies.length; i += 1) {
     if (options.signal?.cancelled) break;
     const ply = plies[i]!;
     const isUserPly = ply.side === userColor;
     if (!isUserPly) {
-      tipStructureTracker.update(ply.fenBefore, ply.fenAfter);
       continue;
     }
-    const structure = tipStructureTracker.update(ply.fenBefore, ply.fenAfter);
+    const structure = structureByPly[i] || [];
     let stormTempo = 0;
     try {
       const afterBoard = new Chess(ply.fenAfter);
@@ -1882,8 +1919,13 @@ export async function analyzeSelectedGame(options: {
       stormTempo = 0;
     }
     const pieceCount = ply.fenAfter.split(" ")[0].replace(/\d/g, "").length;
-    const phase = phaseForPly(ply.ply, pieceCount, metrics.phaseBounds);
     const moment = metrics.momentsByPly[ply.ply] || null;
+    const phase = phaseForPly(
+      ply.ply,
+      pieceCount,
+      metrics.phaseBounds,
+      moment?.structuralKind
+    );
     const playedBest = Boolean(ply.bestSan && ply.bestSan === ply.san);
     const pov = assessPositionPov(ply.fenAfter, userColor);
     const provisionalThemes = [
@@ -1923,8 +1965,10 @@ export async function analyzeSelectedGame(options: {
       structureThemeUsed,
       phaseThemesFallback: phaseThemes,
     });
-    const playedContSans =
-      ply.bestPvSan.length > 1 ? ply.bestPvSan.slice(1) : [];
+    const playedLineToks = String(moment?.inputs?.played_line || "")
+      .split(/\s+/)
+      .filter(Boolean);
+    const trapContSans = sansAfterIndex(plies, i, 6);
     gamePlan = advanceGamePlan(gamePlan, {
       situations: planSituations,
       structureThemes: structure,
@@ -1939,8 +1983,10 @@ export async function analyzeSelectedGame(options: {
       fenBefore: ply.fenBefore,
       fenAfter: ply.fenAfter,
       bestPvSan: ply.bestPvSan,
+      lines: ply.lines,
       playedSan: ply.san,
-      playedContinuationSans: playedContSans,
+      playedLineSans: playedLineToks.length ? playedLineToks : undefined,
+      playedContinuationSans: trapContSans,
       userColor,
       evalBeforeCp: ply.evalBeforeCp,
       evalAfterCp: ply.evalAfterCp,
@@ -2077,6 +2123,47 @@ export async function analyzeSelectedGame(options: {
     if (!note) continue;
     tip.text = note;
     ply.note = note;
+    const weightTop = rankMetricNoteWeights({
+      phase,
+      themes: themesForPly({
+        metrics,
+        phase,
+        moment,
+        deltaCp: ply.deltaCp,
+        request: noteRequest,
+      }),
+      mark: ply.mark,
+      deltaCp: ply.deltaCp,
+      moment,
+      openingKeyId,
+      eco: options.eco,
+      opening: options.opening,
+      limit: 8,
+      request: noteRequest,
+      gamePlan,
+    }).map((w) => ({
+      keyId: w.keyId,
+      weight: w.weight,
+      formatted: formatWeightBreakdown(w),
+    }));
+    ply.noteRefs = buildCommentRefs({
+      tipText: note,
+      keyIds: tip.keyIds || (tip.keyId ? [tip.keyId] : []),
+      tipMeta: tip.tipMeta || null,
+      weightTop,
+      softKeysPool: tip.tipMeta?.softKeys || tip.keyIds || [],
+      inputs: {
+        ...(moment?.inputs || {}),
+        ...(noteRequest?.inputs || {}),
+      },
+      situations: noteRequest?.situations || null,
+      tacticalFact: noteRequest?.tacticalFact || null,
+      primaryField:
+        typeof noteRequest?.inputs?.primary_field === "string"
+          ? noteRequest.inputs.primary_field
+          : null,
+      primarySoftKeys: tip.tipMeta?.softKeys || null,
+    });
     usedKeyTips.push(tip);
     phaseNoteCounts[phase] += 1;
     if (tip.noteId) usedNoteIds.add(tip.noteId);
@@ -2085,7 +2172,8 @@ export async function analyzeSelectedGame(options: {
   }
 
   if (plies.length) {
-    plies[plies.length - 1]!.note = composeGameSummaryNote({
+    const last = plies[plies.length - 1]!;
+    const summary = composeGameSummaryNote({
       plies,
       userColor,
       metrics,
@@ -2094,6 +2182,22 @@ export async function analyzeSelectedGame(options: {
       usedKeyTips,
       gameKeys,
       selectedNotes,
+    });
+    last.note = summary;
+    last.noteRefs = buildCommentRefs({
+      tipText: summary,
+      tipMeta: {
+        topics: ["summary", "eval:swing"],
+        softKeys: [],
+        metrics: ["eval:swing"],
+        clauses: [],
+      },
+      keyIds: usedKeyTips
+        .flatMap((t) => t.keyIds || (t.keyId ? [t.keyId] : []))
+        .slice(0, 5),
+      weightTop: [],
+      softKeysPool: [],
+      inputs: {},
     });
   }
 

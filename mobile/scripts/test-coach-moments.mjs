@@ -10,6 +10,9 @@ import {
 import {
   COACH_NOTE_REQUEST_CONFIG,
   buildCoachNoteRequest,
+  formatCoachNoteRequest,
+  pawnBreakEvalGapAllowsRecommend,
+  boardMetricSnap,
 } from "../src/engine/gameCoach/coachNoteRequest.ts";
 import {
   softKeysForNoteRequest,
@@ -34,20 +37,30 @@ import {
   softKeysFromMiddlegamePeerGaps,
 } from "../src/engine/gameCoach/middlegameCoachInputs.ts";
 import { composeMiddlegameJudgmentTipDetailed } from "../src/engine/gameCoach/middlegameJudgmentTip.ts";
+import { composeEndgameJudgmentTipDetailed } from "../src/engine/gameCoach/endgameJudgmentTip.ts";
 import { middlegameAttackSnaps } from "../src/engine/middlegameAttackSnaps.ts";
 import { Chess } from "chess.js";
 import { keysForMetricFields } from "../src/engine/gameCoach/metricNoteKeys.ts";
 import {
   classifyPawnBreakClass,
   buildMiddlegameStrategicInputs,
+  preferCenterStrike,
+  engineLinePawnPushScores,
+  wingFromEnginePawnPushes,
   softKeysFromMgStructure,
 } from "../src/engine/gameCoach/middlegameStructure.ts";
+import {
+  isClosedCenter,
+  isOppositeSideCastling,
+  centerFluidityIndex,
+} from "../src/engine/gameCoach/situationProfiles.ts";
 import {
   composeMiddlegameStrategicTip,
 } from "../src/engine/gameCoach/middlegameStrategicTip.ts";
 import {
   classifyEndgameType,
   buildEndgameStrategicInputs,
+  enrichEndgameCoachMoments,
 } from "../src/engine/gameCoach/endgameContext.ts";
 import {
   composeEndgameStrategicTip,
@@ -272,6 +285,30 @@ assert(
     kind: pawnBreak.kind,
   }).includes("positional.pawn_break"),
   "pawn break → positional.pawn_break"
+);
+assert(
+  !pawnBreakEvalGapAllowsRecommend({
+    playedBest: false,
+    deltaCp: 20,
+    mark: null,
+  }),
+  "pawn break: tiny cp gap → no engine recommend"
+);
+assert(
+  pawnBreakEvalGapAllowsRecommend({
+    playedBest: false,
+    deltaCp: 80,
+    mark: null,
+  }),
+  "pawn break: ≥50cp gap → allow engine recommend"
+);
+assert(
+  !pawnBreakEvalGapAllowsRecommend({
+    playedBest: true,
+    deltaCp: 0,
+    mark: "best",
+  }),
+  "pawn break: played best → no engine recommend"
 );
 
 assert(
@@ -546,7 +583,7 @@ console.log(
       aggPly: byKind.opening_aggregate.ply,
       mgAggPly: byKind.middlegame_aggregate.ply,
       egAdvPly: byKind.endgame_advantage.ply,
-      cache: "game-coach:v127",
+      cache: "game-coach:v149",
     },
     null,
     2
@@ -1065,10 +1102,7 @@ console.log("ok coach moments smoke (post tip-diversity)");
   );
   const snaps = middlegameAttackSnaps(board, "w");
   assert(snaps.opp_king_uncastled === 1, "e8 king must count uncastled");
-  assert(
-    snaps.opp_king_in_centre === 1 || snaps.attack_setup >= 1,
-    "Italian-ish FEN should show centre king and/or attack setup"
-  );
+  assert(snaps.opp_king_in_centre === 1, "e8 king is in the centre");
   assert(
     typeof snaps.king_attack_ratio === "number" &&
       snaps.piece_support >= 0 &&
@@ -1119,6 +1153,158 @@ console.log("ok coach moments smoke (mg peer + attack snaps)");
     }) === "correct_wing_break",
     "b-file lever vs QS plan = correct_wing_break"
   );
+  assert(
+    classifyPawnBreakClass({
+      toFile: 4,
+      activeWingUser: "queenside",
+      isLever: true,
+      preferCenterStrike: true,
+    }) === "wrong_center_break",
+    "e-file lever vs QS plan stays wrong even if centre-strike flag is on"
+  );
+
+  const stranded = new Chess(
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQ1RK1 w kq - 5 5"
+  );
+  assert(
+    !isOppositeSideCastling(stranded),
+    "castled vs e8 king is not opposite-side"
+  );
+  const strandedSnap = boardMetricSnap(stranded, "white");
+  assert(strandedSnap.opp_king_in_centre === 1, "stranded e8 = in centre");
+  assert(strandedSnap.opp_king_uncastled === 1, "stranded e8 = uncastled");
+  assert(strandedSnap.opposite_side_castling === 0, "snap not opposite-side");
+  assert(strandedSnap.closed_center === 0, "Italian e4-e5 still has d-lever");
+  assert(
+    strandedSnap.center_fluidity_index >= 25,
+    "d-file mobile → fluidity not zero"
+  );
+  assert(
+    preferCenterStrike({
+      closedCenter: false,
+      oppKingUncastled: true,
+      oppKingInCentre: true,
+      userCastled: true,
+      oppKingsideAdvance: 0,
+    }),
+    "castled vs uncastled + open centre prefers centre strike"
+  );
+  const centreStrike = buildMiddlegameStrategicInputs({
+    board: stranded,
+    color: "w",
+    playedSan: "d4",
+    isLever: true,
+    toFile: 3,
+  });
+  assert(
+    centreStrike.pawn_break_class === "correct_center_break",
+    `d4 vs uncastled king = centre strike, got ${centreStrike.pawn_break_class}`
+  );
+  assert(centreStrike.prefer_center_strike === 1, "stamp prefer_center_strike");
+  assert(
+    centreStrike.active_wing_user === "center",
+    `wing plan centre, got ${centreStrike.active_wing_user}`
+  );
+
+  assert(
+    wingFromEnginePawnPushes(
+      engineLinePawnPushScores(
+        "r3nrk1/1pq1ppbp/3p2p1/3P2PP/p1PB1P2/8/PPQ1N3/R3K2R b KQ - 3 20",
+        ["Rc8", "b3", "b5"],
+        "b"
+      )
+    ) === "queenside",
+    "engine PV pawn pushes (b5) beat a rook-first move"
+  );
+  assert(
+    wingFromEnginePawnPushes(
+      engineLinePawnPushScores(
+        "r3nrk1/1pq1ppbp/3p2p1/3P2PP/p1PB1P2/8/PPQ1N3/R3K2R b KQ - 3 20",
+        ["Rc8", "Nf3", "Qd7"],
+        "b"
+      )
+    ) == null,
+    "rook-only engine line is not a wing plan"
+  );
+
+  const dragonBreak = new Chess(
+    "r3nrk1/1pq1ppbp/3p2p1/3P2PP/p1PB1P2/8/PPQ1N3/R3K2R b KQ - 3 20"
+  );
+  const dragonSit = [
+    {
+      id: "dragon_formation",
+      confidence: 1,
+      role: "cramped",
+      softKeys: ["structure.dragon_formation"],
+      metricHints: [],
+      lockBoost: 11,
+    },
+  ];
+  const dragonStrat = buildMiddlegameStrategicInputs({
+    board: dragonBreak,
+    color: "b",
+    situations: dragonSit,
+    playedSan: "e5",
+    bestSan: "Rc8",
+    engineLineSans: ["Rc8", "b3", "b5", "Qc3", "Qd7"],
+    isLever: true,
+    toFile: 4,
+    recommendBest: true,
+  });
+  assert(
+    dragonStrat.active_wing_user === "queenside",
+    `Dragon engine b5 = queenside plan, got ${dragonStrat.active_wing_user}`
+  );
+  assert(
+    dragonStrat.pawn_break_class === "wrong_center_break",
+    `e5 vs QS plan = wrong_center_break, got ${dragonStrat.pawn_break_class}`
+  );
+  assert(
+    /queenside/i.test(String(dragonStrat.engine_line_plan || "")),
+    `engine_line_plan must follow Rc8, got ${dragonStrat.engine_line_plan}`
+  );
+  assert(
+    /Played e5 instead of Rc8/.test(String(dragonStrat.strategic_summary || "")) &&
+      !/Opened the centre/.test(String(dragonStrat.strategic_summary || "")) &&
+      !/Plan:\s*queenside/i.test(String(dragonStrat.strategic_summary || "")),
+    `summary must not praise e5 as a centre strike: ${dragonStrat.strategic_summary}`
+  );
+
+  const centreReq = buildCoachNoteRequest({
+    ply: 12,
+    phase: "middlegame",
+    mark: "mistake",
+    moment: {
+      ply: 12,
+      moveNumber: 6,
+      severity: "mistake",
+      dropCp: 150,
+      playedSan: "a3",
+      bestSan: "d4",
+      fen: stranded.fen(),
+      source: "live",
+      inputs: { pawn_break: true },
+    },
+    deltaCp: 150,
+    fenBefore: stranded.fen(),
+    playedSan: "d4",
+    userColor: "white",
+  });
+  assert(centreReq, "MG request builds for stranded king");
+  assert(
+    centreReq.inputs?.prefer_center_strike === 1,
+    "request stamps prefer_center_strike"
+  );
+  assert(
+    /centre=strike=1/.test(formatCoachNoteRequest(centreReq)),
+    `fmt shows centre strike: ${formatCoachNoteRequest(centreReq)}`
+  );
+
+  const frenchLocked = new Chess(
+    "rnbqkbnr/ppp2ppp/4p3/3pP3/3P4/8/PPP2PPP/RNBQKBNR w KQkq - 0 4"
+  );
+  assert(isClosedCenter(frenchLocked), "French Advance both files locked");
+  assert(centerFluidityIndex(frenchLocked) === 0, "locked centre fluidity 0");
 
   const mgBoard = new Chess(
     "rnbqkb1r/pp3ppp/3p1n2/2pP4/2P5/2N5/PP2PPPP/R1BQKBNR b KQkq - 0 5"
@@ -1130,6 +1316,7 @@ console.log("ok coach moments smoke (mg peer + attack snaps)");
     bestSan: "b5",
     isLever: true,
     toFile: 4,
+    recommendBest: true,
   });
   assert(
     mgStrat.pawn_break_class === "wrong_center_break" ||
@@ -1137,16 +1324,151 @@ console.log("ok coach moments smoke (mg peer + attack snaps)");
       mgStrat.mg_structure_type === "benoni_asymmetric",
     "Benoni-ish FEN should stamp structure/wing/break"
   );
-  const mgTip = composeMiddlegameStrategicTip({ inputs: mgStrat });
-  assert(mgTip.length > 20, "MG strategic tip prose");
   assert(
-    !/\b\d+\s*cp\b/i.test(mgTip) && !/Why better:/i.test(mgTip),
-    "MG strategic tip clean"
+    String(mgStrat.strategic_summary || "").includes("Played e5 instead of b5"),
+    "meaningful gap: stamp Played X instead of Y"
+  );
+  const mgStratQuiet = buildMiddlegameStrategicInputs({
+    board: mgBoard,
+    color: "b",
+    playedSan: "e5",
+    bestSan: "b5",
+    isLever: true,
+    toFile: 4,
+    recommendBest: false,
+  });
+  assert(
+    !String(mgStratQuiet.strategic_summary || "").includes(
+      "Played e5 instead of b5"
+    ),
+    "tiny gap: skip instead-of recommendation"
+  );
+  const mgTip = composeMiddlegameStrategicTip({ inputs: mgStrat });
+  assert(mgTip.text.length > 20, "MG strategic tip prose");
+  assert(
+    !/\b\d+\s*cp\b/i.test(mgTip.text) &&
+      !/Why better:/i.test(mgTip.text) &&
+      !/Plan:\s*queenside/i.test(mgTip.text) &&
+      !/on the board:/i.test(mgTip.text),
+    "MG strategic tip clean human weave"
+  );
+  assert(
+    /tone:critique/.test(mgTip.topics.join(",")) ||
+      /better was|just remember|Closed or levered/i.test(mgTip.text),
+    `MG tip critique tone for wrong break: ${mgTip.text} [${mgTip.topics}]`
+  );
+
+  const mgTipGood = composeMiddlegameStrategicTip({
+    inputs: {
+      ...mgStrat,
+      pawn_break_class: "correct_wing_break",
+      played_impact:
+        "Played the primary wing pawn break to open lines for counterplay.",
+      strategic_summary:
+        "Played the primary wing pawn break to open lines for counterplay.",
+      played_move_error: "correct_wing_pawn_break",
+    },
+  });
+  assert(
+    /tone:praise/.test(mgTipGood.topics.join(",")),
+    `correct break → praise tone: ${mgTipGood.topics}`
+  );
+  assert(
+    !/Serious miss|Costly miss/i.test(mgTipGood.text),
+    `praise tip no critique lead: ${mgTipGood.text}`
+  );
+
+  const mgTipNeutral = composeMiddlegameStrategicTip({
+    inputs: {
+      mg_structure_type: "dragon_formation",
+      active_wing_user: "queenside",
+      engine_line_plan:
+        "Execute the queenside pawn break to open files before the kingside attack arrives.",
+      strategic_summary:
+        "In a Dragon structure, your plan is the queenside pawn break before their kingside play arrives.",
+      played_impact:
+        "In a Dragon structure, your plan is the queenside pawn break before their kingside play arrives.",
+    },
+  });
+  assert(
+    /tone:neutral/.test(mgTipNeutral.topics.join(",")),
+    `structure-only → neutral: ${mgTipNeutral.topics}`
+  );
+  assert(
+    /idea is|Dragon|queenside/i.test(mgTipNeutral.text),
+    `neutral explains plan/assets: ${mgTipNeutral.text}`
   );
   assert(
     softKeysFromMgStructure(mgStrat).length >= 1,
     "MG structure maps soft keys"
   );
+
+  // Fixed MG/EG checkpoint rigid weave (so far / now / phase-remember)
+  {
+    const mgCk = composeMiddlegameJudgmentTipDetailed({
+      inputs: {
+        middlegame_pawn_breaks: 2,
+        middlegame_seventh_rank_infiltration: 0,
+        active_wing_user: "queenside",
+        mg_structure_type: "dragon_formation",
+        engine_line_plan:
+          "Execute the queenside pawn break to open files before the kingside attack arrives.",
+        peer_delta_middlegame_space_advantage_pct: 8,
+        peer_delta_middlegame_open_file_utilization: -12,
+      },
+      packByKey: {
+        "imbalance.space":
+          "Claim space so your pieces have room before the opponent locks the position.",
+        "piece.coordination":
+          "Connect rooks on open files and improve the worst-placed piece.",
+      },
+    });
+    assert(
+      /so far/i.test(mgCk.text) && /now /i.test(mgCk.text),
+      `MG checkpoint lead/core: ${mgCk.text}`
+    );
+    assert(
+      /going forward/i.test(mgCk.text),
+      `MG checkpoint phase remember: ${mgCk.text}`
+    );
+    assert(
+      !/just remember/i.test(mgCk.text),
+      `MG checkpoint must not use opening remember: ${mgCk.text}`
+    );
+    assert(
+      mgCk.topics.includes("checkpoint:middlegame"),
+      `MG checkpoint topic: ${mgCk.topics}`
+    );
+
+    const egCk = composeEndgameJudgmentTipDetailed({
+      inputs: {
+        endgame_type: "king_and_pawn",
+        conversion_state: "winning_conversion",
+        vector_king_mechanics: "pawn_advanced_without_king_lead",
+        king_centralization: 1,
+        engine_line_plan:
+          "Centralize the king to secure opposition or key squares before pushing pawns.",
+        technical_rule:
+          "In king and pawn endgames, the king must lead the pawn to control key squares.",
+      },
+      packByKey: {
+        "endgame.strategic.active_king":
+          "Bring the king into the fight before further pawn moves.",
+      },
+    });
+    assert(
+      /so far/i.test(egCk.text) && /now /i.test(egCk.text),
+      `EG checkpoint lead/core: ${egCk.text}`
+    );
+    assert(
+      /from here/i.test(egCk.text),
+      `EG checkpoint phase remember: ${egCk.text}`
+    );
+    assert(
+      !/going forward/i.test(egCk.text) && !/just remember/i.test(egCk.text),
+      `EG checkpoint uses from-here remember: ${egCk.text}`
+    );
+  }
 
   const kp = new Chess("8/8/4k3/4P3/8/8/4K3/8 w - - 0 1");
   assert(
@@ -1196,9 +1518,65 @@ console.log("ok coach moments smoke (mg peer + attack snaps)");
   );
   const egTip = composeEndgameStrategicTip({ inputs: egStrat });
   assert(
-    /king/i.test(egTip) && !/\b\d+\s*cp\b/i.test(egTip),
+    /king/i.test(egTip.text) && !/\b\d+\s*cp\b/i.test(egTip.text),
     "EG tip leads with technique, no cp dump"
+  );
+  assert(
+    !/Endgame king_and_pawn/i.test(egTip.text) &&
+      !/conversion winning_conversion/i.test(egTip.text),
+    `EG tip humanized: ${egTip.text}`
   );
 }
 
 console.log("ok coach moments smoke (strategic vectors MG+EG)");
+
+// EG enrich must not stamp pre-endgame plies (full board).
+{
+  const momentsByPly = {
+    22: {
+      ply: 22,
+      fen: "r1bq1rk1/pppp1ppp/2n2n2/2b1p3/2B1P3/2NP1N2/PPP2PPP/R1BQ1RK1 w - - 0 8",
+      severity: "mistake",
+      inputs: {},
+    },
+    60: {
+      ply: 60,
+      fen: "8/8/4k3/4P3/8/8/4K3/8 w - - 0 1",
+      severity: "mistake",
+      inputs: {},
+    },
+  };
+  enrichEndgameCoachMoments({
+    momentsByPly,
+    userColor: "w",
+    eg: {
+      reached_endgame: true,
+      endgame_start_ply: 50,
+      blunders: 0,
+      king_centralization: 2,
+      king_distance: 2,
+      pawn_diff: 1,
+      piece_trades: 0,
+      beneficial_trades: 0,
+      winning_trades: 0,
+      simplification_trades: 0,
+      mate_episodes: 0,
+      mate_converted: 0,
+      accidental_stalemate: false,
+      mate_move_times: [],
+      theoretical: {},
+      theoretical_saved: false,
+      result: "*",
+    },
+  });
+  assert(
+    !momentsByPly[22].inputs?.endgame_type,
+    "ply 22 full-board mistake must not get EG strategic stamps"
+  );
+  assert(
+    momentsByPly[60].inputs?.endgame_type === "king_and_pawn",
+    "true EG ply must get endgame_type"
+  );
+}
+
+console.log("ok coach moments smoke (eg enrich phase gate)");

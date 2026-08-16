@@ -14,6 +14,7 @@ import { Chess } from "chess.js";
 import {
   GLOBAL_DEPTH,
   GLOBAL_MULTIPV,
+  LIVE_EVAL_DEPTH,
 } from "./analysisConfig";
 import { fenKey } from "./chessMoves";
 import { resolveEngineResources } from "./deviceResources";
@@ -138,6 +139,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
   let currentId = null;
   let bestByPv = {};
   let scoreByPv = {};
+  let depthByPv = {};
   let pvByMove = {};
   let scoreByMove = {};
   let wantedMultiPv = 1;
@@ -159,6 +161,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
   function resetCollect() {
     bestByPv = {};
     scoreByPv = {};
+    depthByPv = {};
     pvByMove = {};
     scoreByMove = {};
   }
@@ -217,8 +220,17 @@ const ENGINE_HTML = `<!DOCTYPE html>
         var mate = parseInt(mateMatch[1], 10);
         cp = mate > 0 ? 100000 - mate * 1000 : -100000 - mate * 1000;
       }
-      bestByPv[multipv] = pvUcis;
-      scoreByPv[multipv] = cp;
+      var depthMatch = line.match(/depth (\\d+)/);
+      var depth = depthMatch ? parseInt(depthMatch[1], 10) : -1;
+      var prevDepth = depthByPv[multipv] != null ? depthByPv[multipv] : -1;
+      var prevPv = bestByPv[multipv];
+      if (!prevPv || depth > prevDepth || (depth === prevDepth && pvUcis.length >= prevPv.length)) {
+        bestByPv[multipv] = pvUcis;
+        scoreByPv[multipv] = cp;
+        depthByPv[multipv] = depth;
+      } else if (depth === prevDepth) {
+        scoreByPv[multipv] = cp;
+      }
       var head = pvUcis[0];
       var known = pvByMove[head];
       if (!known || pvUcis.length >= known.length) pvByMove[head] = pvUcis;
@@ -263,10 +275,12 @@ const ENGINE_HTML = `<!DOCTYPE html>
           });
         }
       }
-      var bestUci = bestmoveUci || (multipvList[0] ? multipvList[0].uci : null);
-      var matched = bestUci
+      multipvList.sort(function (a, b) { return b.cpWhite - a.cpWhite; });
+      var top = multipvList[0] || null;
+      var bestUci = (top && top.uci) || bestmoveUci;
+      var matched = top || (bestUci
         ? multipvList.find(function (row) { return row.uci === bestUci; })
-        : null;
+        : null);
       var trackedPv = bestUci ? pvByMove[bestUci] : null;
       var bestPv =
         matched && matched.pv && matched.pv.length > 1
@@ -279,6 +293,9 @@ const ENGINE_HTML = `<!DOCTYPE html>
         : (bestUci && scoreByMove[bestUci] != null
           ? scoreByMove[bestUci]
           : (multipvList[0] ? multipvList[0].cpWhite : 0));
+      for (var mi = 0; mi < multipvList.length; mi++) {
+        if (multipvList[mi].cpWhite > cpWhite) cpWhite = multipvList[mi].cpWhite;
+      }
       searching = false;
       // #region agent log
       send('probe', {
@@ -512,7 +529,7 @@ const ENGINE_HTML = `<!DOCTYPE html>
     currentId = msg.id;
     wantedMultiPv = Math.max(1, Math.min(5, msg.multiPv || 1));
     searching = true;
-    var infinite = !!msg.infinite || msg.type === 'liveEval';
+    var infinite = !!msg.infinite;
     // #region agent log
     goCount++;
     // #endregion
@@ -801,7 +818,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         id,
         fen,
         multiPv,
-        infinite: true,
+        depth: LIVE_EVAL_DEPTH,
         stream: true,
       });
       return () => {

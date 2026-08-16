@@ -15,6 +15,8 @@
  *   sacrificeTheme+10 errorTacticalFamily+8 deltaCpTactical+4
  *   phaseThemeBagSoft+2 endgamePhase+3 theoreticalEndgame+3
  *   situationLock / tacticalLock / gamePlanLock (soft-key boosts)
+ *   tacticalSharp+6 (motif/attack/methodology when tactical_sharp)
+ *   MG centre stamp (prefer_center_strike / fluidity / exposure / wing / break class)
  *   accept when weight >= METRIC_TIP_MIN_WEIGHT (4); pool = softKeysForNoteRequest
  */
 import { accessSync, constants, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -38,7 +40,6 @@ import {
   createStyleScanSession,
   styleScanConsumeRoot,
   styleScanProcessPly,
-  sacrificeOfferAfterMove,
   type StyleScanSession,
 } from "../mobile/src/engine/styleMetrics";
 import {
@@ -84,9 +85,9 @@ import {
   composePlayedAltLine,
   COACH_NOTE_REQUEST_CONFIG,
   engineLineSansBudget,
-  isPraiseMark,
   isFixedCheckpointMoment,
   openingEvalGapAllowsEngineLine,
+  pawnBreakEvalGapAllowsRecommend,
 } from "../mobile/src/engine/gameCoach/coachNoteRequest";
 import {
   fenAfterUciPv,
@@ -94,12 +95,23 @@ import {
 } from "../mobile/src/engine/gameCoach/extendEnginePv";
 import {
   classifyEvalDrop,
+  formatPgnEvalCp,
+  isMateScore,
+  uciMateToCp,
   userWinProbability,
 } from "../mobile/src/engine/winProb";
 import {
+  applyForcedMateWhiteCp,
+  bestStmCp,
+} from "../mobile/src/engine/forcedMate";
+import {
+  classifyCoachMark,
+  coachMissedFromPending,
+} from "../mobile/src/engine/gameCoach/coachMarkClassify";
+import {
   detectOpeningFamily,
   resolveOpeningPackKey,
-  StructureThemeTracker,
+  confirmedStructureThemesByPly,
 } from "../mobile/src/engine/gameCoach/structureDetect";
 import {
   emptyGamePlanState,
@@ -121,9 +133,13 @@ import { enrichMiddlegameStrategicMoments } from "../mobile/src/engine/gameCoach
 import { enrichEndgameCoachMoments } from "../mobile/src/engine/gameCoach/endgameContext";
 import { defaultBundledPeerContext } from "../mobile/src/engine/gameCoach/openingCoachPeers";
 import { formatOpeningLabel } from "../mobile/src/engine/gameCoach/ecoLabels";
+import {
+  mergeMultiPvGapLines,
+  rankLinesByStm,
+} from "../mobile/src/engine/gameCoach/tacticSharpness";
+import { shouldDropNoiseCoachMoment } from "../mobile/src/engine/gameCoach/coachMomentNoise";
 
 const EVAL_CLAMP = 1000;
-const MATE_CP_THRESHOLD = 50000;
 
 /** Mirror mobile/src/engine/globalAnalysis.ts candidate gates. */
 const OPENING_PLY_SKIP = 12;
@@ -131,11 +147,15 @@ const MAX_OPENING_PLY = 20;
 const OPENING_MIN_DROP_CP = 100;
 const MAX_MOMENTS_PER_GAME = 3;
 
+type SfLine = { san: string; cpWhite: number };
+
 type SfPosition = {
   cpWhite: number;
   bestUci: string | null;
   /** Full best-line UCI tokens (for bad-move engine horizon). */
   bestPvUci: string[];
+  /** MultiPV ranks (SAN + white-relative cp) for sharpness / important. */
+  lines: SfLine[];
 };
 
 type MetricTimelineEvent = HeuristicMetricEvent & {
@@ -273,10 +293,7 @@ const OUT_EVAL = join(OUT_DIR, "metrics_with_eval.pgn");
 const WRITE_SPLIT = process.env.WRITE_SPLIT !== "0";
 
 function clampCp(value: number): number {
-  const abs = Math.abs(value);
-  if (abs >= MATE_CP_THRESHOLD) {
-    return value > 0 ? EVAL_CLAMP + 50 : -(EVAL_CLAMP + 50);
-  }
+  if (isMateScore(value)) return value;
   return Math.max(-EVAL_CLAMP, Math.min(EVAL_CLAMP, value));
 }
 
@@ -489,12 +506,20 @@ function stockfishAnalyzeOnce(
   });
   if (!res.stdout) return null;
   const lines = res.stdout.split(/\r?\n/);
-  const out: SfPosition[] = [];
+  type RankHit = { depth: number; cpStm: number; pv: string[] };
+  type ParseHit = {
+    cpWhite: number;
+    bestUci: string | null;
+    bestPvUci: string[];
+    ranks: RankHit[];
+  };
+  const out: ParseHit[] = [];
   let lastCp = 0;
   let bestUci: string | null = null;
   let multipv1Uci: string | null = null;
   let multipv1Pv: string[] = [];
   let bestDepth = -1;
+  const ranks = new Map<number, RankHit>();
   for (const line of lines) {
     const mpv = line.match(/\bmultipv (\d+)\b/);
     const depthM = line.match(/\bdepth (\d+)\b/);
@@ -503,25 +528,36 @@ function stockfishAnalyzeOnce(
     const pvMatch = line.match(/\bpv (.+)$/);
     const mpvN = mpv ? Number(mpv[1]) : null;
     const depthN = depthM ? Number(depthM[1]) : -1;
+    let cpStm: number | null = null;
+    if (score) cpStm = Number(score[1]);
+    if (mate) cpStm = uciMateToCp(Number(mate[1]));
     if (mpvN == null || mpvN === 1) {
-      if (score) lastCp = Number(score[1]);
-      if (mate) lastCp = Number(mate[1]) > 0 ? 10000 : -10000;
-      if (pvMatch) {
-        const toks = pvMatch[1]
-          .trim()
-          .split(/\s+/)
-          .filter((t) => /^[a-h][1-8][a-h][1-8][qrbn]?$/i.test(t));
-        if (toks.length) {
-          // Prefer deepest search; at same depth keep the longest PV.
+      if (cpStm != null) lastCp = cpStm;
+    }
+    if (pvMatch) {
+      const toks = pvMatch[1]
+        .trim()
+        .split(/\s+/)
+        .filter((t) => /^[a-h][1-8][a-h][1-8][qrbn]?$/i.test(t));
+      if (toks.length) {
+        const rank = mpvN ?? 1;
+        const prev = ranks.get(rank);
+        const nextCp = cpStm ?? prev?.cpStm ?? (rank === 1 ? lastCp : 0);
+        if (
+          !prev ||
+          depthN > prev.depth ||
+          (depthN === prev.depth && toks.length > prev.pv.length) ||
+          (depthN < 0 && toks.length > prev.pv.length)
+        ) {
+          ranks.set(rank, { depth: depthN, cpStm: nextCp, pv: toks });
+        }
+        if (rank === 1) {
           if (
             depthN > bestDepth ||
             (depthN === bestDepth && toks.length > multipv1Pv.length) ||
             (depthN < 0 && toks.length > multipv1Pv.length)
           ) {
             if (depthN >= 0) bestDepth = depthN;
-            multipv1Pv = toks;
-            multipv1Uci = toks[0] || null;
-          } else if (toks.length > multipv1Pv.length) {
             multipv1Pv = toks;
             multipv1Uci = toks[0] || null;
           }
@@ -532,28 +568,63 @@ function stockfishAnalyzeOnce(
       const bm = line.match(/^bestmove (\S+)/);
       bestUci =
         multipv1Uci || (bm?.[1] !== "(none)" ? bm?.[1] || null : null);
+      const ordered = [...ranks.entries()]
+        .sort((a, b) => a[0] - b[0])
+        .map(([, hit]) => hit)
+        .sort((a, b) => b.cpStm - a.cpStm);
+      const top = ordered[0];
+      const stmBest = bestStmCp([
+        lastCp,
+        ...ordered.map((hit) => hit.cpStm),
+      ]);
       out.push({
-        cpWhite: clampCp(lastCp),
-        bestUci,
-        bestPvUci: multipv1Pv.length
-          ? multipv1Pv
-          : bestUci
-            ? [bestUci]
-            : [],
+        cpWhite: clampCp(top?.cpStm ?? stmBest),
+        bestUci: top?.pv[0] || multipv1Uci || bestUci,
+        bestPvUci: top?.pv.length
+          ? top.pv
+          : multipv1Pv.length
+            ? multipv1Pv
+            : bestUci
+              ? [bestUci]
+              : [],
+        ranks: ordered,
       });
       lastCp = 0;
       bestUci = null;
       multipv1Uci = null;
       multipv1Pv = [];
       bestDepth = -1;
+      ranks.clear();
     }
   }
   if (out.length !== fens.length) return null;
-  return out.map((row, i) => ({
-    cpWhite: toWhiteCp(fens[i], row.cpWhite),
-    bestUci: row.bestUci,
-    bestPvUci: row.bestPvUci,
-  }));
+  return out.map((row, i) => {
+    const fen = fens[i]!;
+    const converted: SfLine[] = rankLinesByStm(
+      fen,
+      row.ranks
+        .map((hit) => ({
+          san: uciToSan(fen, hit.pv[0] || null) || hit.pv[0] || "",
+          cpWhite: toWhiteCp(fen, hit.cpStm),
+        }))
+        .filter((l) => l.san)
+    );
+    const fallback =
+      converted.length || !row.bestUci
+        ? converted
+        : [
+            {
+              san: uciToSan(fen, row.bestUci) || row.bestUci,
+              cpWhite: toWhiteCp(fen, row.cpWhite),
+            },
+          ];
+    return {
+      cpWhite: applyForcedMateWhiteCp(fen, toWhiteCp(fen, row.cpWhite)),
+      bestUci: row.bestUci,
+      bestPvUci: row.bestPvUci,
+      lines: fallback,
+    };
+  });
 }
 
 /**
@@ -569,6 +640,7 @@ function extendShortPvs(
   const out = positions.map((p) => ({
     ...p,
     bestPvUci: [...(p.bestPvUci || [])],
+    lines: [...(p.lines || [])],
   }));
   for (let round = 0; round < 4; round += 1) {
     const jobs: { index: number; leaf: string }[] = [];
@@ -635,6 +707,7 @@ function deepenCriticalPositions(args: {
   const out = positions.map((p) => ({
     ...p,
     bestPvUci: [...(p.bestPvUci || [])],
+    lines: [...(p.lines || [])],
   }));
   const criticalFenIdx = new Set<number>();
   let pendingOppKind: "mistake" | "blunder" | null = null;
@@ -659,7 +732,6 @@ function deepenCriticalPositions(args: {
     const playedBest = Boolean(bestSan && bestSan === san);
     const wpBefore = userWinProbability(before, userIsWhite);
     const wpAfter = userWinProbability(after, userIsWhite);
-    const wpDrop = Math.max(0, wpBefore - wpAfter);
 
     if (!isUser) {
       const gift = oppGiftKind(wpBefore, wpAfter);
@@ -670,7 +742,7 @@ function deepenCriticalPositions(args: {
 
     let missedOpportunity = false;
     if (pendingOppKind && pendingOppWp != null) {
-      missedOpportunity = annotateMissedOpportunity({
+      missedOpportunity = coachMissedFromPending({
         wpBefore,
         wpAfter,
         pendingPeakWp: pendingOppWp,
@@ -683,22 +755,21 @@ function deepenCriticalPositions(args: {
       pendingOppWp = null;
     }
 
-    const mark = annotateCoachMark({
+    const mark = userPlyMark({
       playedBest,
-      wpDrop,
-      wpBefore,
-      wpAfter,
       fenBefore,
       playedSan: san,
-      userIsWhite,
+      evalBeforeCp: before,
+      evalAfterCp: after,
       missedOpportunity,
+      lines: coachLinesFromPos(fenBefore, out[ply0]),
+      userIsWhite,
     });
 
     if (
       (!playedBest &&
         (mark === "blunder" || mark === "mistake" || mark === "missed")) ||
-      mark === "brilliant" ||
-      mark === "important"
+      mark === "brilliant"
     ) {
       addPair(ply0);
     }
@@ -713,13 +784,26 @@ function deepenCriticalPositions(args: {
   );
   const deep = stockfishAnalyzeOnce(deepFens, { ...SF_CRITICAL, quiet: true });
   if (!deep) return out;
+  const shallowByIdx = new Map<number, SfLine[]>();
+  for (const idx of idxList) {
+    shallowByIdx.set(idx, [...(out[idx]?.lines || [])]);
+  }
   for (let j = 0; j < idxList.length; j += 1) {
     out[idxList[j]!] = deep[j]!;
   }
   const budget = engineLineSansBudget();
   const extended = extendShortPvs(deepFens, deep, budget, SF_CRITICAL);
   for (let j = 0; j < idxList.length; j += 1) {
-    out[idxList[j]!] = extended[j]!;
+    const idx = idxList[j]!;
+    const ext = extended[j]!;
+    out[idx] = {
+      ...ext,
+      lines: mergeMultiPvGapLines(
+        shallowByIdx.get(idx),
+        ext.lines,
+        fens[idx]
+      ),
+    };
   }
   return out;
 }
@@ -750,6 +834,20 @@ function uciToSan(fen: string, uci: string | null): string | null {
   } catch {
     return null;
   }
+}
+
+function coachLinesFromPos(
+  fen: string,
+  pos: SfPosition | undefined
+): SfLine[] {
+  const raw = pos?.lines?.length
+    ? pos.lines.filter((l) => l.san)
+    : (() => {
+        const san = uciToSan(fen, pos?.bestUci || null);
+        if (!san || !pos) return [];
+        return [{ san, cpWhite: pos.cpWhite }];
+      })();
+  return fen && raw.length ? rankLinesByStm(fen, raw) : raw;
 }
 
 function playedAltLineFromPositions(args: {
@@ -806,76 +904,43 @@ function extractClkTags(raw: string): string[] {
   return [...raw.matchAll(/\[%clk\s+([^\]]+)\]/gi)].map((m) => m[1].trim());
 }
 
-function markFromWpDrop(wpDrop: number): MetricCoachMark | null {
-  if (wpDrop >= 0.2) return "blunder";
-  if (wpDrop >= 0.1) return "mistake";
-  if (wpDrop >= 0.05) return "inaccuracy";
-  if (wpDrop >= 0.02) return "good";
-  if (wpDrop >= 0) return "excellent";
-  return null;
+function trapContinuationSans(
+  historySans: string[],
+  ply0: number,
+  maxPly = 6
+): string[] {
+  return historySans.slice(ply0 + 1, ply0 + 1 + maxPly).filter(Boolean);
 }
 
-/** Node-safe praise/error band (no RN coachMarks GIF imports). */
-function annotateCoachMark(args: {
+function factContinuationSans(
+  historySans: string[],
+  ply0: number,
+  engineContinuation: string[]
+): string[] {
+  const trap = trapContinuationSans(historySans, ply0);
+  return trap.length ? trap : engineContinuation;
+}
+
+function userPlyMark(args: {
   playedBest: boolean;
-  wpDrop: number;
-  wpBefore?: number;
-  wpAfter?: number;
-  fenBefore?: string;
-  playedSan?: string;
-  userIsWhite?: boolean;
-  /** Prior opp mistake/blunder → missed opportunity, not mistake. */
-  missedOpportunity?: boolean;
+  fenBefore: string;
+  playedSan: string;
+  evalBeforeCp: number;
+  evalAfterCp: number;
+  missedOpportunity: boolean;
+  lines: SfLine[];
+  userIsWhite: boolean;
 }): MetricCoachMark | null {
-  // Best move is never miss/error — even right after an opp gift.
-  if (args.playedBest) {
-    if (
-      args.fenBefore &&
-      args.playedSan &&
-      args.wpBefore != null &&
-      args.wpAfter != null &&
-      args.userIsWhite != null &&
-      args.wpBefore < 0.85 &&
-      args.wpAfter >= 0.2 &&
-      !(args.wpBefore < 0.25 && args.wpAfter < 0.45)
-    ) {
-      try {
-        const board = new Chess(args.fenBefore);
-        const color = args.userIsWhite ? "w" : "b";
-        const move = board.move(args.playedSan);
-        if (move && sacrificeOfferAfterMove(board, move, color) >= 2) {
-          return "brilliant";
-        }
-      } catch {
-        /* ignore */
-      }
-    }
-    return "best";
-  }
-  if (args.missedOpportunity) return "missed";
-  if (
-    args.fenBefore &&
-    args.playedSan &&
-    args.wpBefore != null &&
-    args.wpAfter != null &&
-    args.userIsWhite != null &&
-    args.wpBefore < 0.85 &&
-    args.wpAfter >= 0.2 &&
-    !(args.wpBefore < 0.25 && args.wpAfter < 0.45) &&
-    args.wpDrop < 0.02
-  ) {
-    try {
-      const board = new Chess(args.fenBefore);
-      const color = args.userIsWhite ? "w" : "b";
-      const move = board.move(args.playedSan);
-      if (move && sacrificeOfferAfterMove(board, move, color) >= 2) {
-        return "brilliant";
-      }
-    } catch {
-      /* ignore */
-    }
-  }
-  return markFromWpDrop(args.wpDrop);
+  return classifyCoachMark({
+    side: args.userIsWhite ? "white" : "black",
+    evalBeforeCp: args.evalBeforeCp,
+    evalAfterCp: args.evalAfterCp,
+    playedBest: args.playedBest,
+    lines: args.lines,
+    fenBefore: args.fenBefore,
+    playedSan: args.playedSan,
+    missedOpportunity: args.missedOpportunity,
+  });
 }
 
 function oppGiftKind(
@@ -886,19 +951,6 @@ function oppGiftKind(
   if (gift >= 0.2) return "blunder";
   if (gift >= 0.1) return "mistake";
   return null;
-}
-
-function annotateMissedOpportunity(args: {
-  wpBefore: number;
-  wpAfter: number;
-  pendingPeakWp: number;
-  playedBest?: boolean;
-}): boolean {
-  if (args.playedBest) return false;
-  const drop = Math.max(0, args.wpBefore - args.wpAfter);
-  // Eval drop after opp gift → missed opportunity (not raw mistake).
-  if (drop >= 0.05) return true;
-  return Math.round((args.pendingPeakWp - args.wpAfter) * 100) >= 5;
 }
 
 function mistakePriority(
@@ -932,10 +984,23 @@ function buildVaultCandidates(args: {
     if (!isUser) continue;
     const before = args.evalsCp[ply0];
     const after = args.evalsCp[ply0 + 1];
-    const wpBefore = userWinProbability(before, args.userIsWhite);
-    const wpAfter = userWinProbability(after, args.userIsWhite);
-    const wpDrop = Math.max(0, wpBefore - wpAfter);
-    const mark = markFromWpDrop(wpDrop);
+    const fen = args.fens[ply0] || "";
+    const bestUci = args.positions[ply0]?.bestUci || null;
+    const bestSan = uciToSan(fen, bestUci);
+    const playedSan = args.historySans[ply0] || "";
+    const playedBest = Boolean(bestSan && playedSan && bestSan === playedSan);
+    if (playedBest) continue;
+    if (isMateScore(before)) continue;
+    const mark = userPlyMark({
+      playedBest: false,
+      fenBefore: fen,
+      playedSan,
+      evalBeforeCp: before,
+      evalAfterCp: after,
+      missedOpportunity: false,
+      lines: coachLinesFromPos(fen, args.positions[ply0]),
+      userIsWhite: args.userIsWhite,
+    });
     if (
       mark !== "inaccuracy" &&
       mark !== "mistake" &&
@@ -948,14 +1013,6 @@ function buildVaultCandidates(args: {
     const userAfter = args.userIsWhite ? after : -after;
     const dropCp = Math.max(0, Math.round(userBefore - userAfter));
     if (dropCp < OPENING_MIN_DROP_CP) continue;
-    const fen = args.fens[ply0] || "";
-    const bestUci = args.positions[ply0]?.bestUci || null;
-    const bestSan = uciToSan(fen, bestUci);
-    const playedSan = args.historySans[ply0] || "";
-    // Skip non-deviations and terminal eval explosions (mate clamp flips).
-    if (bestSan && playedSan && bestSan === playedSan) continue;
-    if (Math.abs(before) >= 9000 || Math.abs(after) >= 9000) continue;
-    if (dropCp >= 800) continue;
     pool.push({
       kind: ply0 < MAX_OPENING_PLY ? "opening" : "mistake",
       ply: ply0,
@@ -995,8 +1052,22 @@ function buildVaultCandidates(args: {
 
 function phaseForPly(
   ply0: number,
-  metrics: Awaited<ReturnType<typeof analyzeHeuristicGame>>
+  metrics: Awaited<ReturnType<typeof analyzeHeuristicGame>>,
+  structuralKind?: string | null
 ): PhaseName {
+  if (
+    structuralKind === "opening_name" ||
+    structuralKind === "opening_aggregate"
+  ) {
+    return "opening";
+  }
+  if (
+    structuralKind === "middlegame_aggregate" ||
+    structuralKind === "decisive_pawn_break"
+  ) {
+    return "middlegame";
+  }
+  if (structuralKind === "endgame_advantage") return "endgame";
   const o = metrics.opening;
   const m = metrics.middlegame;
   const e = metrics.endgame;
@@ -1071,10 +1142,10 @@ function coachHeaders(
     `[CoachMoments "${tagList(moments)}"]`,
     `[CoachStrengths "${tagList(coach.strengths)}"]`,
     `[CoachWeaknesses "${tagList(coach.weaknesses)}"]`,
-    `[CoachNoteWeightRules "metricInputKey+16;metricInputFamily+6;themeHit+14/12/4;openingKeyLock+12;minAccept=${METRIC_TIP_MIN_WEIGHT}"]`,
+    `[CoachNoteWeightRules "metricInputKey+16;metricInputFamily+6;themeHit+14/12/4;openingKeyLock+12;tacticalSharp+6;minAccept=${METRIC_TIP_MIN_WEIGHT}"]`,
     `[CoachNoteAttachRules "requestKinds=${COACH_NOTE_REQUEST_CONFIG.alwaysAttachKinds.join(",")};engineHorizon=${engineLineSansBudget()};fixed=${COACH_NOTE_REQUEST_CONFIG.fixedCheckpoints.map((c) => c.structuralKind).join(",")};live=${COACH_NOTE_REQUEST_CONFIG.liveStructuralKinds.join(",")};openingAlwaysAttach=${COACH_NOTE_REQUEST_CONFIG.openingAlwaysAttach}"]`,
     `[CoachNoteSelectRules "pool soft-keys from metricNoteKeys(softKeysForNoteRequest) only; pick highest weight>=${METRIC_TIP_MIN_WEIGHT}; didactic mid-specificity"]`,
-    `[CoachNoteBadMovePayload "playedMetricDelta+playedLine+engineLine+engineVsPlayed(horizon=${engineLineSansBudget()})"]`,
+    `[CoachNoteBadMovePayload "playedMetricDelta+playedLine+engineLine+engineVsPlayed(horizon=${engineLineSansBudget()});centre=strike/fluid/exp/wing/break"]`,
   ];
 }
 
@@ -1097,9 +1168,15 @@ function buildAllMoveText(args: {
   const chess = new Chess();
   chess.loadPgn(args.raw, { strict: false });
   const history = chess.history({ verbose: true });
+  const historySans = history.map((hm) => hm.san);
   const clks = extractClkTags(args.raw);
   const structureThemeUsed = new Set<string>();
-  const structureTracker = new StructureThemeTracker();
+  const structureByPly = confirmedStructureThemesByPly(
+    history.map((_, ply) => ({
+      fenBefore: args.fens[ply] || "",
+      fenAfter: args.fens[ply + 1] || "",
+    }))
+  );
   const pawnStormTracker = new PawnStormTracker(4);
   let gamePlan = emptyGamePlanState(args.openingKeyId);
   let stickySituations: import("../mobile/src/engine/gameCoach/situationProfiles").DetectedSituation[] =
@@ -1119,8 +1196,8 @@ function buildAllMoveText(args: {
     const isUser = args.userIsWhite ? ply % 2 === 0 : ply % 2 === 1;
     const bits: string[] = [];
     if (clks[ply]) bits.push(`[%clk ${clks[ply]}]`);
-    const pawns = args.evalsPawns[ply + 1];
-    if (pawns != null) bits.push(`[%eval ${pawns.toFixed(2)}]`);
+    const cp = args.evalsCp[ply + 1];
+    if (cp != null) bits.push(`[%eval ${formatPgnEvalCp(cp)}]`);
     const phaseBoundary = phaseComment(ply, args.metrics);
     if (phaseBoundary) bits.push(phaseBoundary);
 
@@ -1135,12 +1212,12 @@ function buildAllMoveText(args: {
       bits.push(`metricΔ[${ranked.slice(0, 12).map(formatEvent).join(" ")}]`);
     }
 
-    const phase = phaseForPly(ply, args.metrics);
+    const moment = args.coach.momentsByPly[ply + 1] || null;
+    const phase = phaseForPly(ply, args.metrics, moment?.structuralKind);
     const before = args.evalsCp[ply] ?? 0;
     const after = args.evalsCp[ply + 1] ?? before;
     const wpBefore = userWinProbability(before, args.userIsWhite);
     const wpAfter = userWinProbability(after, args.userIsWhite);
-    const wpDrop = Math.max(0, wpBefore - wpAfter);
     const userBefore = args.userIsWhite ? before : -before;
     const userAfter = args.userIsWhite ? after : -after;
     const deltaCp = Math.max(0, Math.round(userBefore - userAfter));
@@ -1153,7 +1230,7 @@ function buildAllMoveText(args: {
     let missedOpportunity = false;
     let missedAfterOpp: "mistake" | "blunder" | null = null;
     if (isUser && pendingOppKind && pendingOppWp != null) {
-      missedOpportunity = annotateMissedOpportunity({
+      missedOpportunity = coachMissedFromPending({
         wpBefore,
         wpAfter,
         pendingPeakWp: pendingOppWp,
@@ -1168,21 +1245,18 @@ function buildAllMoveText(args: {
     }
 
     const markRaw = isUser
-      ? annotateCoachMark({
+      ? userPlyMark({
           playedBest,
-          wpDrop,
-          wpBefore,
-          wpAfter,
           fenBefore: args.fens[ply] || "",
           playedSan,
-          userIsWhite: args.userIsWhite,
+          evalBeforeCp: before,
+          evalAfterCp: after,
           missedOpportunity,
+          lines: coachLinesFromPos(args.fens[ply] || "", args.positions[ply]),
+          userIsWhite: args.userIsWhite,
         })
       : null;
-    const isTerminalPly =
-      ply >= history.length - 1 ||
-      Math.abs(before) >= 9000 ||
-      Math.abs(after) >= 9000;
+    const isTerminalPly = isMateScore(before);
     const wpSwing = Math.abs(wpAfter - wpBefore);
     const errorMarks = new Set(["blunder", "mistake", "inaccuracy", "missed"]);
     const mark =
@@ -1191,7 +1265,6 @@ function buildAllMoveText(args: {
       (isTerminalPly || wpSwing < 0.02)
         ? null
         : markRaw;
-    const moment = args.coach.momentsByPly[ply1] || null;
     const cand = candByPly.get(ply) || null;
 
     const pushMomentBits = () => {
@@ -1215,7 +1288,6 @@ function buildAllMoveText(args: {
     };
 
     if (!isUser) {
-      structureTracker.update(args.fens[ply] || "", args.fens[ply + 1] || "");
       bits.push(`phase=${phase}`);
       if (bestSan) bits.push(`best=${bestSan}`);
       pushMomentBits();
@@ -1225,10 +1297,7 @@ function buildAllMoveText(args: {
     }
 
     if (isUser) {
-      const structure = structureTracker.update(
-        args.fens[ply] || "",
-        args.fens[ply + 1] || ""
-      );
+      const structure = structureByPly[ply] || [];
       let stormTempo = 0;
       try {
         const afterBoard = new Chess(args.fens[ply + 1] || "");
@@ -1276,6 +1345,7 @@ function buildAllMoveText(args: {
           args.positions[ply]?.bestPvUci || [],
           engineLineSansBudget()
         ),
+        lines: coachLinesFromPos(args.fens[ply] || "", args.positions[ply]),
         ...(() => {
           const alt = playedAltLineFromPositions({
             fenBefore: args.fens[ply] || "",
@@ -1287,7 +1357,11 @@ function buildAllMoveText(args: {
           return {
             playedLineSans: alt.playedLineSans,
             playedSan,
-            playedContinuationSans: alt.continuationSans,
+            playedContinuationSans: factContinuationSans(
+              historySans,
+              ply,
+              alt.continuationSans
+            ),
           };
         })(),
         userColor: args.userIsWhite ? "white" : "black",
@@ -1446,8 +1520,6 @@ function buildAllMoveText(args: {
             `notePick selected=none score=0 rule=noKeyReachMin${METRIC_TIP_MIN_WEIGHT} fallback=metricTemplateInApp`
           );
         }
-      } else {
-        bits.push("notePick selected=skip rule=attach=false");
       }
     }
 
@@ -1489,18 +1561,16 @@ function buildHeuristicMoveText(
   return parts.join(" ");
 }
 
-function buildEvalMoveText(
-  raw: string,
-  evalsPawns: Array<number | null>
-): string {
+function buildEvalMoveText(raw: string, evalsCp: number[]): string {
   const chess = new Chess();
   chess.loadPgn(raw, { strict: false });
   const history = chess.history({ verbose: true });
   const parts: string[] = [];
   for (let ply = 0; ply < history.length; ply += 1) {
     const m = history[ply];
-    const pawns = evalsPawns[ply + 1];
-    const comment = pawns != null ? ` {[%eval ${pawns.toFixed(2)}]}` : "";
+    const cp = evalsCp[ply + 1];
+    const comment =
+      cp != null ? ` {[%eval ${formatPgnEvalCp(cp)}]}` : "";
     const num = Math.floor(ply / 2) + 1;
     if (ply % 2 === 0) parts.push(`${num}. ${m.san}${comment}`);
     else parts.push(`${m.san}${comment}`);
@@ -1562,7 +1632,7 @@ async function main() {
   const sf = stockfishAnalyze(fens, SF_ANALYZE);
   const usedEngine = Boolean(sf);
   let positions: SfPosition[] =
-    sf || fens.map(() => ({ cpWhite: 0, bestUci: null, bestPvUci: [] }));
+    sf || fens.map(() => ({ cpWhite: 0, bestUci: null, bestPvUci: [], lines: [] }));
   if (usedEngine) {
     const fixedBeforePly0: number[] = [];
     const pushUserFullmove = (fm: number) => {
@@ -1705,7 +1775,8 @@ async function main() {
     const fenAfter = fens[ply0 + 1] || "";
     const san = historySans[ply0] || "";
     const isUser = userIsWhite ? ply0 % 2 === 0 : ply0 % 2 === 1;
-    const phase = phaseForPly(ply0, metrics);
+    const momentAtPly = coach.momentsByPly[ply1] || null;
+    const phase = phaseForPly(ply0, metrics, momentAtPly?.structuralKind);
     const before = evalsCp[ply0] ?? 0;
     const after = evalsCp[ply0 + 1] ?? before;
     const bestUci = positions[ply0]?.bestUci || null;
@@ -1718,12 +1789,11 @@ async function main() {
     const playedBest = Boolean(bestSan && bestSan === san);
     const wpBefore = userWinProbability(before, userIsWhite);
     const wpAfter = userWinProbability(after, userIsWhite);
-    const wpDrop = Math.max(0, wpBefore - wpAfter);
 
     let missedOpportunity = false;
     let missedAfterOpp: "mistake" | "blunder" | null = null;
     if (isUser && pendingOppKind && pendingOppWp != null) {
-      missedOpportunity = annotateMissedOpportunity({
+      missedOpportunity = coachMissedFromPending({
         wpBefore,
         wpAfter,
         pendingPeakWp: pendingOppWp,
@@ -1738,15 +1808,15 @@ async function main() {
     }
 
     const mark = isUser
-      ? annotateCoachMark({
+      ? userPlyMark({
           playedBest,
-          wpDrop,
-          wpBefore,
-          wpAfter,
           fenBefore,
           playedSan: san,
-          userIsWhite,
+          evalBeforeCp: before,
+          evalAfterCp: after,
           missedOpportunity,
+          lines: coachLinesFromPos(fenBefore, positions[ply0]),
+          userIsWhite,
         })
       : null;
 
@@ -1782,9 +1852,14 @@ async function main() {
         fenBefore,
         fenAfter,
         bestPvSan,
+        lines: coachLinesFromPos(fenBefore, positions[ply0]),
         playedLineSans: alt.playedLineSans,
         playedSan: san,
-        playedContinuationSans: alt.continuationSans,
+        playedContinuationSans: factContinuationSans(
+          historySans,
+          ply0,
+          alt.continuationSans
+        ),
         userColor: userIsWhite ? "white" : "black",
         evalBeforeCp: before,
         evalAfterCp: after,
@@ -1820,7 +1895,7 @@ async function main() {
       });
     }
 
-    if (isUser && isPraiseMark(mark)) {
+    if (isUser && mark === "brilliant") {
       const praiseDrop = mark === "brilliant" ? 35 : 28;
       const prevLive = coach.momentsByPly[ply1];
       upsertLiveMoment(coach.momentsByPly, {
@@ -1872,6 +1947,20 @@ async function main() {
               eco: studyGame.opening_eco || null,
               pawn_break: true,
               played_best: playedBest,
+              engine_recommend: pawnBreakEvalGapAllowsRecommend({
+                mark,
+                deltaCp: Math.max(
+                  0,
+                  Math.round(
+                    (userIsWhite ? before : -before) -
+                      (userIsWhite ? after : -after)
+                  )
+                ),
+                userColor: userIsWhite ? "white" : "black",
+                evalBeforeCp: before,
+                evalAfterCp: after,
+                playedBest,
+              }),
               san,
             },
           });
@@ -1890,9 +1979,14 @@ async function main() {
             fenBefore,
             fenAfter,
             bestPvSan,
+            lines: coachLinesFromPos(fenBefore, positions[ply0]),
             playedLineSans: alt.playedLineSans,
             playedSan: san,
-            playedContinuationSans: alt.continuationSans,
+            playedContinuationSans: factContinuationSans(
+          historySans,
+          ply0,
+          alt.continuationSans
+        ),
             userColor: userIsWhite ? "white" : "black",
             evalBeforeCp: before,
             evalAfterCp: after,
@@ -1967,9 +2061,14 @@ async function main() {
             fenBefore,
             fenAfter,
             bestPvSan,
+            lines: coachLinesFromPos(fenBefore, positions[ply0]),
             playedLineSans: alt.playedLineSans,
             playedSan: san,
-            playedContinuationSans: alt.continuationSans,
+            playedContinuationSans: factContinuationSans(
+          historySans,
+          ply0,
+          alt.continuationSans
+        ),
             userColor: userIsWhite ? "white" : "black",
             evalBeforeCp: before,
             evalAfterCp: after,
@@ -2016,26 +2115,10 @@ async function main() {
     style: evalMetrics.style,
   });
 
-  // Drop terminal eval explosions / non-deviations from moment map.
-  // Keep structural, praise, and live bad-move moments (except terminal noise).
+  // Drop already-decided mate conversions / non-deviations.
+  // Keep live blunders — including equal → mate-in-N.
   for (const [ply, m] of Object.entries(coach.momentsByPly)) {
-    const ply0 = Number(ply) - 1;
-    const played = historySans[ply0] || "";
-    if (m.structuralKind || m.inputs?.praise_mark) continue;
-    if (m.severity && m.source === "live") {
-      if (
-        m.dropCp >= 500 ||
-        Math.abs(m.evalBeforeCp || 0) >= 9000
-      ) {
-        delete coach.momentsByPly[Number(ply)];
-      }
-      continue;
-    }
-    if (
-      m.dropCp >= 500 ||
-      Math.abs(m.evalBeforeCp || 0) >= 9000 ||
-      (m.playedSan && played && m.bestSan && m.bestSan === played)
-    ) {
+    if (shouldDropNoiseCoachMoment(m)) {
       delete coach.momentsByPly[Number(ply)];
     }
   }
@@ -2098,11 +2181,21 @@ async function main() {
     const wpBefore = userWinProbability(before, userIsWhite);
     const wpAfter = userWinProbability(after, userIsWhite);
     const wpSwing = Math.abs(wpAfter - wpBefore);
-    const isTerminal =
-      ply0 >= historySans.length - 1 ||
-      Math.abs(before) >= 9000 ||
-      Math.abs(after) >= 9000;
-    const mark = markFromWpDrop(Math.max(0, wpBefore - wpAfter));
+    const fenBefore = fens[ply0] || "";
+    const playedSan = historySans[ply0] || "";
+    const bestSan = uciToSan(fenBefore, positions[ply0]?.bestUci || null);
+    const playedBest = Boolean(bestSan && bestSan === playedSan);
+    const isTerminal = isMateScore(before);
+    const mark = userPlyMark({
+      playedBest,
+      fenBefore,
+      playedSan,
+      evalBeforeCp: before,
+      evalAfterCp: after,
+      missedOpportunity: false,
+      lines: coachLinesFromPos(fenBefore, positions[ply0]),
+      userIsWhite,
+    });
     const userBefore = userIsWhite ? before : -before;
     const userAfter = userIsWhite ? after : -after;
     const deltaCp = Math.max(0, Math.round(userBefore - userAfter));
@@ -2219,6 +2312,18 @@ async function main() {
       openingNearMisses: openingNear.slice(0, 8),
     },
     coach,
+    sans: historySans,
+    engine: fens.slice(0, -1).map((fen, i) => ({
+      ply: i + 1,
+      fen,
+      cpWhite: positions[i]?.cpWhite ?? 0,
+      bestUci: positions[i]?.bestUci ?? null,
+      bestPvUci: positions[i]?.bestPvUci ?? [],
+      lines: (positions[i]?.lines || []).map((l) => ({
+        san: l.san,
+        cpWhite: l.cpWhite,
+      })),
+    })),
     timeline,
     timelineByPly: Object.fromEntries(
       [...eventsByPly.entries()].map(([ply, evs]) => [
@@ -2245,13 +2350,15 @@ async function main() {
         "phaseThemeBagSoft+2",
         "endgamePhase+3",
         "theoreticalEndgame+3",
+        "tacticalSharp+6",
+        "preferCenterStrike+fluidity+exposure",
       ],
       attach:
         "requestKinds=bad_move|fixed_checkpoint|structural_moment|praise_move;engineHorizon=8;openingAlwaysAttach=false;allowPhaseStructure=false",
       select:
         "pool soft-keys from softKeysForNoteRequest only; pick max if >= minAccept; didactic mid-specificity",
       badMovePayload:
-        "playedMetricDelta + playedLineMetricDelta + engineLineMetricDelta + engineVsPlayedMetricDelta (8-move PV, all BoardMetricSnap fields)",
+        "playedMetricDelta + playedLineMetricDelta + engineLineMetricDelta + engineVsPlayedMetricDelta (8-move PV, all BoardMetricSnap fields); centre stamp prefer_center_strike/fluidity/exposure/wing/break",
     },
   };
   writeFileSync(OUT_JSON, `${JSON.stringify(jsonDump, null, 2)}\n`);
@@ -2264,7 +2371,7 @@ async function main() {
     );
     writeFileSync(
       OUT_EVAL,
-      `${baseHeaders}\n[EvalSource "${usedEngine ? "stockfish" : "zero"}"]\n\n${buildEvalMoveText(raw, evalsPawns)}\n`
+      `${baseHeaders}\n[EvalSource "${usedEngine ? "stockfish" : "zero"}"]\n\n${buildEvalMoveText(raw, evalsCp)}\n`
     );
     console.log("Wrote", OUT_HEUR);
     console.log("Wrote", OUT_EVAL);

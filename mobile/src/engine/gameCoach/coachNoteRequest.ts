@@ -35,11 +35,77 @@ import {
   tacticalFactInputs,
   type TacticalFact,
 } from "./tacticalFact";
+import {
+  measureTacticSharpness,
+  tacticSharpnessInputs,
+} from "./tacticSharpness";
 import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
+import { checkpointEvalInputs } from "./evalSwingIndex";
 import {
   explainEngineLineVsPlayed,
   formatMetricSignalShort,
 } from "./engineLineExplain";
+import { buildMiddlegameStrategicInputs } from "./middlegameStructure";
+
+const MG_STRATEGY_META = [
+  "prefer_center_strike",
+  "center_fluidity_index",
+  "pawn_storm_tempo_delta",
+  "king_center_file_exposure",
+  "closed_center",
+  "opposite_side_castling",
+  "opp_king_in_centre",
+  "opp_king_uncastled",
+  "active_wing_user",
+  "active_wing_opp",
+  "user_wing_activity",
+  "pawn_break_class",
+  "mg_structure_type",
+  "mg_structure",
+  "engine_line_plan",
+  "strategic_summary",
+] as const;
+
+function middlegameStrategyStamp(args: {
+  phase: PhaseName;
+  fenBefore?: string;
+  moment?: CoachMetricMoment | null;
+  playedSan?: string | null;
+  userColor: "white" | "black";
+  situations?: DetectedSituation[] | null;
+  engineLineSans?: string[] | null;
+}): Record<string, string | number | boolean | null> {
+  const moment = args.moment || null;
+  const want =
+    args.phase === "middlegame" ||
+    moment?.structuralKind === "decisive_pawn_break" ||
+    moment?.structuralKind === "middlegame_aggregate";
+  const fen = args.fenBefore || moment?.fen;
+  if (!want || !fen) return {};
+  try {
+    const board = new Chess(fen);
+    const played = args.playedSan || moment?.playedSan || "";
+    const san = played.replace(/[+#?!x]/g, "");
+    const toFile =
+      san && /^[a-h]/.test(san) ? san.charCodeAt(0) - 97 : null;
+    const isLever =
+      moment?.structuralKind === "decisive_pawn_break" ||
+      moment?.inputs?.pawn_break === true;
+    return buildMiddlegameStrategicInputs({
+      board,
+      color: args.userColor === "white" ? "w" : "b",
+      situations: args.situations,
+      inputs: moment?.inputs,
+      playedSan: played || null,
+      bestSan: moment?.bestSan,
+      engineLineSans: args.engineLineSans,
+      isLever: Boolean(isLever && toFile != null),
+      toFile,
+    });
+  } catch {
+    return {};
+  }
+}
 
 export type CoachNoteRequestKind =
   | "bad_move"
@@ -97,7 +163,13 @@ export type BoardMetricSnap = {
   good_vs_bad_bishop: number;
   /** Own wing race minus opp (opp-castle aware). */
   pawn_storm_tempo: number;
-  /** Opp king on central 16 (c3–f6). */
+  /** Mobile d/e pawns vs locked heads (0 locked … 100 both files open). */
+  center_fluidity_index: number;
+  /** User queenside advance minus opp kingside advance. */
+  pawn_storm_tempo_delta: number;
+  /** Open/semi d/e files while opp king uncastled or on d/e. */
+  king_center_file_exposure: number;
+  /** Opp king on the d or e file. */
   opp_king_in_centre: number;
   /** Opp king not castled to wing. */
   opp_king_uncastled: number;
@@ -161,7 +233,7 @@ export const COACH_NOTE_REQUEST_CONFIG = {
   /** Engine PV / played-continuation horizon for line compare. */
   engineLineHorizonMoves: 8,
   badMoveMarks: ["blunder", "mistake", "missed"] as const,
-  praiseMarks: ["brilliant", "important"] as const,
+  praiseMarks: ["brilliant"] as const,
   alwaysAttachKinds: [
     "bad_move",
     "structural_moment",
@@ -210,6 +282,11 @@ export const COACH_NOTE_REQUEST_CONFIG = {
    * Quiet openings stay concept/structure focused.
    */
   openingAggregateEngineMinWpDrop: WP_INACCURACY_DROP,
+  /**
+   * Pawn break: only recommend engine best when gap ≥ inaccuracy band.
+   * Near-equal alternatives stay structure-focused (no "instead of …").
+   */
+  pawnBreakEngineMinWpDrop: WP_INACCURACY_DROP,
 };
 
 export type CoachNoteRequestConfig = typeof COACH_NOTE_REQUEST_CONFIG;
@@ -309,6 +386,9 @@ const BOARD_METRIC_FIELDS: (keyof BoardMetricSnap)[] = [
   "knight_vs_bishop",
   "good_vs_bad_bishop",
   "pawn_storm_tempo",
+  "center_fluidity_index",
+  "pawn_storm_tempo_delta",
+  "king_center_file_exposure",
   "opp_king_in_centre",
   "opp_king_uncastled",
   "king_attack_ratio",
@@ -545,6 +625,27 @@ export function openingEvalGapAllowsEngineLine(args: {
   return false;
 }
 
+/** Pawn-break engine recommend only when best is meaningfully better. */
+export function pawnBreakEvalGapAllowsRecommend(args: {
+  mark?: CoachMark | null;
+  deltaCp?: number;
+  userColor?: "white" | "black";
+  evalBeforeCp?: number | null;
+  evalAfterCp?: number | null;
+  playedBest?: boolean;
+}): boolean {
+  if (args.playedBest) return false;
+  return openingEvalGapAllowsEngineLine({
+    mark: args.mark,
+    deltaCp: args.deltaCp,
+    fenBefore: undefined,
+    userColor: args.userColor,
+    evalBeforeCp: args.evalBeforeCp,
+    evalAfterCp: args.evalAfterCp,
+    minWpDrop: COACH_NOTE_REQUEST_CONFIG.pawnBreakEngineMinWpDrop,
+  });
+}
+
 export function requestAlwaysAttaches(
   kind: CoachNoteRequestKind | null | undefined
 ): boolean {
@@ -642,6 +743,7 @@ export function buildCoachNoteRequest(args: {
   fenBefore?: string;
   fenAfter?: string;
   bestPvSan?: string[];
+  lines?: { san?: string; cpWhite: number }[] | null;
   /**
    * Played move + engine continuation after it (preferred).
    * Not the real game line — opponent later mistakes must not affect Δ.
@@ -712,7 +814,7 @@ export function buildCoachNoteRequest(args: {
     (isBadMoveMark(args.mark) || (moment && moment.dropCp >= 80))
   ) {
     kind = "bad_move";
-  } else if (isPraiseMark(args.mark)) {
+  } else if (isPraiseMark(args.mark) || args.moment?.inputs?.praise_mark === "brilliant") {
     kind = "praise_move";
   } else if (
     COACH_NOTE_REQUEST_CONFIG.allowPhaseStructure &&
@@ -758,7 +860,17 @@ export function buildCoachNoteRequest(args: {
       evalBeforeCp: args.evalBeforeCp,
       evalAfterCp: args.evalAfterCp,
     });
-  // Pawn break: always run 8-ply engine continuation Δ vs pre-break.
+  const pawnBreakWantsEngine =
+    isPawnBreak &&
+    pawnBreakEvalGapAllowsRecommend({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      userColor,
+      evalBeforeCp: args.evalBeforeCp,
+      evalAfterCp: args.evalAfterCp,
+      playedBest,
+    });
+  // Pawn break: always snap played continuation; engine recommend only when gap meaningful.
   // Other kinds: skip engine-vs-played when move already best.
   const wantLineCompare =
     isPawnBreak ||
@@ -799,8 +911,9 @@ export function buildCoachNoteRequest(args: {
       playedLineSans = playedLine.sans;
       playedLineMetricDelta = playedLine.deltas;
 
-      // Engine best from fenBefore — only needed when a better move exists.
-      if (!playedBest || !isPawnBreak) {
+      const allowEngine =
+        (!isPawnBreak && !playedBest) || pawnBreakWantsEngine;
+      if (allowEngine) {
         const engine = metricDeltaAlongSans({
           fen: args.fenBefore,
           sans: args.bestPvSan || [],
@@ -857,6 +970,12 @@ export function buildCoachNoteRequest(args: {
     const best =
       moment?.bestSan ||
       (args.bestPvSan && args.bestPvSan[0] ? args.bestPvSan[0] : null);
+    const continuation =
+      args.playedContinuationSans?.length
+        ? args.playedContinuationSans
+        : args.playedLineSans && args.playedLineSans.length > 1
+          ? args.playedLineSans.slice(1)
+          : [];
     tacticalFact = detectTacticalFact({
       fenBefore: args.fenBefore,
       fenAfter: args.fenAfter,
@@ -867,11 +986,47 @@ export function buildCoachNoteRequest(args: {
       deltaCp: args.deltaCp,
       evalBeforeWhite: args.evalBeforeCp,
       evalAfterWhite: args.evalAfterCp,
+      opponentReplySan: continuation[0] || null,
+      playedContinuationSans: continuation,
       side: userColor,
+      lines: args.lines,
     });
     if (!tacticalFact.kind) tacticalFact = null;
   }
-  const tacticalStamp = tacticalFactInputs(tacticalFact);
+  const sharp =
+    kind === "bad_move" || kind === "praise_move"
+      ? measureTacticSharpness({
+          pvSan: args.bestPvSan || [],
+          lines: args.lines,
+          side: userColor,
+        })
+      : null;
+  const tacticalStamp = {
+    ...tacticalFactInputs(tacticalFact),
+    ...tacticSharpnessInputs(sharp),
+  };
+  const mgStamp = middlegameStrategyStamp({
+    phase: args.phase,
+    fenBefore: args.fenBefore,
+    moment,
+    playedSan: args.playedSan,
+    userColor,
+    situations,
+    engineLineSans: engineLineSans.length
+      ? engineLineSans
+      : args.bestPvSan || [],
+  });
+  const evalStamp = checkpointEvalInputs({
+    evalCpWhite:
+      args.evalAfterCp != null && Number.isFinite(args.evalAfterCp)
+        ? args.evalAfterCp
+        : typeof moment?.inputs?.eval_cp === "number"
+          ? moment.inputs.eval_cp
+          : typeof moment?.inputs?.best_line_eval_cp === "number"
+            ? moment.inputs.best_line_eval_cp
+            : null,
+    userIsWhite: userColor === "white",
+  });
 
   return {
     kind,
@@ -891,6 +1046,8 @@ export function buildCoachNoteRequest(args: {
       ...(moment?.inputs || {}),
       ...situationStamp,
       ...tacticalStamp,
+      ...mgStamp,
+      ...evalStamp,
     },
     situations,
     tacticalFact,
@@ -941,7 +1098,30 @@ export function formatCoachNoteRequest(req: CoachNoteRequest): string {
     bits.push(`situations[${formatSituationsShort(req.situations)}]`);
   }
   if (req.tacticalFact?.kind) {
-    bits.push(`tactical=${req.tacticalFact.kind}`);
+    const tf = req.tacticalFact;
+    if (tf.kind === "trapped_piece") {
+      const piece = (tf.pieceLabel || "piece").replace(/_/g, " ");
+      const own = tf.selfInflicted ? ":own" : "";
+      const sq = tf.trapSquare ? `@${tf.trapSquare}` : "";
+      const delay =
+        tf.capturePlyDelay != null ? ` delay=${tf.capturePlyDelay}` : "";
+      bits.push(`tactical=trapped_piece${own}:${piece}${sq}${delay}`);
+    } else {
+      bits.push(`tactical=${tf.kind}${tf.motif ? `:${tf.motif}` : ""}`);
+    }
+  }
+  if (req.inputs?.tactical_sharp != null) {
+    bits.push(
+      `sharp=${req.inputs.tactical_sharp}:gap=${req.inputs.tactical_pv_gap_wp}:force=${req.inputs.tactical_forcing_ratio}`
+    );
+  }
+  if (
+    req.inputs?.prefer_center_strike != null ||
+    req.inputs?.center_fluidity_index != null
+  ) {
+    bits.push(
+      `centre=strike=${req.inputs.prefer_center_strike ?? 0}:fluid=${req.inputs.center_fluidity_index ?? 0}:exp=${req.inputs.king_center_file_exposure ?? 0}:wing=${req.inputs.active_wing_user || "—"}:break=${req.inputs.pawn_break_class || "—"}`
+    );
   }
   if (req.inputs) {
     const inp = Object.entries(req.inputs)
@@ -966,9 +1146,19 @@ export function coachRequestMetaInputs(
           situation_roles: request.inputs.situation_roles ?? null,
         }
       : {};
+  const tact: Record<string, string | number | boolean | null> = {};
+  for (const [k, v] of Object.entries(request.inputs || {})) {
+    if (k.startsWith("tactical_") && v != null && v !== "") tact[k] = v;
+  }
+  const mg: Record<string, string | number | boolean | null> = {};
+  for (const k of MG_STRATEGY_META) {
+    const v = request.inputs?.[k];
+    if (v != null && v !== "") mg[k] = v;
+  }
   return {
     ...sit,
-    ...tacticalFactInputs(request.tacticalFact),
+    ...tact,
+    ...mg,
   };
 }
 

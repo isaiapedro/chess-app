@@ -5,12 +5,16 @@
  * notePick / noteRequest comment bits. Regenerates soft keys + pack tip via
  * buildCoachNoteRequest / softKeysForNoteRequest / pickMetricTip, with live
  * situations / tacticalFact / gamePlan (same path as analyzeGame tip loop).
+ * Passes annotate JSON `engine[].lines` so MultiPV gap + motif re-detect.
+ * Rebuilds MG centre stamp (prefer_center_strike / fluidity / exposure / wing).
  *
  * Usage:
  *   cd mobile && npx --yes tsx scripts/dump_coach_moments.mjs
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --json
  *   npx --yes tsx scripts/dump_coach_moments.mjs --pgn ../samples/metrics_all.pgn
+ *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --comment-refs
+ *   # --comment-refs: top pack choices + only coach-moment fields the tip references
  */
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -35,6 +39,7 @@ import {
   enrichOpeningCoachMoments,
   buildOpeningPeerSignals,
 } from "../src/engine/gameCoach/openingCoachInputs.ts";
+import { buildMiddlegamePeerSignals } from "../src/engine/gameCoach/middlegameCoachInputs.ts";
 import { mergeOpeningTipPrior } from "../src/engine/gameCoach/openingJudgmentTip.ts";
 import { defaultBundledPeerContext } from "../src/engine/gameCoach/openingCoachPeers.ts";
 import { resolveOpeningPackKey } from "../src/engine/gameCoach/structureDetect.ts";
@@ -53,7 +58,14 @@ import {
 import {
   formatTacticalFactHead,
   formatTacticalFactShort,
+  tacticalFactInputs,
 } from "../src/engine/gameCoach/tacticalFact.ts";
+import { rankLinesByStm } from "../src/engine/gameCoach/tacticSharpness.ts";
+import { phaseForCoachMoment } from "../src/engine/gameCoach/phaseSplits.ts";
+import {
+  buildCommentRefs,
+  formatCommentRefs,
+} from "../src/engine/gameCoach/commentRefs.ts";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const MOBILE = join(HERE, "..");
@@ -62,16 +74,18 @@ const DEFAULT_JSON = join(CHESS_ROOT, "samples/metrics_all.json");
 const DEFAULT_PGN = join(CHESS_ROOT, "samples/metrics_all.pgn");
 
 function usage() {
-  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json]
+  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json] [--comment-refs]
+  --comment-refs  top pack choices + only coach-moment refs used by the tip
   Default annotate JSON: ${DEFAULT_JSON}`);
 }
 
 function parseArgs(argv) {
-  const out = { jsonPath: null, pgnPath: null, asJson: false };
+  const out = { jsonPath: null, pgnPath: null, asJson: false, commentRefs: false };
   const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--json") out.asJson = true;
+    else if (a === "--comment-refs") out.commentRefs = true;
     else if (a === "--pgn") {
       out.pgnPath = argv[++i];
     } else if (a === "-h" || a === "--help") {
@@ -136,13 +150,25 @@ function parseScalar(s) {
   return Number.isFinite(n) ? n : s;
 }
 
-function phaseForPly(ply, coach) {
+function phaseForPly(ply, coach, structuralKind) {
   const bounds = coach?.phaseBounds || {};
-  const eg = bounds.endgameStartPly ?? bounds.endgame_start_ply;
-  const mg = bounds.middlegameStartPly ?? bounds.middlegame_start_ply;
-  if (eg != null && ply >= eg) return "endgame";
-  if (mg != null && ply >= mg) return "middlegame";
-  return "opening";
+  return phaseForCoachMoment({
+    ply1: ply,
+    pieceCount: 32,
+    bounds: {
+      middlegameStartPly0:
+        bounds.middlegameStartPly0 ??
+        bounds.middlegameStartPly ??
+        bounds.middlegame_start_ply ??
+        null,
+      endgameStartPly0:
+        bounds.endgameStartPly0 ??
+        bounds.endgameStartPly ??
+        bounds.endgame_start_ply ??
+        null,
+    },
+    structuralKind,
+  });
 }
 
 function markFromMoment(moment) {
@@ -171,6 +197,21 @@ function loadPackEntries() {
       e.keyId || ""
     )
   );
+}
+
+function engineLinesForMoment(data, moment) {
+  const rows = data?.engine;
+  if (!Array.isArray(rows) || !moment?.ply) return [];
+  const byPly = rows.find((r) => r && r.ply === moment.ply);
+  const row = byPly || rows[moment.ply - 1];
+  const lines = Array.isArray(row?.lines) ? row.lines : [];
+  const fen = moment.fen || row?.fen;
+  return fen && lines.length ? rankLinesByStm(fen, lines) : lines;
+}
+
+function trapContinuationSans(historySans, ply1, maxPly = 6) {
+  if (!Array.isArray(historySans) || !ply1) return [];
+  return historySans.slice(ply1, ply1 + maxPly).filter(Boolean);
 }
 
 /** Pull per-ply annotate comment blobs that mention noteRequest / notePick. */
@@ -285,6 +326,53 @@ function enrichRequestFromMomentInputs(req, moment) {
   };
 }
 
+function commentRefsForRow(row) {
+  const tip = row.tip;
+  if (!tip?.text) return null;
+  return buildCommentRefs({
+    tipText: tip.text,
+    keyIds: tip.keyIds || (tip.keyId ? [tip.keyId] : []),
+    tipMeta: tip.tipMeta || null,
+    weightTop: row.weightTop || [],
+    softKeysPool: tip.tipMeta?.softKeys || tip.keyIds || row.softKeys || [],
+    inputs: row.inputs || {},
+    situations: row.situations || null,
+    tacticalFact: row.request?.tacticalFact || null,
+    primaryField: row.primaryField || null,
+    primarySoftKeys: row.primarySoftKeys || tip.tipMeta?.softKeys || null,
+  });
+}
+
+function dumpMomentCommentRefs(row) {
+  const { moment, tip, phase } = row;
+  const lines = [];
+  lines.push("═".repeat(72));
+  lines.push(
+    `MOMENT ply=${moment.ply} move=${moment.moveNumber ?? "?"} ` +
+      `mark=${moment.severity ?? "—"} structuralKind=${moment.structuralKind ?? "—"} ` +
+      `phase=${phase} dropCp=${moment.dropCp ?? 0}`
+  );
+  lines.push(
+    `played: ${moment.playedSan || "—"}  best: ${moment.bestSan || "—"}`
+  );
+  if (!row.attachLive?.attach || !tip) {
+    lines.push("generated comment: (none)");
+    lines.push("");
+    return lines.join("\n");
+  }
+  const ids =
+    tip.keyIds?.length ? tip.keyIds.join(", ") : tip.keyId || "—";
+  lines.push("─ generated comment ─");
+  lines.push(
+    `keyId: ${tip.keyId}  keyIds: [${ids}]  score=${tip.score ?? "—"}  noteId=${tip.noteId || "—"}`
+  );
+  lines.push(tip.text || "(empty)");
+  const refs = commentRefsForRow(row);
+  if (refs) lines.push(formatCommentRefs(refs));
+  lines.push("");
+  return lines.join("\n");
+}
+
 function dumpMoment(row) {
   const {
     moment,
@@ -370,11 +458,21 @@ function dumpMoment(row) {
       "tactical_mate_in",
       "tactical_taken_next",
       "tactical_head",
+      "tactical_trap_square",
+      "tactical_capture_ply_delay",
+      "tactical_material_delta",
+      "tactical_motif",
+      "tactical_sharp",
+      "tactical_pv_gap_wp",
+      "tactical_forcing_ratio",
       "key_id",
       "key_ids",
     ]);
-    const openingSnap = keys.filter(
-      (k) => !coachMeta.has(k) && !k.startsWith("peer_") && !k.startsWith("tactical_")
+    const metricSnap = keys.filter(
+      (k) =>
+        !coachMeta.has(k) &&
+        !k.startsWith("peer_") &&
+        !k.startsWith("tactical_")
     );
     const peerKeys = keys.filter((k) => k.startsWith("peer_")).sort();
     const sitKeys = keys.filter(
@@ -390,22 +488,86 @@ function dumpMoment(row) {
         lines.push(`  ${k}: ${inputs[k]}`);
       }
     }
-    if (openingSnap.length) {
-      lines.push("  [opening metric snapshot]");
-      for (const k of openingSnap.sort()) {
-        lines.push(`  ${k}: ${inputs[k]}`);
-      }
-    }
     const isOpeningCheckpoint =
       moment.structuralKind === "opening_name" ||
       moment.structuralKind === "opening_aggregate";
-    if (isOpeningCheckpoint) {
+    const isMgCheckpoint =
+      moment.structuralKind === "middlegame_aggregate" ||
+      moment.structuralKind === "decisive_pawn_break";
+    const isEgCheckpoint = moment.structuralKind === "endgame_advantage";
+    const strategicKeys = new Set([
+      "mg_structure_type",
+      "mg_structure",
+      "active_wing_user",
+      "active_wing_opp",
+      "user_wing_activity",
+      "pawn_break_class",
+      "prefer_center_strike",
+      "center_fluidity_index",
+      "pawn_storm_tempo_delta",
+      "king_center_file_exposure",
+      "closed_center",
+      "opposite_side_castling",
+      "opp_king_in_centre",
+      "opp_king_uncastled",
+      "vector_king_threat",
+      "vector_piece_scope",
+      "vector_pawn_health",
+      "vector_infiltration",
+      "king_attack_urgency",
+      "played_move_error",
+      "played_impact",
+      "engine_line_plan",
+      "strategic_summary",
+      "endgame_type",
+      "theoretical",
+      "theoretical_shape",
+      "theoretical_keys",
+      "conversion_state",
+      "vector_king_mechanics",
+      "vector_pawn_dynamics",
+      "vector_simplification",
+      "vector_rook_activity",
+      "technical_rule",
+    ]);
+    const stratSnap = metricSnap.filter((k) => strategicKeys.has(k));
+    const phaseSnap = metricSnap.filter((k) => !strategicKeys.has(k));
+    const snapLabel = isOpeningCheckpoint
+      ? "[opening metric snapshot]"
+      : isMgCheckpoint || phase === "middlegame"
+        ? "[middlegame metric snapshot]"
+        : isEgCheckpoint || phase === "endgame"
+          ? "[endgame metric snapshot]"
+          : `[${phase || "phase"} metric snapshot]`;
+    if (phaseSnap.length) {
+      lines.push(`  ${snapLabel}`);
+      for (const k of phaseSnap.sort()) {
+        lines.push(`  ${k}: ${inputs[k]}`);
+      }
+    }
+    if (stratSnap.length) {
+      lines.push(
+        phase === "endgame" || isEgCheckpoint
+          ? "  [endgame strategic vectors]"
+          : "  [middlegame strategic vectors]"
+      );
+      for (const k of stratSnap.sort()) {
+        lines.push(`  ${k}: ${inputs[k]}`);
+      }
+    }
+    const showPeers =
+      isOpeningCheckpoint ||
+      moment.structuralKind === "middlegame_aggregate" ||
+      peerKeys.length > 0;
+    if (showPeers) {
       if (peerKeys.length) {
         lines.push("  [peer comparison]");
         for (const k of peerKeys) {
           lines.push(`  ${k}: ${inputs[k]}`);
         }
-        const judgments = buildOpeningPeerSignals(inputs);
+        const judgments = isOpeningCheckpoint
+          ? buildOpeningPeerSignals(inputs)
+          : buildMiddlegamePeerSignals(inputs);
         if (judgments.length) {
           lines.push("  [peer judgments]");
           for (const s of judgments) {
@@ -422,7 +584,7 @@ function dumpMoment(row) {
             "  [peer judgments]: (none — peers present but no significant gaps)"
           );
         }
-      } else {
+      } else if (isOpeningCheckpoint || isMgCheckpoint) {
         lines.push(
           "  [peer comparison]: (none — no peer_* stamps; enrich needs rating×speed + baselines)"
         );
@@ -481,7 +643,7 @@ function dumpMoment(row) {
   }
   if (annotate?.noteAttach) lines.push(`annotate.noteAttach: ${annotate.noteAttach}`);
   if (annotate?.notePick) lines.push(`annotate.notePick: ${annotate.notePick}`);
-  if (tip) {
+  if (row.attachLive?.attach && tip) {
     lines.push("─ generated comment ─");
     const ids =
       tip.keyIds?.length
@@ -496,9 +658,8 @@ function dumpMoment(row) {
       );
     }
     lines.push(tip.text || "(empty)");
-  } else {
-    lines.push("─ generated comment ─");
-    lines.push("(no tip)");
+    const refs = commentRefsForRow(row);
+    if (refs) lines.push(formatCommentRefs(refs));
   }
   lines.push("");
   return lines.join("\n");
@@ -566,16 +727,29 @@ function main() {
       openingName: data.openingName || openingRow.opening_name || null,
     });
   }
+  const engineRows = Array.isArray(data.engine) ? data.engine : [];
+  const cpByPly = new Map();
+  for (const row of engineRows) {
+    if (row && row.ply != null) cpByPly.set(Number(row.ply), row.cpWhite);
+  }
+  function engineCpAt(ply1) {
+    if (ply1 == null) return null;
+    if (cpByPly.has(Number(ply1))) return cpByPly.get(Number(ply1));
+    const idx = Number(ply1) - 1;
+    return engineRows[idx]?.cpWhite ?? null;
+  }
+
   const moments = Object.values(coach.momentsByPly).sort(
     (a, b) => (a.ply || 0) - (b.ply || 0)
   );
 
+  const historySans = Array.isArray(data.sans) ? data.sans.filter(Boolean) : [];
   const rows = [];
   let openingPriorTopics = null;
   let gamePlan = emptyGamePlanState(openingKeyId);
   let stickySituations = [];
   for (const moment of moments) {
-    const phase = phaseForPly(moment.ply, coach);
+    const phase = phaseForPly(moment.ply, coach, moment.structuralKind);
     const mark = markFromMoment(moment);
     const engineSans = String(moment.inputs?.engine_line || "")
       .split(/\s+/)
@@ -594,11 +768,17 @@ function main() {
       fenAfter: moment.inputs?.fen_after
         ? String(moment.inputs.fen_after)
         : undefined,
-      evalBeforeCp: moment.evalBeforeCp ?? null,
-      evalAfterCp: moment.evalAfterCp ?? null,
+      evalBeforeCp: moment.evalBeforeCp ?? engineCpAt(moment.ply) ?? null,
+      evalAfterCp: moment.evalAfterCp ?? engineCpAt(moment.ply + 1) ?? null,
       playedSan: moment.playedSan || null,
       bestPvSan: engineSans,
       playedLineSans: playedSans,
+      playedContinuationSans: (() => {
+        const trap = trapContinuationSans(historySans, moment.ply);
+        if (trap.length) return trap;
+        return playedSans.length > 1 ? playedSans.slice(1) : [];
+      })(),
+      lines: engineLinesForMoment(data, moment),
       structureThemes: coach.themesByPhase?.[phase] || [],
     });
     request = enrichRequestFromMomentInputs(request, moment);
@@ -671,50 +851,52 @@ function main() {
       request,
     });
 
-    const weightTop = request
-      ? rankMetricNoteWeights({
-          phase,
-          themes,
-          mark,
-          deltaCp: moment.dropCp || 0,
-          moment,
-          openingKeyId,
-          eco: data.eco || null,
-          opening: data.openingName || null,
-          limit: 8,
-          request,
-          gamePlan,
-        })
-      : [];
+    const weightTop =
+      request && attachLive.attach
+        ? rankMetricNoteWeights({
+            phase,
+            themes,
+            mark,
+            deltaCp: moment.dropCp || 0,
+            moment,
+            openingKeyId,
+            eco: data.eco || null,
+            opening: data.openingName || null,
+            limit: 8,
+            request,
+            gamePlan,
+          })
+        : [];
 
-    const tip = request
-      ? pickMetricTip({
-          entries,
-          metrics: coach,
-          phase,
-          mark,
-          deltaCp: moment.dropCp || 0,
-          moment,
-          openingKeyId,
-          eco: data.eco || null,
-          opening: data.openingName || null,
-          themes,
-          request,
-          userColor,
-          priorTopics: openingPriorTopics,
-          gamePlan,
-          onOpeningTipUsed: (meta) => {
-            openingPriorTopics = mergeOpeningTipPrior(openingPriorTopics, meta);
-            gamePlan = mergeOpeningPlanKeys(
-              gamePlan,
-              meta.softKeys,
-              openingKeyId
-            );
-          },
-        })
-      : null;
+    const tip =
+      request && attachLive.attach
+        ? pickMetricTip({
+            entries,
+            metrics: coach,
+            phase,
+            mark,
+            deltaCp: moment.dropCp || 0,
+            moment,
+            openingKeyId,
+            eco: data.eco || null,
+            opening: data.openingName || null,
+            themes,
+            request,
+            userColor,
+            priorTopics: openingPriorTopics,
+            gamePlan,
+            onOpeningTipUsed: (meta) => {
+              openingPriorTopics = mergeOpeningTipPrior(openingPriorTopics, meta);
+              gamePlan = mergeOpeningPlanKeys(
+                gamePlan,
+                meta.softKeys,
+                openingKeyId
+              );
+            },
+          })
+        : null;
 
-    if (tip?.keyIds?.length || tip?.keyId) {
+    if (attachLive.attach && (tip?.keyIds?.length || tip?.keyId)) {
       gamePlan = markPlanKeysTaught(
         gamePlan,
         tip.keyIds?.length ? tip.keyIds : tip.keyId ? [tip.keyId] : []
@@ -731,10 +913,30 @@ function main() {
       stampedInputs.situation_roles = request.inputs.situation_roles;
     }
     if (request?.tacticalFact?.kind) {
-      stampedInputs.tactical_kind = request.tacticalFact.kind;
-      stampedInputs.tactical_line = request.tacticalFact.captureSan;
-      stampedInputs.tactical_piece = request.tacticalFact.pieceLabel;
-      stampedInputs.tactical_head = formatTacticalFactHead(request.tacticalFact);
+      Object.assign(stampedInputs, tacticalFactInputs(request.tacticalFact));
+    }
+    if (request?.inputs) {
+      for (const k of [
+        "prefer_center_strike",
+        "center_fluidity_index",
+        "pawn_storm_tempo_delta",
+        "king_center_file_exposure",
+        "closed_center",
+        "opposite_side_castling",
+        "opp_king_in_centre",
+        "opp_king_uncastled",
+        "active_wing_user",
+        "active_wing_opp",
+        "user_wing_activity",
+        "pawn_break_class",
+        "mg_structure_type",
+        "engine_line_plan",
+        "strategic_summary",
+      ]) {
+        if (request.inputs[k] != null && request.inputs[k] !== "") {
+          stampedInputs[k] = request.inputs[k];
+        }
+      }
     }
     stampedInputs.game_plan = formatGamePlanShort(gamePlan) || null;
     if (tip?.keyId) {
@@ -765,6 +967,11 @@ function main() {
             captureSan: request.tacticalFact.captureSan,
             mateIn: request.tacticalFact.mateIn,
             takenNext: request.tacticalFact.takenNext,
+            trapSquare: request.tacticalFact.trapSquare ?? null,
+            capturePlyDelay: request.tacticalFact.capturePlyDelay ?? null,
+            finalMaterialDelta:
+              request.tacticalFact.finalMaterialDelta ?? null,
+            selfInflicted: Boolean(request.tacticalFact.selfInflicted),
             head: formatTacticalFactHead(request.tacticalFact),
           }
         : null,
@@ -805,6 +1012,7 @@ function main() {
             noteId: tip.noteId || null,
             score: tip.score ?? null,
             text: tip.text,
+            tipMeta: tip.tipMeta || null,
           }
         : null,
       annotate,
@@ -814,7 +1022,51 @@ function main() {
     });
   }
 
+  for (const row of rows) {
+    row.commentRefs = commentRefsForRow(row);
+  }
+
   if (args.asJson) {
+    const momentPayload = (r) => {
+      const base = {
+        ply: r.ply,
+        mark: r.mark,
+        structuralKind: r.structuralKind,
+        phase: r.phase,
+        fen: r.fen,
+        playedSan: r.playedSan,
+        bestSan: r.bestSan,
+        dropCp: r.dropCp,
+        generatedComment: r.generatedComment,
+        commentRefs: r.commentRefs,
+        attachLive: r.attachLive,
+      };
+      if (args.commentRefs) {
+        return {
+          ...base,
+          weightTop: r.weightTop,
+          softKeys: r.softKeys,
+        };
+      }
+      return {
+        ...base,
+        inputs: r.inputs,
+        situations: r.situations,
+        situationRoles: r.situationRoles,
+        tacticalFact: r.tacticalFact,
+        gamePlanShort: r.gamePlanShort,
+        gamePlanSticky: r.gamePlanSticky,
+        weightTop: r.weightTop,
+        noteRequest: r.noteRequest,
+        softKeys: r.softKeys,
+        themes: r.themes,
+        metricSignals: r.metricSignals,
+        primaryWhyBetter: r.primaryWhyBetter,
+        primaryField: r.primaryField,
+        primarySoftKeys: r.primarySoftKeys,
+        annotate: r.annotate,
+      };
+    };
     console.log(
       JSON.stringify(
         {
@@ -826,33 +1078,8 @@ function main() {
           themesByPhase: coach.themesByPhase || {},
           globalThemes: coach.globalThemes || [],
           momentCount: rows.length,
-          moments: rows.map((r) => ({
-            ply: r.ply,
-            mark: r.mark,
-            structuralKind: r.structuralKind,
-            phase: r.phase,
-            fen: r.fen,
-            playedSan: r.playedSan,
-            bestSan: r.bestSan,
-            dropCp: r.dropCp,
-            inputs: r.inputs,
-            situations: r.situations,
-            situationRoles: r.situationRoles,
-            tacticalFact: r.tacticalFact,
-            gamePlanShort: r.gamePlanShort,
-            gamePlanSticky: r.gamePlanSticky,
-            weightTop: r.weightTop,
-            noteRequest: r.noteRequest,
-            softKeys: r.softKeys,
-            themes: r.themes,
-            metricSignals: r.metricSignals,
-            primaryWhyBetter: r.primaryWhyBetter,
-            primaryField: r.primaryField,
-            primarySoftKeys: r.primarySoftKeys,
-            attachLive: r.attachLive,
-            generatedComment: r.generatedComment,
-            annotate: r.annotate,
-          })),
+          commentRefsMode: Boolean(args.commentRefs),
+          moments: rows.map(momentPayload),
         },
         null,
         2
@@ -870,9 +1097,14 @@ function main() {
   console.log(
     `game_plan(final): ${formatGamePlanShort(gamePlan) || "—"}`
   );
+  if (args.commentRefs) {
+    console.log("mode: --comment-refs (top choices + tip-referenced coach fields only)");
+  }
   console.log("");
   for (const row of rows) {
-    process.stdout.write(dumpMoment(row));
+    process.stdout.write(
+      args.commentRefs ? dumpMomentCommentRefs(row) : dumpMoment(row)
+    );
   }
 }
 
