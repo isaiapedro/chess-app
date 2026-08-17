@@ -23,6 +23,7 @@ import {
   bishopComplexSnaps,
 } from "../phaseTacticalMetrics";
 import { middlegameAttackSnaps } from "../middlegameAttackSnaps";
+import { isOpeningTempoWasteMove, countMinorsDeveloped } from "../openingPhase";
 import {
   detectSituations,
   formatSituationRolesShort,
@@ -91,17 +92,23 @@ function middlegameStrategyStamp(args: {
     const isLever =
       moment?.structuralKind === "decisive_pawn_break" ||
       moment?.inputs?.pawn_break === true;
-    return buildMiddlegameStrategicInputs({
-      board,
-      color: args.userColor === "white" ? "w" : "b",
-      situations: args.situations,
-      inputs: moment?.inputs,
-      playedSan: played || null,
-      bestSan: moment?.bestSan,
-      engineLineSans: args.engineLineSans,
-      isLever: Boolean(isLever && toFile != null),
-      toFile,
-    });
+    return {
+      ...buildMiddlegameStrategicInputs({
+        board,
+        color: args.userColor === "white" ? "w" : "b",
+        situations: args.situations,
+        inputs: moment?.inputs,
+        playedSan: played || null,
+        bestSan: moment?.bestSan,
+        engineLineSans: args.engineLineSans,
+        isLever: Boolean(isLever && toFile != null),
+        toFile,
+      }),
+      material_balance: boardMetricSnap(
+        board,
+        args.userColor === "white" ? "white" : "black"
+      ).material_balance,
+    };
   } catch {
     return {};
   }
@@ -538,6 +545,62 @@ export function composePlayedAltLine(args: {
     out.push(c);
   }
   return out;
+}
+
+export function detectPlayedOpeningTempoWaste(args: {
+  phase: PhaseName;
+  fenBefore?: string | null;
+  playedSan?: string | null;
+  userColor: "white" | "black";
+}): { waste: boolean; piece: string | null } {
+  if (args.phase !== "opening" || !args.fenBefore || !args.playedSan) {
+    return { waste: false, piece: null };
+  }
+  try {
+    const board = new Chess(args.fenBefore);
+    const color: Color = args.userColor === "white" ? "w" : "b";
+    if (board.turn() !== color) return { waste: false, piece: null };
+    const move = board.move(args.playedSan);
+    if (!move) return { waste: false, piece: null };
+    board.undo();
+    return isOpeningTempoWasteMove(board, move, color);
+  } catch {
+    return { waste: false, piece: null };
+  }
+}
+
+function injectTempoWasteDelta(
+  deltas: MetricFieldDelta[],
+  waste: boolean
+): MetricFieldDelta[] {
+  if (!waste) return deltas;
+  if (deltas.some((d) => d.field === "tempo_waste_rate_pct")) return deltas;
+  return [
+    { field: "tempo_waste_rate_pct", before: 100, after: 0, delta: -100 },
+    ...deltas,
+  ];
+}
+
+export function openingLocationStamp(args: {
+  phase: PhaseName;
+  fenBefore?: string | null;
+  userColor: "white" | "black";
+}): Record<string, string | number | boolean | null> {
+  if (args.phase !== "opening" || !args.fenBefore) return {};
+  try {
+    const board = new Chess(args.fenBefore);
+    const color: Color = args.userColor === "white" ? "w" : "b";
+    const minors = countMinorsDeveloped(board, color);
+    const attack = middlegameAttackSnaps(board, color);
+    return {
+      undeveloped_minors: minors < 4 ? 1 : 0,
+      minors_developed: minors,
+      opp_king_in_centre: attack.opp_king_in_centre,
+      opp_king_uncastled: attack.opp_king_uncastled,
+    };
+  } catch {
+    return {};
+  }
 }
 
 export function playedMoveMetricDelta(args: {
@@ -1028,6 +1091,29 @@ export function buildCoachNoteRequest(args: {
     userIsWhite: userColor === "white",
   });
 
+  const tempoHit = detectPlayedOpeningTempoWaste({
+    phase: args.phase,
+    fenBefore: args.fenBefore,
+    playedSan: args.playedSan || moment?.playedSan || null,
+    userColor,
+  });
+  engineVsPlayedMetricDelta = injectTempoWasteDelta(
+    engineVsPlayedMetricDelta,
+    tempoHit.waste
+  );
+  const tempoStamp = tempoHit.waste
+    ? {
+        played_tempo_waste: true,
+        played_tempo_piece: tempoHit.piece,
+        tempo_waste_rate_pct: 1,
+      }
+    : {};
+  const locationStamp = openingLocationStamp({
+    phase: args.phase,
+    fenBefore: args.fenBefore,
+    userColor,
+  });
+
   return {
     kind,
     ply: args.ply,
@@ -1048,6 +1134,8 @@ export function buildCoachNoteRequest(args: {
       ...tacticalStamp,
       ...mgStamp,
       ...evalStamp,
+      ...tempoStamp,
+      ...locationStamp,
     },
     situations,
     tacticalFact,
@@ -1155,10 +1243,30 @@ export function coachRequestMetaInputs(
     const v = request.inputs?.[k];
     if (v != null && v !== "") mg[k] = v;
   }
+  const tempo: Record<string, string | number | boolean | null> = {};
+  if (request.inputs?.played_tempo_waste != null) {
+    tempo.played_tempo_waste = request.inputs.played_tempo_waste;
+  }
+  if (request.inputs?.played_tempo_piece != null) {
+    tempo.played_tempo_piece = request.inputs.played_tempo_piece;
+  }
+  if (request.inputs?.tempo_waste_rate_pct != null) {
+    tempo.tempo_waste_rate_pct = request.inputs.tempo_waste_rate_pct;
+  }
+  for (const k of [
+    "undeveloped_minors",
+    "minors_developed",
+    "opp_king_in_centre",
+    "opp_king_uncastled",
+  ] as const) {
+    const v = request.inputs?.[k];
+    if (v != null && v !== "") tempo[k] = v;
+  }
   return {
     ...sit,
     ...tact,
     ...mg,
+    ...tempo,
   };
 }
 

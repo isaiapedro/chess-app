@@ -4,6 +4,7 @@ import React, {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import * as AuthSession from "expo-auth-session";
@@ -31,6 +32,7 @@ export type AuthState = {
   platform: Platform | null;
   username: string;
   email: string;
+  avatarUrl: string | null;
   lichessAccessToken: string | null;
   loginChesscom: (username: string, email: string) => Promise<void>;
   loginLichess: () => Promise<void>;
@@ -100,6 +102,31 @@ async function fetchLichessProfile(token: string): Promise<{
   return { username, email };
 }
 
+async function fetchChesscomAvatar(
+  username: string,
+  email: string
+): Promise<string | null> {
+  const cleaned = username.trim();
+  if (!cleaned) return null;
+  try {
+    const contact = (email || "dev@example.com").trim();
+    const res = await fetch(
+      `https://api.chess.com/pub/player/${encodeURIComponent(cleaned.toLowerCase())}`,
+      {
+        headers: {
+          "User-Agent": `ChessWrappedMobile/1.0 (contact: ${contact})`,
+        },
+      }
+    );
+    if (!res.ok) return null;
+    const body = (await res.json()) as { avatar?: string };
+    const avatar = String(body.avatar || "").trim();
+    return avatar || null;
+  } catch {
+    return null;
+  }
+}
+
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [ready, setReady] = useState(false);
   const [platform, setPlatform] = useState<Platform | null>(null);
@@ -108,6 +135,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [lichessAccessToken, setLichessAccessToken] = useState<string | null>(
     null
   );
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(null);
+  const avatarFetchIdRef = useRef(0);
 
   const redirectUri = AuthSession.makeRedirectUri({
     scheme: "com.chesswrapped.app",
@@ -123,6 +152,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       responseType: AuthSession.ResponseType.Code,
     },
     lichessDiscovery
+  );
+
+  const loadAvatarAsync = useCallback(
+    (nextPlatform: Platform, nextUsername: string, nextEmail: string) => {
+      setAvatarUrl(null);
+      const fetchId = ++avatarFetchIdRef.current;
+      if (nextPlatform !== "chesscom") return;
+      void fetchChesscomAvatar(nextUsername, nextEmail).then((avatar) => {
+        if (avatarFetchIdRef.current !== fetchId) return;
+        setAvatarUrl(avatar);
+      });
+    },
+    []
   );
 
   useEffect(() => {
@@ -141,6 +183,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
           username: persisted.username,
           email: persisted.email || "",
         });
+        loadAvatarAsync(
+          persisted.platform,
+          persisted.username,
+          persisted.email || ""
+        );
       } else {
         applyGamesAuth(null);
       }
@@ -148,22 +195,27 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     })();
     return () => {
       cancelled = true;
+      avatarFetchIdRef.current += 1;
     };
-  }, []);
+  }, [loadAvatarAsync]);
 
-  const persistAndSet = useCallback(async (data: PersistedAuth) => {
-    await writePersisted(data);
-    setPlatform(data.platform);
-    setUsername(data.username);
-    setEmail(data.email || "");
-    setLichessAccessToken(data.lichessAccessToken || null);
-    applyGamesAuth(data);
-    void registerServerUser({
-      platform: data.platform,
-      username: data.username,
-      email: data.email || "",
-    });
-  }, []);
+  const persistAndSet = useCallback(
+    async (data: PersistedAuth) => {
+      await writePersisted(data);
+      setPlatform(data.platform);
+      setUsername(data.username);
+      setEmail(data.email || "");
+      setLichessAccessToken(data.lichessAccessToken || null);
+      applyGamesAuth(data);
+      void registerServerUser({
+        platform: data.platform,
+        username: data.username,
+        email: data.email || "",
+      });
+      loadAvatarAsync(data.platform, data.username, data.email || "");
+    },
+    [loadAvatarAsync]
+  );
 
   const loginChesscom = useCallback(
     async (nextUsername: string, nextEmail: string) => {
@@ -218,10 +270,12 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
   const logout = useCallback(async () => {
     await writePersisted(null);
+    avatarFetchIdRef.current += 1;
     setPlatform(null);
     setUsername("");
     setEmail("");
     setLichessAccessToken(null);
+    setAvatarUrl(null);
     applyGamesAuth(null);
   }, []);
 
@@ -232,6 +286,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       platform,
       username,
       email,
+      avatarUrl,
       lichessAccessToken,
       loginChesscom,
       loginLichess,
@@ -242,6 +297,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       platform,
       username,
       email,
+      avatarUrl,
       lichessAccessToken,
       loginChesscom,
       loginLichess,

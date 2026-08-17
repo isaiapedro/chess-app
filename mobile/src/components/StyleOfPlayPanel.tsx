@@ -17,8 +17,10 @@ import { type OpeningMixStats } from "../engine/openingMix";
 import {
   ARCHETYPE_DESCRIPTIONS,
   computeArchetypeScores,
+  computePrimaryFeatureScores,
   computeStyleRadarAxes,
   type ArchetypeScore,
+  type PrimaryFeatureScore,
   type StyleRadarAxis,
 } from "../engine/archetypeScores";
 import { StyleRadarChart } from "./StyleRadarChart";
@@ -30,7 +32,9 @@ import {
   ratingBand,
   type BaselineMetricHit,
 } from "../data/baselines";
-import { Ionicons } from "@expo/vector-icons";
+import { peerImpactColor } from "../data/metricPolarity";
+import { Info, X } from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
@@ -80,6 +84,8 @@ type MetricRow = {
   detail: string;
   occurred: boolean;
   baselineKey?: string;
+  absoluteRef?: number;
+  refKey?: string;
   userNum?: number | null;
   scale?: MetricScale;
 };
@@ -95,30 +101,30 @@ type MetricScale =
   | { kind: "signed"; fallback: number };
 
 const METRIC_SCALE: Record<string, MetricScale> = {
-  "Average Think Time": { kind: "benchmark", fallback: 18 },
+  "Average Think Time": { kind: "benchmark", fallback: 14 },
   "Clock Difference": { kind: "signed", fallback: 8 },
-  "Time When Losing": { kind: "benchmark", fallback: 18 },
-  "Time on Big Moments": { kind: "benchmark", fallback: 22 },
+  "Time When Losing": { kind: "benchmark", fallback: 14 },
+  "Time on Big Moments": { kind: "benchmark", fallback: 20 },
   "Signature Openings": { kind: "fixed", max: 100 },
   "Offbeat Openings": { kind: "fixed", max: 100 },
   "Mainstream Openings": { kind: "fixed", max: 100 },
   "Side Openings": { kind: "fixed", max: 100 },
-  "Position Swings": { kind: "fixed", max: 40 },
-  Sacrifices: { kind: "fixed", max: 5 },
-  "Early Flank Pushes": { kind: "fixed", max: 100 },
+  "Position Swings": { kind: "benchmark", fallback: 100 },
+  Sacrifices: { kind: "benchmark", fallback: 7 },
+  "Early Flank Pushes": { kind: "benchmark", fallback: 25 },
   "Endgame Conversion": { kind: "fixed", max: 100 },
-  "Early Piece Trades": { kind: "benchmark", fallback: 4 },
-  "Unequal Threats": { kind: "benchmark", fallback: 5 },
-  "Threat Escapes": { kind: "benchmark", fallback: 5 },
-  "Fights Near Their King": { kind: "benchmark", fallback: 3.5 },
-  "Fights Near Your King": { kind: "benchmark", fallback: 3.5 },
-  "Enemy Half Moves": { kind: "fixed", max: 100 },
+  "Early Piece Trades": { kind: "benchmark", fallback: 3 },
+  "Unequal Threats": { kind: "benchmark", fallback: 7 },
+  "Threat Escapes": { kind: "benchmark", fallback: 7 },
+  "Trades Near Their King": { kind: "benchmark", fallback: 3 },
+  "Trades Near Your King": { kind: "benchmark", fallback: 4 },
+  "Opponent's Half Moves": { kind: "fixed", max: 100 },
   "Own Half Moves": { kind: "fixed", max: 100 },
   "Forward Moves": { kind: "fixed", max: 100 },
-  "Backward Moves": { kind: "fixed", max: 100 },
-  "Breaking Draws": { kind: "fixed", max: 100 },
-  "Declined Recaptures": { kind: "fixed", max: 100 },
-  Comebacks: { kind: "fixed", max: 100 },
+  "Backwards Moves": { kind: "fixed", max: 100 },
+  "Breaking Draws": { kind: "benchmark", fallback: 12 },
+  "Declined Recaptures": { kind: "benchmark", fallback: 30 },
+  Comebacks: { kind: "benchmark", fallback: 50 },
   Blunders: { kind: "benchmark", fallback: 4 },
 };
 
@@ -126,15 +132,10 @@ function projectBenchmarkMax(
   hit: BaselineMetricHit | null,
   fallback: number
 ): number {
-  const parts = [fallback];
-  if (hit?.p90 != null && Number.isFinite(hit.p90) && hit.p90 > 0) {
-    parts.push(hit.p90 * 1.25);
-  } else if (hit?.p75 != null && Number.isFinite(hit.p75) && hit.p75 > 0) {
-    parts.push(hit.p75 * 1.45);
-  } else if (hit?.mean != null && Number.isFinite(hit.mean) && hit.mean > 0) {
-    parts.push(hit.mean * 2.2);
+  if (hit?.mean != null && Number.isFinite(hit.mean) && Math.abs(hit.mean) > 0) {
+    return Math.abs(hit.mean) * 2;
   }
-  return Math.max(...parts);
+  return fallback;
 }
 
 function projectSignedHalf(
@@ -164,11 +165,13 @@ function MetricBulletGraph({
   peerMean,
   scaleMax,
   signed = false,
+  fillColor,
 }: {
   value: number | null | undefined;
   peerMean: number | null | undefined;
   scaleMax: number;
   signed?: boolean;
+  fillColor: string;
 }) {
   if (value == null || !Number.isFinite(value) || !(scaleMax > 0)) return null;
 
@@ -189,7 +192,11 @@ function MetricBulletGraph({
           <View
             style={[
               styles.bulletFill,
-              { left: `${left}%`, width: `${width}%` },
+              {
+                left: `${left}%`,
+                width: `${width}%`,
+                backgroundColor: fillColor,
+              },
             ]}
           />
           {peerPct != null ? (
@@ -212,7 +219,10 @@ function MetricBulletGraph({
         <View
           style={[
             styles.bulletFill,
-            { width: `${Math.min(fillPct, 100)}%` },
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: fillColor,
+            },
           ]}
         />
         {fillPct > 100 ? (
@@ -232,11 +242,11 @@ function MetricBulletGraph({
 }
 
 const PERSONALITY_HELP = {
-  title: "Personality Type",
+  title: "Your chess personality",
   summary:
-    "We compare your play pattern to nine ideal style profiles and show the closest match.",
+    "Your chess personality is based on patterns in your games, including your opening choices, position changes, sacrifices, piece movement, time usage, attacking and defensive decisions, and how you handle difficult positions.",
   detail:
-    "From your filtered games we collect move lists and PGN clocks, Stockfish evaluations converted to win probability, and opening ECO/name tags. Those feed style metrics (time use, sacrifices, territory, threats, recovery, blunders) and opening mix (signature vs offbeat, mainstream vs side).\n\nMetrics are turned into a normalized feature vector: maneuver vs initiative style, intuitive style, opening loyalty and orthodoxy, and time-quality signals (overall, critical moments, and when you are worse). Where possible, time and volatility signals are scaled against Lichess peers in your rating band and speed. Secondary themes—creativity, attacking, positioning, defense, and durability—also shape the match.\n\nEach personality (Technical, Positional, Attacking, Calculating, Tricky, Dynamic, Practical, Intuitive, Logical) has a target profile. Your similarity score blends directional alignment (cosine, 60%) with closeness in feature space (40%), plus a small bonus from the secondary themes. The highest-scoring profile is shown as your personality type.",
+    "Your results are compared with players in a similar rating and time-control group.",
 };
 
 function HelpModal({
@@ -264,7 +274,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Ionicons name="close" size={20} color={colors.textMuted} />
+              <AppIcon icon={X} size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -319,10 +329,10 @@ function buildSections(
         {
           name: "Average Think Time",
           value: fmt(avgTime),
-          unit: "s",
-          summary: "How long you usually spend on each move.",
+          unit: "sec/move",
+          summary: "How much time you usually take to make a move.",
           detail:
-            "From each game’s PGN clock stamps we measure your think time per move, average those within the game, then average across games that have clock data. Games without usable clocks are skipped.",
+            "We read the clock timestamps from your games, calculate your average time per move in each game, then average those game-level values. Games without usable clock data are left out.",
           occurred: hasNumber(avgTime),
         },
         {
@@ -331,20 +341,21 @@ function buildSections(
             clockDiff == null
               ? "—"
               : `${clockDiff >= 0 ? "+" : ""}${fmt(clockDiff)}`,
-          unit: "s",
+          unit: "sec",
           summary:
-            "Whether you think longer or shorter than your opponents on average.",
+            "Whether you usually play faster or slower than your opponent.",
           detail:
-            "For each game with clocks we compute your average move time minus your opponent’s. Positive means you spend more time; negative means you play faster. Reported value is the mean of those game-level differences.",
+            "For every game with clock data, we subtract your average move time from your opponent's average move time. Positive values mean you took longer; negative values mean you played faster.",
           occurred: hasNumber(clockDiff),
         },
         {
           name: "Time When Losing",
           value: fmt(durability.avg_disadvantage_time_s),
-          unit: "s",
-          summary: "How long you think when the position is already bad.",
+          unit: "sec/move",
+          summary:
+            "How much time you spend thinking when things are going badly.",
           detail:
-            "Using engine evaluations converted to your win probability, we flag moves where your chance of winning is 20% or lower. We collect your clock times on those moves and average them across the period.",
+            "Engine evaluations are converted into your estimated win probability. We collect your move times whenever that probability is 20% or lower, then average those times across the games and positions where this happened.",
           occurred:
             hasNumber(durability.avg_disadvantage_time_s) &&
             hasPositive(durability.disadvantage_positions),
@@ -352,11 +363,10 @@ function buildSections(
         {
           name: "Time on Big Moments",
           value: fmt(creativity.avg_critical_time_s),
-          unit: "s",
-          summary:
-            "How long you think when a move sharply changes the evaluation.",
+          unit: "sec/move",
+          summary: "How much time you spend when the game is about to change.",
           detail:
-            "A move is critical when your win probability swings by ≥10 percentage points and the raw eval also moves by at least 1cp. Critical position count does not need clock data. Avg critical time uses your clock on those moves when clocks exist.",
+            "A position is marked as critical when your estimated win probability changes by at least 10 percentage points between moves. When clock data is available, we average the time you spent on those critical moves.",
           occurred:
             hasNumber(creativity.avg_critical_time_s) &&
             hasPositive(creativity.critical_positions),
@@ -369,37 +379,37 @@ function buildSections(
         {
           name: "Signature Openings",
           value: fmt(mix?.same_opening_rate_pct),
-          unit: "%",
-          summary: "How often you stick to your usual openings.",
+          unit: "% games",
+          summary: "How often you return to your usual opening choices.",
           detail:
-            "For each side/first-pawn context (White e4, White d4, Black vs e4, Black vs d4) we find your most common ECO/name as the signature. This metric is the share of games that match that signature opening.",
+            "We identify your most-played opening for each context: White with e4, White with d4, Black against e4, and Black against d4. This is the percentage of games that use the corresponding signature opening.",
           occurred: hasPositive(mix?.same_openings.games),
         },
         {
           name: "Offbeat Openings",
           value: fmt(mix?.different_opening_rate_pct),
-          unit: "%",
-          summary: "How often you leave your usual opening choices.",
+          unit: "% games",
+          summary: "How often you step away from your usual openings.",
           detail:
-            "The complement of Signature Openings: games whose ECO/name do not match your signature opening for that side and first-pawn context.",
+            "This is the complement of Signature Openings: games whose opening does not match your usual opening for that side and first-pawn context.",
           occurred: hasPositive(mix?.different_openings.games),
         },
         {
           name: "Mainstream Openings",
           value: fmt(mix?.orthodox_rate_pct),
-          unit: "%",
-          summary: "How often you play well-known mainstream systems.",
+          unit: "% games",
+          summary: "How often you play familiar, well-established openings.",
           detail:
-            "Openings counted as mainstream by ECO ranges (Italian/Ruy/French/Caro, Sicilian, Queen’s Gambit family, King’s Indian, etc.) or by name match for Italian, Ruy Lopez, Sicilian, French, Caro-Kann, Queen’s Gambit, London, and King’s Indian. Value is that share of all games.",
+            "Games are classified as mainstream using the app's ECO ranges and opening-name rules covering systems such as the Italian, Ruy Lopez, Sicilian, French, Caro-Kann, Queen's Gambit, London, and King's Indian.",
           occurred: hasPositive(mix?.orthodox.games),
         },
         {
           name: "Side Openings",
           value: fmt(mix?.unorthodox_rate_pct),
-          unit: "%",
-          summary: "How often you play less standard opening systems.",
+          unit: "% games",
+          summary: "How often you choose something less standard.",
           detail:
-            "Any game that does not fall into the mainstream ECO/name set above. Value is that share of all games in the period.",
+            "A game is counted as a Side Opening when its ECO or opening name does not fall into the app's mainstream opening categories.",
           occurred: hasPositive(mix?.unorthodox.games),
         },
       ],
@@ -410,46 +420,48 @@ function buildSections(
         {
           name: "Position Swings",
           value: fmt(initiative.avg_eval_volatility_cp),
-          unit: "cp",
-          summary: "How much the evaluation jumps from move to move.",
+          unit: "cp/ply",
+          summary:
+            "How much your games tend to swing from one side to the other.",
           detail:
-            "Volatility is the average absolute change in your engine evaluation (centipawns, white-POV flipped to you) between consecutive plies, then averaged across games. Mate scores are excluded. Higher means sharper, less settled games.",
+            "We compare the engine evaluation after consecutive moves, from your point of view, and measure the average absolute change. Larger values mean the game tends to have sharper evaluation swings.",
           occurred: hasPositive(initiative.avg_eval_volatility_cp),
         },
         {
           name: "Sacrifices",
-          value: fmt(initiative.sacrifice_rate_pct),
-          unit: "% moves",
-          summary: "Share of your moves that give up material without a trade.",
+          value: fmt(initiative.avg_sacrifice_moves),
+          unit: "per game",
+          summary: "How often you deliberately put material on the line.",
           detail:
-            "A sacrifice counts only when you leave a minor/major hanging (or capture while giving up ≥ a minor more than you take), the opponent takes that piece, and you do not immediately get the material back (same-square recapture or capturing a piece of similar value next move). Declined offers and trades do not count. Aggregated as sacrifices ÷ your moves across the period.",
-          occurred: hasPositive(initiative.sacrifice_rate_pct),
+            "A sacrifice is detected when you offer significant material without an immediate equivalent trade or recovery. The metric is the number of detected sacrifices divided by your total moves.",
+          occurred: hasPositive(initiative.avg_sacrifice_moves),
         },
         {
           name: "Early Flank Pushes",
           value: fmt(initiative.early_flank_rate_pct),
-          unit: "%",
-          summary: "How often you push wing pawns early into enemy ground.",
+          unit: "% games",
+          summary: "How often you push your wing pawns early.",
           detail:
-            "Counts games where, in the first 12 full moves, you advance a flank pawn (a, b, g, or h file) at least to the 4th rank as White or the 5th rank as Black. Value is the percentage of games with at least one such push.",
+            "We check the first 12 moves for advances by the a-, b-, g-, or h-pawns deep enough to reach the opponent's side of the board. The value is the percentage of games containing at least one such push.",
           occurred: hasPositive(initiative.early_flank_rate_pct),
         },
         {
           name: "Endgame Conversion",
           value: fmt(initiative.endgame_conversion_rate_pct),
-          unit: "%",
-          summary: "How often you turn a winning endgame into a win.",
+          unit: "% wins",
+          summary:
+            "How often you turn a winning endgame into an actual win.",
           detail:
-            "An endgame advantage sticks once your eval reaches ~+100cp (win prob ≥ 65%) after the endgame has started; it never resets. Conversion is the share of those games you actually won (PGN Result Win / 1-0 / 0-1 for you). Unfinished games (Result *) do not count as converted.",
+            "Once the endgame begins and your engine-based win probability reaches the app's winning threshold, that game becomes a conversion opportunity. The metric is the percentage of those opportunities that ended in a win.",
           occurred: hasPositive(initiative.endgame_advantage_games),
         },
         {
           name: "Early Piece Trades",
           value: fmt(initiative.avg_early_trades),
-          unit: "/game",
-          summary: "How often pieces come off early in the game.",
+          unit: "per game",
+          summary: "How often you exchange pieces early.",
           detail:
-            "In the first 12 full moves, a trade is counted when minor or major pieces are captured in a short exchange (captures within two plies of each other). Reported as the average number of such trades per game.",
+            "During the first 12 moves, we detect short sequences of minor- or major-piece captures that form a trade. The value is the average number of detected early trades per game.",
           occurred: hasPositive(initiative.avg_early_trades),
         },
       ],
@@ -460,37 +472,40 @@ function buildSections(
         {
           name: "Unequal Threats",
           value: fmt(attacking.avg_higher_value_threats),
-          unit: "/game",
-          summary: "How often you attack pieces worth more than the attacker.",
+          unit: "per game",
+          summary:
+            "How often you attack something more valuable than the piece doing the attacking.",
           detail:
-            "Full game. After each of your moves (including pawns), count when that piece attacks an enemy minor/major of strictly higher value, or captures a higher-value piece. Equal exchanges do not count. Averaged per game.",
+            "After each of your moves, we check whether the moved piece attacks an enemy minor or major piece worth more than itself. The result is averaged across games.",
           occurred: hasPositive(attacking.avg_higher_value_threats),
         },
         {
           name: "Threat Escapes",
           value: fmt(attacking.avg_threat_escapes),
-          unit: "/game",
-          summary: "How often a threatened piece slips to safety.",
+          unit: "per game",
+          summary:
+            "How often you manage to get an attacked piece out of danger.",
           detail:
-            "Counts only non-pawn, non-king moves. Before the move the piece must be under enemy attack (any or lesser-value); after the move it is no longer attacked that way. Pawn recaptures and king moves are ignored. Averaged per game.",
+            "We identify non-pawn, non-king pieces that are under attack before your move and no longer under the relevant attack afterward. The result is the average number of such escapes per game.",
           occurred: hasPositive(attacking.avg_threat_escapes),
         },
         {
-          name: "Fights Near Their King",
+          name: "Trades Near Their King",
           value: fmt(attacking.avg_trades_near_enemy_king),
-          unit: "/game",
-          summary: "How often piece trades happen next to the enemy king.",
+          unit: "per game",
+          summary:
+            "How often your exchanges happen close to the enemy king.",
           detail:
-            "Early piece trades (minor/major only — not pawns or kings) whose capture square is within Chebyshev distance 2 of the enemy king. Averaged per game.",
+            "We count minor- and major-piece trades whose capture square is within two squares of the opponent's king, then average those trades per game.",
           occurred: hasPositive(attacking.avg_trades_near_enemy_king),
         },
         {
-          name: "Fights Near Your King",
+          name: "Trades Near Your King",
           value: fmt(attacking.avg_trades_near_user_king),
-          unit: "/game",
-          summary: "How often piece trades happen next to your king.",
+          unit: "per game",
+          summary: "How often exchanges happen close to your own king.",
           detail:
-            "Same as fights near their king: minor/major trades only, capture square within distance 2 of your king. Averaged per game.",
+            "We use the same trade detection, but measure the distance from the capture square to your king.",
           occurred: hasPositive(attacking.avg_trades_near_user_king),
         },
       ],
@@ -499,39 +514,40 @@ function buildSections(
       title: "Positional Play",
       metrics: [
         {
-          name: "Enemy Half Moves",
+          name: "Opponent's Half Moves",
           value: fmt(attacking.territory_opp_pct),
-          unit: "%",
-          summary: "Share of your moves that land in the opponent’s half.",
+          unit: "% moves",
+          summary:
+            "How often your pieces venture into the opponent's side of the board.",
           detail:
-            "For White, ranks 5–8 count as enemy territory; for Black, ranks 1–4. Each of your moves is tagged by destination square. Value is enemy-half moves divided by all your moves.",
+            "Every piece move is classified by its destination square. Ranks 5–8 are enemy territory for White and ranks 1–4 for Black. The percentage is enemy-half moves divided by your total moves.",
           occurred: hasPositive(attacking.territory_opp_pct),
         },
         {
           name: "Own Half Moves",
           value: fmt(attacking.territory_own_pct),
-          unit: "%",
-          summary: "Share of your moves that stay in your own half.",
+          unit: "% moves",
+          summary: "How often your pieces stay on your side of the board.",
           detail:
-            "Complement of Enemy Half Moves using the same rank split. Value is own-half destinations divided by all your moves.",
+            "Using the same board-half classification, we calculate the percentage of your moves that land in your own half.",
           occurred: hasPositive(attacking.territory_own_pct),
         },
         {
           name: "Forward Moves",
           value: fmt(attacking.forward_move_pct),
-          unit: "%",
-          summary: "How often your pieces advance toward the enemy.",
+          unit: "% moves",
+          summary: "How often your pieces move toward the opponent.",
           detail:
-            "Among moves that change rank (forward, backward, or stay on rank as lateral), forward means increasing rank for White and decreasing rank for Black. Value is forward moves over all directed moves (forward + backward + lateral).",
+            "We classify directed piece moves by rank change relative to your color. Forward moves are counted against all forward, backward, and lateral piece moves.",
           occurred: hasPositive(attacking.forward_move_pct),
         },
         {
-          name: "Backward Moves",
+          name: "Backwards Moves",
           value: fmt(attacking.backward_move_pct),
-          unit: "%",
-          summary: "How often your pieces retreat.",
+          unit: "% moves",
+          summary: "How often your pieces pull back or retreat.",
           detail:
-            "Same directed-move set as Forward Moves. Backward means decreasing rank for White and increasing rank for Black. Value is backward moves over forward + backward + lateral.",
+            "Using the same directed-move set, we count moves that decrease your piece's progress toward the opponent.",
           occurred: hasPositive(attacking.backward_move_pct),
         },
       ],
@@ -542,20 +558,20 @@ function buildSections(
         {
           name: "Breaking Draws",
           value: fmt(creativity.drawishless_rate_pct),
-          unit: "%",
+          unit: "% games",
           summary:
-            "How often equal late middlegames still end with a decisive result.",
+            "How often you manage to make an even-looking game decisive.",
           detail:
-            "At move 40, if your win probability sits between 45% and 55% (a drawish position) and the game does not end as a draw, we count it. Value is that share of all games.",
+            "From move 40 onward, we look for positions where your engine-based win probability is between 45% and 55%. If the game then finishes with a win or loss rather than a draw, it counts toward this metric.",
           occurred: hasPositive(creativity.drawishless_games),
         },
         {
           name: "Declined Recaptures",
           value: fmt(creativity.declined_recapture_rate_pct),
-          unit: "%",
-          summary: "How often you refuse to take back immediately.",
+          unit: "% chances",
+          summary: "How often you choose not to recapture immediately.",
           detail:
-            "When the opponent captures, we check whether you can recapture on that square on your next turn. If you can but play something else, it counts as declined. Value is declined chances divided by all recapture chances.",
+            "When your opponent captures a piece and you have a legal recapture on the same square, we check whether your next move takes it back. If you choose another move, the opportunity is counted as declined.",
           occurred: hasPositive(creativity.recapture_chances),
         },
       ],
@@ -566,19 +582,20 @@ function buildSections(
         {
           name: "Comebacks",
           value: fmt(durability.recovery_rate_pct),
-          unit: "%",
-          summary: "How often you save or win games after being clearly worse.",
+          unit: "% games",
+          summary:
+            "How often you recover after the game has gone badly against you.",
           detail:
-            "A disadvantage game is any game where your win probability drops to 20% or lower at some point. Recovery counts those games you still win or draw. Value is recoveries divided by disadvantage games.",
+            "A comeback opportunity begins when your engine-based win probability falls to 20% or lower. We then check whether you eventually draw or win. The score is recoveries divided by disadvantage games.",
           occurred: hasPositive(durability.disadvantage_games),
         },
         {
           name: "Blunders",
           value: fmt(durability.avg_blunders),
-          unit: "/game",
-          summary: "How often a single move tanks your winning chances after the opening.",
+          unit: "per game",
+          summary: "How often one move seriously hurts your position.",
           detail:
-            "Post-opening only (middlegame + endgame). A blunder drops win probability by more than 15pp. Opening blunders excluded so this aligns with phase metrics. Average count per game.",
+            "We count post-opening moves where your estimated win probability drops by 20 percentage points or more. The result is the average number of these blunders per game.",
           occurred: hasPositive(durability.total_blunders),
         },
       ],
@@ -605,7 +622,12 @@ function attachPeerMeta(
     durability.avg_clock_diff_s ?? clockFallback.avg_clock_diff_s;
   const peerMeta: Record<
     string,
-    { baselineKey: string; userNum: number | null | undefined }
+    {
+      baselineKey?: string;
+      absoluteRef?: number;
+      refKey?: string;
+      userNum: number | null | undefined;
+    }
   > = {
     "Average Think Time": {
       baselineKey: "avg_time_per_move_s",
@@ -624,11 +646,13 @@ function attachPeerMeta(
       userNum: creativity.avg_critical_time_s,
     },
     "Signature Openings": {
-      baselineKey: "same_opening_rate",
+      absoluteRef: 50,
+      refKey: "same_opening_rate",
       userNum: mix?.same_opening_rate_pct,
     },
     "Offbeat Openings": {
-      baselineKey: "different_opening_rate",
+      absoluteRef: 50,
+      refKey: "different_opening_rate",
       userNum: mix?.different_opening_rate_pct,
     },
     "Mainstream Openings": {
@@ -644,8 +668,8 @@ function attachPeerMeta(
       userNum: initiative.avg_eval_volatility_cp,
     },
     Sacrifices: {
-      baselineKey: "sacrifice_rate_pct",
-      userNum: initiative.sacrifice_rate_pct,
+      baselineKey: "avg_sacrifice_moves",
+      userNum: initiative.avg_sacrifice_moves,
     },
     "Early Flank Pushes": {
       baselineKey: "early_flank_rate_pct",
@@ -667,15 +691,15 @@ function attachPeerMeta(
       baselineKey: "avg_threat_escapes",
       userNum: attacking.avg_threat_escapes,
     },
-    "Fights Near Their King": {
+    "Trades Near Their King": {
       baselineKey: "avg_trades_near_enemy_king",
       userNum: attacking.avg_trades_near_enemy_king,
     },
-    "Fights Near Your King": {
+    "Trades Near Your King": {
       baselineKey: "avg_trades_near_user_king",
       userNum: attacking.avg_trades_near_user_king,
     },
-    "Enemy Half Moves": {
+    "Opponent's Half Moves": {
       baselineKey: "territory_opp_pct",
       userNum: attacking.territory_opp_pct,
     },
@@ -687,7 +711,7 @@ function attachPeerMeta(
       baselineKey: "forward_move_pct",
       userNum: attacking.forward_move_pct,
     },
-    "Backward Moves": {
+    "Backwards Moves": {
       baselineKey: "backward_move_pct",
       userNum: attacking.backward_move_pct,
     },
@@ -716,6 +740,8 @@ function attachPeerMeta(
       return {
         ...metric,
         baselineKey: meta?.baselineKey ?? metric.baselineKey,
+        absoluteRef: meta?.absoluteRef ?? metric.absoluteRef,
+        refKey: meta?.refKey ?? metric.refKey,
         userNum: meta ? (meta.userNum ?? null) : metric.userNum,
         scale: scale ?? metric.scale,
       };
@@ -861,6 +887,26 @@ export function StyleOfPlayPanel() {
     clockFallback,
   ]);
 
+  const primaryFeatures = useMemo((): PrimaryFeatureScore[] => {
+    if (!profileReady || !style || style.games <= 0 || !mix) return [];
+    return computePrimaryFeatureScores({
+      style,
+      mix,
+      baselines,
+      band: peerBand,
+      speed: peerSpeed,
+      avgTimeFallback: clockFallback.avg_time_per_move_s,
+    });
+  }, [
+    profileReady,
+    style,
+    mix,
+    baselines,
+    peerBand,
+    peerSpeed,
+    clockFallback,
+  ]);
+
   const topArchetype = useMemo((): ArchetypeScore | null => {
     if (!profileReady || !style || style.games <= 0 || !mix) return null;
     const scores = computeArchetypeScores({
@@ -916,21 +962,17 @@ export function StyleOfPlayPanel() {
       />
       {topArchetype ? (
         <View style={styles.archetypeHero}>
-          <Text style={styles.archetypeHeroLabel}>Your personality type</Text>
+          <Text style={styles.archetypeHeroLabel}>Your chess personality</Text>
           <View style={styles.archetypeTitleRow}>
             <Text style={styles.archetypeName}>{topArchetype.name}</Text>
             <Pressable
               onPress={() => setHelpContent(PERSONALITY_HELP)}
               hitSlop={10}
               accessibilityRole="button"
-              accessibilityLabel="About personality type"
+              accessibilityLabel="About chess personality"
               style={styles.helpButton}
             >
-              <Ionicons
-                name="information-circle-outline"
-                size={22}
-                color={colors.textDim}
-              />
+              <AppIcon icon={Info} size={22} color={colors.textDim} />
             </Pressable>
           </View>
           <Text style={styles.archetypeDesc}>
@@ -941,6 +983,18 @@ export function StyleOfPlayPanel() {
       {radarAxes.length ? (
         <View style={styles.section}>
           <StyleRadarChart axes={radarAxes} />
+          <Text style={styles.radarScores}>
+            {radarAxes
+              .map((axis) => `${axis.name} ${axis.score.toFixed(1)}`)
+              .join("  ·  ")}
+          </Text>
+          {primaryFeatures.length ? (
+            <Text style={styles.radarScores}>
+              {primaryFeatures
+                .map((f) => `${f.name} ${f.score.toFixed(1)}`)
+                .join("  ·  ")}
+            </Text>
+          ) : null}
         </View>
       ) : null}
       {visibleSections.map((section) => (
@@ -960,14 +1014,27 @@ export function StyleOfPlayPanel() {
             const scaleMax = scale
               ? resolveScaleMax(scale, hit)
               : null;
+            const referenceMean =
+              metric.absoluteRef != null && Number.isFinite(metric.absoluteRef)
+                ? metric.absoluteRef
+                : hit?.mean ?? null;
+            const polarityKey = metric.baselineKey ?? metric.refKey;
             const deltaLabel =
-              metric.baselineKey && hit?.mean != null
-                ? peerDeltaLabel(metric.userNum, hit.mean, metric.unit)
+              referenceMean != null
+                ? peerDeltaLabel(metric.userNum, referenceMean, metric.unit)
                 : null;
-            const deltaPositive =
-              metric.userNum != null &&
-              hit?.mean != null &&
-              metric.userNum >= hit.mean;
+            const impactColor = polarityKey
+              ? peerImpactColor(
+                  metric.userNum,
+                  referenceMean,
+                  polarityKey,
+                  scaleMax != null
+                    ? scale?.kind === "signed"
+                      ? scaleMax * 2
+                      : scaleMax
+                    : null
+                )
+              : result.win;
             return (
               <EdgeCard key={metric.name} style={styles.card}>
                 <View style={styles.cardRow}>
@@ -980,12 +1047,7 @@ export function StyleOfPlayPanel() {
                       </Text>
                       {deltaLabel ? (
                         <Text
-                          style={[
-                            styles.peerDelta,
-                            {
-                              color: deltaPositive ? result.win : result.loss,
-                            },
-                          ]}
+                          style={[styles.peerDelta, { color: impactColor }]}
                         >
                           {deltaLabel}
                         </Text>
@@ -994,9 +1056,10 @@ export function StyleOfPlayPanel() {
                     {scaleMax != null ? (
                       <MetricBulletGraph
                         value={metric.userNum}
-                        peerMean={hit?.mean}
+                        peerMean={referenceMean}
                         scaleMax={scaleMax}
                         signed={scale?.kind === "signed"}
+                        fillColor={impactColor}
                       />
                     ) : null}
                   </View>
@@ -1013,11 +1076,7 @@ export function StyleOfPlayPanel() {
                     accessibilityLabel={`About ${metric.name}`}
                     style={styles.helpButton}
                   >
-                    <Ionicons
-                      name="information-circle-outline"
-                      size={20}
-                      color={colors.textDim}
-                    />
+                    <AppIcon icon={Info} size={20} color={colors.textDim} />
                   </Pressable>
                 </View>
               </EdgeCard>
@@ -1036,6 +1095,13 @@ const styles = StyleSheet.create({
     marginBottom: spacing.md,
   },
   section: { marginBottom: spacing.xl },
+  radarScores: {
+    ...type.bodySmall,
+    color: colors.textMuted,
+    textAlign: "center",
+    marginTop: spacing.sm,
+    lineHeight: 20,
+  },
   card: { marginBottom: spacing.sm },
   cardRow: {
     flexDirection: "row",
@@ -1116,7 +1182,6 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     borderRadius: radius.pill,
-    backgroundColor: result.win,
   },
   bulletOverflow: {
     position: "absolute",

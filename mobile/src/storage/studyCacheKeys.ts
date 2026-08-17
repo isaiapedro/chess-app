@@ -11,6 +11,11 @@ function isoDateLocal(d: Date): string {
   return `${year}-${month}-${day}`;
 }
 
+function isoHourLocal(d: Date): string {
+  const hour = String(d.getHours()).padStart(2, "0");
+  return `${isoDateLocal(d)}T${hour}`;
+}
+
 export function withoutSpeedFilter(filters: QueryFilters): QueryFilters {
   return { ...filters, speed: null };
 }
@@ -33,29 +38,39 @@ export function relatedPeriodFilters(filters: QueryFilters): QueryFilters[] {
   };
 
   const now = new Date();
-  const monthStart = new Date(now);
-  monthStart.setDate(monthStart.getDate() - 29);
-  monthStart.setHours(0, 0, 0, 0);
-  const yearStart = new Date(now);
-  yearStart.setFullYear(yearStart.getFullYear() - 1);
-  yearStart.setHours(0, 0, 0, 0);
 
-  if (period.timeframe === "1 month" && period.dateFrom && period.dateTo) {
-    push({
-      ...period,
-      timeframe: "1 month",
-      dateFrom: isoDateLocal(monthStart),
-      dateTo: isoDateLocal(now),
-    });
-  }
-
-  if (period.timeframe === "1 month" || period.timeframe === "1 year") {
+  const pushWindowsForAnchor = (anchor: Date, dateTo: string) => {
+    const monthStart = new Date(anchor);
+    monthStart.setDate(monthStart.getDate() - 29);
+    monthStart.setHours(0, 0, 0, 0);
+    const yearStart = new Date(anchor);
+    yearStart.setFullYear(yearStart.getFullYear() - 1);
+    yearStart.setHours(0, 0, 0, 0);
+    if (period.timeframe === "1 month") {
+      push({
+        ...period,
+        timeframe: "1 month",
+        dateFrom: isoDateLocal(monthStart),
+        dateTo,
+      });
+    }
     push({
       ...period,
       timeframe: "1 year",
       dateFrom: isoDateLocal(yearStart),
-      dateTo: isoDateLocal(now),
+      dateTo,
     });
+  };
+
+  if (period.timeframe === "1 month" || period.timeframe === "1 year") {
+    for (let daysBack = 0; daysBack <= 3; daysBack += 1) {
+      const anchor = new Date(now);
+      anchor.setDate(anchor.getDate() - daysBack);
+      pushWindowsForAnchor(anchor, isoDateLocal(anchor));
+      const hourAnchor = new Date(anchor);
+      hourAnchor.setMinutes(0, 0, 0);
+      pushWindowsForAnchor(hourAnchor, isoHourLocal(hourAnchor));
+    }
   }
 
   if (period.timeframe !== "all") {

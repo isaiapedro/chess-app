@@ -12,6 +12,10 @@ import { softKeysFromMgStructure } from "./middlegameStructure";
 import { softKeysFromEndgameContext } from "./endgameContext";
 import { themeTagToMetricKey } from "./metricThemes";
 import {
+  primaryFieldFromRanked,
+  rankMetricAxes,
+} from "./metricAxisRank";
+import {
   softKeysFromSituations,
   type DetectedSituation,
 } from "./situationProfiles";
@@ -37,6 +41,9 @@ const COMPARE_HIGHER_BETTER = new Set([
   "bishop_openness_light",
   "bishop_openness_dark",
   "pawn_storm_tempo",
+  "center_fluidity_index",
+  "pawn_storm_tempo_delta",
+  "king_center_file_exposure",
   "wp",
   "eval_cp",
   "opp_king_in_centre",
@@ -50,12 +57,17 @@ const COMPARE_HIGHER_BETTER = new Set([
   "piece_liberation",
   "side_clamp",
   "key_square_control",
+  "minors_developed",
+  "center_control_pct",
   "piece_support",
 ]);
 
 const COMPARE_LOWER_BETTER = new Set([
   "hanging_material_own",
   "king_attackers_pct",
+  "tempo_waste_rate_pct",
+  "uncastled_rate_pct",
+  "castle_fullmove",
   "queenside_advance_opponent",
   "kingside_advance_opponent",
   "center_advance_opponent",
@@ -68,6 +80,8 @@ const COMPARE_LOWER_BETTER = new Set([
 const FIELD_SOFT_HINT: Record<string, string> = {
   mobility: "piece_activity",
   king_attackers_pct: "king_safety",
+  tempo_waste_rate_pct: "piece_activity",
+  minors_developed: "piece_activity",
   opp_king_attackers_pct: "attack",
   space_advantage_pct: "space",
   hanging_material_own: "prophylaxis",
@@ -94,7 +108,7 @@ const FIELD_SOFT_HINT: Record<string, string> = {
   castled_queenside_opponent: "king_safety",
   opposite_side_castling: "opposite_side_castling",
   closed_center: "pawn_chain",
-  blockade_square_control: "iqp",
+  blockade_square_control: "blockade",
   maroczy_bind: "space",
   carlsbad: "pawn_break",
   minority_attack: "space",
@@ -105,6 +119,9 @@ const FIELD_SOFT_HINT: Record<string, string> = {
   knight_vs_bishop: "knight_vs_bishop",
   good_vs_bad_bishop: "good_vs_bad_bishop",
   pawn_storm_tempo: "attack",
+  center_fluidity_index: "pawn_break",
+  pawn_storm_tempo_delta: "attack",
+  king_center_file_exposure: "king_safety",
   material_balance: "exchanges",
   wp: "initiative",
   eval_cp: "initiative",
@@ -131,19 +148,11 @@ function compareDeltaHelpsEngine(field: string, delta: number): boolean | null {
 
 /** Soft keys for the top engine-helping Δ (why_better primary). */
 export function primarySoftKeysFromMetricDeltas(
-  deltas: Array<{ field: string; delta?: number | null }> | null | undefined
+  deltas: Array<{ field: string; delta?: number | null }> | null | undefined,
+  phase?: string | null
 ): string[] {
   if (!deltas?.length) return [];
-  const scored = deltas
-    .filter((d) => d.delta != null && Math.abs(d.delta) > 1e-9)
-    .map((d) => ({
-      field: d.field,
-      abs: Math.abs(d.delta || 0),
-      helps: compareDeltaHelpsEngine(d.field, d.delta || 0),
-    }))
-    .filter((x) => x.helps)
-    .sort((a, b) => b.abs - a.abs);
-  const primary = scored[0]?.field;
+  const primary = primaryFieldFromRanked(rankMetricAxes({ deltas, phase }));
   if (!primary) return [];
   const fromMap = keysForMetricFields([primary]);
   const hint = FIELD_SOFT_HINT[primary];
@@ -238,7 +247,7 @@ export const METRIC_FIELD_TO_KEYS: Record<string, string[]> = {
     "positional.pawn_break",
     "positional.outpost",
   ],
-  blockade_square_control: ["piece.blockade", "structure.iqp"],
+  blockade_square_control: ["piece.blockade"],
   maroczy_bind: [
     "structure.maroczy_bind",
     "imbalance.space",
@@ -289,6 +298,20 @@ export const METRIC_FIELD_TO_KEYS: Record<string, string[]> = {
     "attack.initiative",
     "imbalance.space",
   ],
+  center_fluidity_index: [
+    "positional.pawn_break",
+    "piece.centralization",
+  ],
+  pawn_storm_tempo_delta: [
+    "attack.initiative",
+    "imbalance.space",
+    "positional.prophylaxis",
+  ],
+  king_center_file_exposure: [
+    "attack.king_safety",
+    "piece.coordination",
+    "positional.pawn_break",
+  ],
   opposition: [
     "endgame.strategic.active_king",
     "endgame.theoretical.triangulation",
@@ -300,12 +323,17 @@ export const METRIC_FIELD_TO_KEYS: Record<string, string[]> = {
   uncastled_rate_pct: ["attack.king_safety"],
   opening_accuracy_pct: [],
   center_control_pct: ["piece.centralization", "imbalance.space"],
-  tempo_waste_rate_pct: ["piece.centralization"],
+  tempo_waste_rate_pct: ["piece.centralization", "methodology.candidate_moves"],
+  played_tempo_waste: ["piece.centralization", "methodology.candidate_moves"],
+  played_tempo_piece: [],
   peer_delta_minors_developed: ["piece.centralization"],
   peer_delta_center_control_pct: ["piece.centralization", "imbalance.space"],
   peer_delta_castle_fullmove: ["attack.king_safety"],
   peer_delta_uncastled_rate_pct: ["attack.king_safety"],
-  peer_delta_tempo_waste_rate_pct: ["piece.centralization"],
+  peer_delta_tempo_waste_rate_pct: [
+    "piece.centralization",
+    "methodology.candidate_moves",
+  ],
   peer_delta_opening_accuracy_pct: [],
   peer_delta_middlegame_accuracy_pct: ["methodology.candidate_moves"],
   peer_delta_middlegame_blunders: [
@@ -398,6 +426,8 @@ export const METRIC_FIELD_TO_KEYS: Record<string, string[]> = {
 };
 
 export const OPENING_PLAN_KEYS = [
+  "opening.benko",
+  "opening.benoni",
   "opening.caro_kann",
   "opening.english",
   "opening.french",
@@ -421,6 +451,7 @@ export const STRUCTURAL_KIND_KEYS: Record<string, string[]> = {
   opening_name: [],
   opening_aggregate: [],
   middlegame_aggregate: [
+    "piece.simplification",
     "imbalance.space",
     "attack.king_safety",
     "attack.initiative",
@@ -495,7 +526,6 @@ export const MARK_KIND_KEYS: Record<string, string[]> = {
     "methodology.candidate_moves",
     "methodology.visualization",
     "methodology.comparison_and_elimination",
-    "motif.intermediate_move",
     "attack.initiative",
   ],
   praise_move: [
@@ -587,7 +617,8 @@ export function softKeysForNoteRequest(args: {
   const whyPrimary = primarySoftKeysFromMetricDeltas(
     args.engineVsPlayedMetricDelta?.length
       ? args.engineVsPlayedMetricDelta
-      : args.engineLineMetricDelta
+      : args.engineLineMetricDelta,
+    args.phase
   );
   const whySoft = [
     ...whyPrimary,
@@ -674,7 +705,10 @@ export function softKeysForNoteRequest(args: {
       ...whyPrimary,
       ...peerGapKeys,
       ...softKeysFromMgStructure(args.inputs),
-      ...softKeysFromEndgameContext(args.inputs),
+      ...(args.phase === "endgame" ||
+      args.structuralKind === "endgame_advantage"
+        ? softKeysFromEndgameContext(args.inputs)
+        : []),
       ...openingLock,
       ...whySoft,
       ...fromCompare,

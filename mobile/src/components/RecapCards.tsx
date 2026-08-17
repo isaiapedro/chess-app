@@ -1,5 +1,7 @@
 import React from "react";
 import { StyleSheet, Text, View } from "react-native";
+import type { LucideIcon } from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { colors, radius, spacing, type } from "../theme";
 
 export function MetricCard({
@@ -43,13 +45,18 @@ export function ComparisonCard({
   label,
   value,
 }: {
-  icon: string;
+  icon: LucideIcon;
   label: string;
   value: string;
 }) {
   return (
     <View style={styles.comparison}>
-      <Text style={styles.comparisonIcon}>{icon}</Text>
+      <AppIcon
+        icon={icon}
+        size={22}
+        color={colors.textMuted}
+        style={styles.comparisonIcon}
+      />
       <Text style={styles.comparisonValue}>{value}</Text>
       <Text style={styles.comparisonLabel}>{label}</Text>
     </View>
@@ -106,7 +113,6 @@ const styles = StyleSheet.create({
     minWidth: 100,
   },
   comparisonIcon: {
-    fontSize: 22,
     marginBottom: 6,
   },
   comparisonValue: {

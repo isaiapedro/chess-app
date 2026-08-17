@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useState } from "react";
 import { StyleSheet, Text, View } from "react-native";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useScanLog } from "../context/ScanLogContext";
@@ -9,7 +9,7 @@ import { AnalysisLoadingBars } from "./LoadingSkeletons";
 const WAITING_LINES = [
   "Buying the chess board…",
   "Warming up the coffee…",
-  "Unhooking the king…",
+  "Uncastleling the king…",
   "Never playing f6…",
   "Hiding the bongcloud…",
   "Dusting off the knights…",
@@ -83,8 +83,13 @@ function ProgressTrack({
   );
 }
 
-export function AnalyticsScanBanner() {
-  const { metricsScanned, metricsTotal, metricsReady } = useAnalytics();
+export function AnalyticsScanBanner({
+  mode = "full",
+}: {
+  mode?: "full" | "overlay";
+}) {
+  const { metricsScanned, metricsTotal, metricsReady, metricsRefreshing } =
+    useAnalytics();
   const [phrase, setPhrase] = useState(() => pickRandomLine());
 
   const metricsDone = Math.min(
@@ -99,18 +104,31 @@ export function AnalyticsScanBanner() {
     return () => clearInterval(timer);
   }, []);
 
-  const showMetrics = !metricsReady;
+  const waiting = mode === "overlay" ? metricsRefreshing : !metricsReady;
+  if (!waiting) return null;
 
-  const message = useMemo(() => {
-    const head = stripTrailingEllipsis(phrase);
-    if (!showMetrics) return `${head}…`;
-    if (metricsTotal > 0) {
-      return `${head}… (${metricsDone}/${metricsTotal} games measured)`;
-    }
-    return `${head}… (measuring games)`;
-  }, [phrase, showMetrics, metricsDone, metricsTotal]);
+  const head = stripTrailingEllipsis(phrase);
+  const message =
+    metricsTotal > 0
+      ? `${head}… (${metricsDone}/${metricsTotal} games measured)`
+      : `${head}… (measuring games)`;
 
-  if (!showMetrics) return null;
+  if (mode === "overlay") {
+    return (
+      <View style={styles.warningWrap}>
+        <Text style={styles.warningText}>{message}</Text>
+        {metricsTotal > 0 ? (
+          <ProgressTrack
+            label="Metrics"
+            done={metricsDone}
+            total={metricsTotal}
+            complete={false}
+          />
+        ) : null}
+        <Text style={styles.subtitle}>Do some puzzles while you wait.</Text>
+      </View>
+    );
+  }
 
   return (
     <View style={styles.wrap}>

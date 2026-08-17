@@ -27,6 +27,13 @@ export type KeyTip = {
   compactDefinition?: string;
   noteCompact?: string;
   modelGame?: string;
+  /** Woven tip metadata (soft keys / metrics / topics used in the comment). */
+  tipMeta?: {
+    softKeys: string[];
+    metrics: string[];
+    clauses: string[];
+    topics: string[];
+  };
 };
 
 export type PhaseName = "opening" | "middlegame" | "endgame";

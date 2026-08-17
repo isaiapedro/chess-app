@@ -23,6 +23,23 @@ export type DerivedCoachNote = {
   specificity?: number;
   features?: string[];
   compact?: string;
+  /** Tip-structure slots: wire directly to lead/core/remember/plan. */
+  slots?: {
+    worked?: string;
+    attention?: string;
+    lesson?: string;
+    plan?: string;
+  };
+  /** Match notes to live metrics / situations / openings / polarity. */
+  conditions?: Array<{
+    softKey?: string;
+    metric?: string;
+    situation?: string;
+    theme?: string;
+    opening?: string;
+    polarity?: "good" | "bad" | "any";
+    feature?: string;
+  }>;
 };
 
 export type DerivedCoachEntry = {

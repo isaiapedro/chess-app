@@ -5,7 +5,6 @@ import {
   ENDGAME_MINOR_MAJOR,
   ENDGAME_NON_PAWN_MAX,
   ENDGAME_PIECE_VALUE,
-  MATE_CP_THRESHOLD,
 } from "./endgamePhase";
 import { inMiddlegamePly } from "./middlegameBounds";
 import type { MiddlegameEvalBucket } from "./middlegamePhase";
@@ -31,15 +30,13 @@ import {
   WP_ENDGAME_ADVANTAGE,
   WP_ENDGAME_ADVANTAGE_STICKY,
   WP_INACCURACY_DROP,
+  isMateScore,
 } from "./winProb";
 
 const EVAL_CLAMP = 1000;
 
 function clampCp(value: number): number {
-  const abs = Math.abs(value);
-  if (abs >= MATE_CP_THRESHOLD) {
-    return value > 0 ? EVAL_CLAMP + 50 : -(EVAL_CLAMP + 50);
-  }
+  if (isMateScore(value)) return value;
   return Math.max(-EVAL_CLAMP, Math.min(EVAL_CLAMP, value));
 }
 
@@ -112,6 +109,9 @@ export type StyleGameRow = {
   lateral_moves: number;
   higher_threats: number;
   threat_escapes: number;
+  brilliant_moves: number;
+  excellent_moves: number;
+  important_moves: number;
   user_moves: number;
   avg_time_per_move_s: number | null;
   opp_avg_time_per_move_s: number | null;
@@ -220,12 +220,13 @@ export function swapColor(color: Color): Color {
 
 function pieceMaterialFor(board: Chess, color: Color): number {
   let total = 0;
-  for (const pt of MINOR_MAJOR) {
+  for (const pt of ["p", "n", "b", "r", "q"] as PieceSymbol[]) {
     total += board.findPiece({ type: pt, color }).length * PIECE_VALUE[pt];
   }
   return total;
 }
 
+/** Own − opp material (p=1, n/b=3, r=5, q=9). King excluded. */
 export function pieceMaterialBalance(board: Chess, color: Color): number {
   return pieceMaterialFor(board, color) - pieceMaterialFor(board, swapColor(color));
 }
@@ -282,6 +283,74 @@ export function hasMaterialWinTactic(board: Chess, color: Color): boolean {
   return false;
 }
 
+export function isUnderEnemyAttack(board: Chess, sq: Square, color: Color): boolean {
+  const piece = board.get(sq);
+  if (!piece || piece.color !== color || piece.type === "k") return false;
+  return board.attackers(sq, swapColor(color)).length > 0;
+}
+
+/**
+ * True when piece on sq is hanging or outnumbered.
+ * Equal protected stares (same attacker/defender count) do not count —
+ * a queen attacked by one rook and defended by one piece is not hanging.
+ */
+export function isHangingOrUnderdefended(
+  board: Chess,
+  sq: Square,
+  color: Color
+): boolean {
+  const piece = board.get(sq);
+  if (!piece || piece.color !== color || piece.type === "k") return false;
+  const opp = swapColor(color);
+  const attackers = board.attackers(sq, opp);
+  if (!attackers.length) return false;
+  const defenders = board.attackers(sq, color);
+  if (!defenders.length) return true;
+  return attackers.length > defenders.length;
+}
+
+/**
+ * Creating a real threat against a higher-value enemy piece.
+ * Captures never count (executing an exchange ≠ creating a threat) — except a
+ * capturing check, where the mover attacks the king (highest value).
+ * King is the top target: only a DIRECT check by the mover counts (discovered
+ * checks with no piece attacked by the mover do not).
+ * Other targets must be hanging / underdefended — protected equal stares don't count.
+ */
+export function threatensHigherValueAfter(
+  boardAfter: Chess,
+  move: Move,
+  color: Color
+): boolean {
+  if (move.piece === "k" || move.piece === "p") return false;
+
+  const aVal = PIECE_VALUE[move.piece] ?? 0;
+  const opp = swapColor(color);
+  /** King outvalues every piece — used only for direct checks by the mover. */
+  const KING_VALUE = 100;
+
+  const kingSq = kingSquare(boardAfter, opp);
+  if (
+    kingSq &&
+    aVal < KING_VALUE &&
+    boardAfter.attackers(kingSq, color).includes(move.to)
+  ) {
+    return true;
+  }
+
+  if (move.isCapture()) return false;
+
+  for (const pt of MINOR_MAJOR) {
+    const vVal = PIECE_VALUE[pt] ?? 0;
+    if (aVal >= vVal) continue;
+    for (const sq of boardAfter.findPiece({ type: pt, color: opp })) {
+      if (!boardAfter.attackers(sq, color).includes(move.to)) continue;
+      if (isHangingOrUnderdefended(boardAfter, sq, opp)) return true;
+    }
+  }
+  return false;
+}
+
 export function threatensHigherValue(board: Chess, move: Move, color: Color): boolean {
   const applied = board.move({
     from: move.from,
@@ -294,39 +363,6 @@ export function threatensHigherValue(board: Chess, move: Move, color: Color): bo
   } finally {
     board.undo();
   }
-}
-
-export function threatensHigherValueAfter(
-  boardAfter: Chess,
-  move: Move,
-  color: Color
-): boolean {
-  if (move.piece === "k") return false;
-  const aVal = PIECE_VALUE[move.piece] ?? 0;
-  if (
-    move.isCapture() &&
-    move.captured &&
-    move.captured !== "k" &&
-    move.captured !== "p" &&
-    aVal < (PIECE_VALUE[move.captured] ?? 0)
-  ) {
-    return true;
-  }
-  const opp = swapColor(color);
-  for (const pt of MINOR_MAJOR) {
-    const vVal = PIECE_VALUE[pt] ?? 0;
-    if (aVal >= vVal) continue;
-    for (const sq of boardAfter.findPiece({ type: pt, color: opp })) {
-      if (boardAfter.attackers(sq, color).includes(move.to)) return true;
-    }
-  }
-  return false;
-}
-
-export function isUnderEnemyAttack(board: Chess, sq: Square, color: Color): boolean {
-  const piece = board.get(sq);
-  if (!piece || piece.color !== color || piece.type === "k") return false;
-  return board.attackers(sq, swapColor(color)).length > 0;
 }
 
 export function isUnderLesserAttack(board: Chess, sq: Square, color: Color): boolean {
@@ -347,27 +383,33 @@ export function canRecapture(board: Chess, captureToSq: Square): boolean {
   return board.attackers(captureToSq, board.turn()).length > 0;
 }
 
+/**
+ * Material offered as a sacrifice (pieces only — never pawns).
+ * Equal/winning captures are not sacrifices.
+ */
 export function sacrificeOfferAfterMove(
   boardAfter: Chess,
   move: Move,
   color: Color
 ): number {
+  if (move.piece === "p" || move.piece === "k") return 0;
   const opp = swapColor(color);
   const moverVal = PIECE_VALUE[move.piece] ?? 0;
   const capturedVal = move.captured ? PIECE_VALUE[move.captured] ?? 0 : 0;
-  const destAttacked = boardAfter.isAttacked(move.to, opp);
-  const destDefended = boardAfter.isAttacked(move.to, color);
-  if (move.isCapture() && destAttacked) {
-    const tradeLoss = moverVal - capturedVal;
-    return tradeLoss >= SACRIFICE_MIN_OFFER ? tradeLoss : 0;
-  }
-  if (
-    destAttacked &&
-    !destDefended &&
-    moverVal >= SACRIFICE_MIN_OFFER
-  ) {
-    return Math.max(0, moverVal - capturedVal);
-  }
+  const attackCount = boardAfter.attackers(move.to, opp).length;
+  if (attackCount === 0) return 0;
+
+  const defendCount = boardAfter.attackers(move.to, color).length;
+  const tradeLoss = moverVal - capturedVal;
+
+  // Equal or winning capture is a trade, not a sac.
+  if (move.isCapture() && tradeLoss <= 0) return 0;
+
+  // Must leave the unit en prise / underdefended — a protected QxP is not a sac.
+  if (attackCount <= defendCount) return 0;
+
+  if (tradeLoss > 0) return tradeLoss;
+  if (moverVal >= SACRIFICE_MIN_OFFER) return moverVal;
   return 0;
 }
 
@@ -427,6 +469,11 @@ export type StyleScanSession = {
   tradesNearUserKing: number;
   higherThreats: number;
   threatEscapes: number;
+  brilliantMoves: number;
+  excellentMoves: number;
+  importantMoves: number;
+  /** 0-based ply to attribute the latest early-trade increment (first capture). */
+  lastEarlyTradePly: number | null;
   userMoves: number;
   earlyFlankPushes: number;
   sacrificeMoves: number;
@@ -501,6 +548,7 @@ export type StyleScanSession = {
   criticalPositions: number;
   clock: ReturnType<typeof extractMoveTimesFromPgn>;
   alive: boolean;
+  totalPlies: number;
 };
 
 export function createStyleScanSession(game: StudyGame): StyleScanSession | null {
@@ -531,6 +579,10 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     tradesNearUserKing: 0,
     higherThreats: 0,
     threatEscapes: 0,
+    brilliantMoves: 0,
+    excellentMoves: 0,
+    importantMoves: 0,
+    lastEarlyTradePly: null,
     userMoves: 0,
     earlyFlankPushes: 0,
     sacrificeMoves: 0,
@@ -599,6 +651,7 @@ export function createStyleScanSession(game: StudyGame): StyleScanSession | null
     criticalPositions: 0,
     clock,
     alive: true,
+    totalPlies: sans.length,
   };
 }
 
@@ -631,10 +684,21 @@ export function styleScanProcessPly(
   let hadTacticBefore = false;
   let pendingCanRecapture = false;
   const pendingRecaptureSq = session.pendingRecaptureSq;
+  let fromWasUnderPressure = false;
   if (isUser) {
     hadTacticBefore = hasMaterialWinTactic(board, userColor);
     if (pendingRecaptureSq != null) {
       pendingCanRecapture = canRecapture(board, pendingRecaptureSq);
+    }
+    const turnSq = board
+      .moves({ verbose: true })
+      .find((m) => m.san === san);
+    if (turnSq) {
+      fromWasUnderPressure = isHangingOrUnderdefended(
+        board,
+        turnSq.from,
+        userColor
+      );
     }
   }
 
@@ -736,22 +800,22 @@ export function styleScanProcessPly(
       session.earlyFlankPushes += 1;
     }
 
-    if (threatensHigherValueAfter(board, move, userColor)) {
+    const madeHigherThreat = threatensHigherValueAfter(board, move, userColor);
+    if (madeHigherThreat) {
       session.higherThreats += 1;
     }
 
     session.userJustCaptured = isCapture;
 
-    if (movingPiece !== "p" && movingPiece !== "k") {
-      const opp = swapColor(userColor);
-      const fromThreatened = board.isAttacked(fromSq, opp);
-      if (
-        fromThreatened &&
-        !isUnderEnemyAttack(board, toSq, userColor) &&
-        !isUnderLesserAttack(board, toSq, userColor)
-      ) {
-        session.threatEscapes += 1;
-      }
+    // Escape only if the piece was hanging/underdefended on fromSq before moving.
+    if (
+      movingPiece !== "p" &&
+      movingPiece !== "k" &&
+      fromWasUnderPressure &&
+      !isUnderEnemyAttack(board, toSq, userColor) &&
+      !isUnderLesserAttack(board, toSq, userColor)
+    ) {
+      session.threatEscapes += 1;
     }
 
     const cpRaw = evalAfter;
@@ -761,16 +825,25 @@ export function styleScanProcessPly(
       session.userWps.push(userWinProbability(cp, userIsWhite));
     }
 
+    const isTerminalPly =
+      plyIdx >= session.totalPlies - 1 ||
+      board.isGameOver() ||
+      (evalBefore != null && isMateScore(evalBefore));
+
     if (beforeCp != null && cp != null) {
       const balAfter = pieceMaterialBalance(board, userColor);
       userBalDelta = balAfter - balBefore;
-      const offered = sacrificeOfferAfterMove(board, move, userColor);
+      const offered = madeHigherThreat
+        ? 0
+        : sacrificeOfferAfterMove(board, move, userColor);
       const evalBeforeUser = userIsWhite ? beforeCp : -beforeCp;
       const evalAfterUser = userIsWhite ? cp : -cp;
       const evalDelta = evalAfterUser - evalBeforeUser;
       const wpBefore = userWinProbability(beforeCp, userIsWhite);
       const wpAfterLocal = userWinProbability(cp, userIsWhite);
       const wpDrop = wpBefore - wpAfterLocal;
+      const wpSwing = Math.abs(wpAfterLocal - wpBefore);
+      const noRealWpChange = wpSwing < 0.02;
       if (
         offered >= SACRIFICE_MIN_OFFER &&
         evalDelta >= -50 &&
@@ -784,16 +857,37 @@ export function styleScanProcessPly(
       }
 
       const dropKind = classifyEvalDrop(wpBefore, wpAfterLocal);
-      if (!inOpening && dropKind === "blunder") session.blunders += 1;
+      if (
+        !inOpening &&
+        dropKind === "blunder" &&
+        !isTerminalPly &&
+        !noRealWpChange
+      ) {
+        session.blunders += 1;
+      }
 
       const cpSwing = Math.abs(evalAfterUser - evalBeforeUser);
       if (
-        Math.abs(wpAfterLocal - wpBefore) >= WP_CRITICAL_DELTA &&
-        cpSwing >= WP_CRITICAL_CP
+        !isTerminalPly &&
+        !noRealWpChange &&
+        wpSwing >= WP_CRITICAL_DELTA &&
+        cpSwing >= WP_CRITICAL_CP &&
+        wpDrop >= WP_INACCURACY_DROP
       ) {
         session.criticalPositions += 1;
         if (userMoveIdx < session.userTimes.length) {
           session.criticalTimes.push(session.userTimes[userMoveIdx]);
+        }
+      }
+
+      // Analysis-tab good bands: brilliant / great (important) / excellent.
+      if (!isTerminalPly && dropKind == null) {
+        if (offered >= 2) {
+          session.brilliantMoves += 1;
+        } else if (wpAfterLocal - wpBefore >= 0.05) {
+          session.importantMoves += 1;
+        } else if (wpDrop >= 0 && wpDrop < 0.02) {
+          session.excellentMoves += 1;
         }
       }
 
@@ -815,6 +909,7 @@ export function styleScanProcessPly(
           plyIdx - session.pieceTradePending <= 2
         ) {
           session.earlyTrades += 1;
+          session.lastEarlyTradePly = session.pieceTradePending;
           if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
             session.tradesNearEnemyKing += 1;
           }
@@ -857,6 +952,7 @@ export function styleScanProcessPly(
           plyIdx - session.pieceTradePending <= 2
         ) {
           session.earlyTrades += 1;
+          session.lastEarlyTradePly = session.pieceTradePending;
           if (enemyKing != null && chebyshev(toSq, enemyKing) <= KING_TRADE_DIST) {
             session.tradesNearEnemyKing += 1;
           }
@@ -884,6 +980,13 @@ export function styleScanProcessPly(
   const cpAfter = evalAfter != null ? clampCp(evalAfter) : null;
   const wpAfter =
     cpAfter != null ? userWinProbability(cpAfter, userIsWhite) : null;
+    const skipAccuracyDrops =
+    plyIdx >= session.totalPlies - 1 ||
+    board.isGameOver() ||
+    (evalBefore != null && isMateScore(evalBefore)) ||
+    (wpBeforeMove != null &&
+      wpAfter != null &&
+      Math.abs(wpAfter - wpBeforeMove) < 0.02);
 
   if (session.endgameStartPly == null) {
     let np = 0;
@@ -922,9 +1025,11 @@ export function styleScanProcessPly(
         moveAccuracyPct(wpBeforeMove * 100, wpAfter * 100)
       );
       const kind = classifyEvalDrop(wpBeforeMove, wpAfter);
-      if (kind === "blunder") session.mgBlunders += 1;
-      else if (kind === "mistake") session.mgMistakes += 1;
-      else if (kind === "inaccuracy") session.mgInaccuracies += 1;
+      if (!skipAccuracyDrops) {
+        if (kind === "blunder") session.mgBlunders += 1;
+        else if (kind === "mistake") session.mgMistakes += 1;
+        else if (kind === "inaccuracy") session.mgInaccuracies += 1;
+      }
       if (hadTacticBefore && isCapture && userBalDelta >= 2) {
         session.mgTacticsMade += 1;
       }
@@ -952,7 +1057,7 @@ export function styleScanProcessPly(
       const found =
         (wpBeforeMove != null &&
           wpAfter != null &&
-          wpDropPp(wpBeforeMove, wpAfter) >= 7.5) ||
+          wpDropPp(wpBeforeMove, wpAfter) >= 10) ||
         isCapture;
       if (found) session.mgAllowedFound += 1;
       session.mgPendingAllowed = false;
@@ -968,6 +1073,7 @@ export function styleScanProcessPly(
 
     if (isUser && wpBeforeMove != null && wpAfter != null) {
       if (
+        !skipAccuracyDrops &&
         classifyEvalDrop(wpBeforeMove, wpAfter) === "blunder" &&
         hasMaterialWinTactic(board, swapColor(userColor))
       ) {
@@ -987,9 +1093,11 @@ export function styleScanProcessPly(
   if (session.endgameStartPly != null && plyIdx >= session.endgameStartPly) {
     if (isUser && wpBeforeMove != null && wpAfter != null) {
       const kind = classifyEvalDrop(wpBeforeMove, wpAfter);
-      if (kind === "blunder") session.egBlunders += 1;
-      else if (kind === "mistake") session.egMistakes += 1;
-      else if (kind === "inaccuracy") session.egInaccuracies += 1;
+      if (!skipAccuracyDrops) {
+        if (kind === "blunder") session.egBlunders += 1;
+        else if (kind === "mistake") session.egMistakes += 1;
+        else if (kind === "inaccuracy") session.egInaccuracies += 1;
+      }
       if (hadTacticBefore && isCapture && userBalDelta >= 2) {
         session.egTacticsMade += 1;
       }
@@ -1105,10 +1213,7 @@ export function styleScanProcessPly(
       }
     }
     if (cpAfter != null) {
-      const rawAfter = evalAfter ?? cpAfter;
-      const userCpRaw = userIsWhite ? rawAfter : -rawAfter;
-      const mateNow =
-        Math.abs(rawAfter) >= 9000 || userCpRaw >= MATE_CP_THRESHOLD;
+      const mateNow = evalAfter != null && isMateScore(evalAfter);
       if (mateNow && !session.inMateEpisode) {
         session.inMateEpisode = true;
         session.mateEpisodeClean = true;
@@ -1311,6 +1416,9 @@ export function styleScanFinalize(
     lateral_moves: session.lateralMoves,
     higher_threats: session.higherThreats,
     threat_escapes: session.threatEscapes,
+    brilliant_moves: session.brilliantMoves,
+    excellent_moves: session.excellentMoves,
+    important_moves: session.importantMoves,
     user_moves: session.userMoves,
     avg_time_per_move_s: clock ? clock.user_avg : null,
     opp_avg_time_per_move_s: clock ? clock.opp_avg : null,

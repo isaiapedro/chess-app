@@ -4,6 +4,7 @@
 
 import { Chess, type Color, type PieceSymbol } from "chess.js";
 import type { EndgameGameRow } from "../endgamePhase";
+import { ENDGAME_NON_PAWN_MAX, nonPawnPieceCount } from "../endgamePhase";
 import { pieceMaterialBalance } from "../styleMetrics";
 import { WP_ENDGAME_ADVANTAGE, WP_DISADVANTAGE } from "../winProb";
 import {
@@ -98,6 +99,23 @@ export function classifyConversionState(args: {
   }
   return "unclear";
 }
+
+const ENDGAME_TYPE_LABEL: Record<EndgameType, string> = {
+  king_and_pawn: "king and pawn ending",
+  single_rook: "rook vs pawns ending",
+  rook_ending: "rook ending",
+  opposite_color_bishops: "opposite-bishop ending",
+  minor_piece_vs_pawns: "minor piece vs pawns ending",
+  queen_ending: "queen ending",
+  other: "simplified ending",
+};
+
+const CONVERSION_LABEL: Record<ConversionState, string> = {
+  winning_conversion: "a winning conversion",
+  holding_draw: "a holdable draw",
+  pawn_race: "a pawn race",
+  unclear: "an unclear technical fight",
+};
 
 const TECHNICAL_RULE: Record<EndgameType, string> = {
   king_and_pawn:
@@ -232,6 +250,8 @@ export function buildEndgameStrategicInputs(args: {
   const technical_rule =
     (shape && SHAPE_RULE[shape]) || TECHNICAL_RULE[type];
 
+  const typeLabel = ENDGAME_TYPE_LABEL[type];
+  const conversionLabel = CONVERSION_LABEL[conversion];
   const played_impact =
     played_move_error === "pawn_move_before_king_activation"
       ? "Advanced the pawn without king support, allowing the enemy king to seize opposition or block the promotion path."
@@ -241,7 +261,9 @@ export function buildEndgameStrategicInputs(args: {
           ? "Failed to liquidate into a clearly won simplified ending."
           : played_move_error === "passive_rook"
             ? "Left the rook passive instead of cutting off the king or sitting behind the passer."
-            : `Endgame ${type}; conversion ${conversion}.`;
+            : played_move_error === "stalemate_blunder"
+              ? "Allowed an accidental stalemate instead of converting cleanly."
+              : `You reached ${conversionLabel} in a ${typeLabel}.`;
 
   const engine_line_plan =
     bestIsKing
@@ -250,12 +272,16 @@ export function buildEndgameStrategicInputs(args: {
         ? "Activate the rook: seventh rank, behind passers, or checking distance."
         : "Improve the king and simplify when ahead.";
 
-  const strategic_summary = [
+  const arrival =
     args.playedSan && args.bestSan && args.playedSan !== args.bestSan
-      ? `Played ${args.playedSan} instead of ${args.bestSan} in a ${type.replace(/_/g, " ")} ending.`
-      : `Reached a ${type.replace(/_/g, " ")} ending (${conversion.replace(/_/g, " ")}).`,
-    played_impact,
-    technical_rule,
+      ? `In a ${typeLabel}, the better idea was ${args.bestSan}.`
+      : `You reached ${conversionLabel} in a ${typeLabel}.`;
+  const strategic_summary = [
+    arrival,
+    played_move_error ? played_impact : null,
+    technical_rule && !(played_move_error ? played_impact : "").includes(technical_rule)
+      ? technical_rule
+      : null,
   ]
     .filter(Boolean)
     .join(" ")
@@ -347,6 +373,7 @@ export function enrichEndgameCoachMoments(args: {
   momentsByPly: Record<
     number,
     {
+      ply?: number;
       structuralKind?: string | null;
       inputs?: Record<string, string | number | boolean | null>;
       fen?: string;
@@ -363,18 +390,32 @@ export function enrichEndgameCoachMoments(args: {
   } | null;
 }): void {
   const snap = buildEndgameMetricSnapshot(args.eg);
-  for (const moment of Object.values(args.momentsByPly)) {
+  const egStart0 = args.eg?.endgame_start_ply;
+  for (const [plyKey, moment] of Object.entries(args.momentsByPly)) {
     const isEgCheckpoint = moment.structuralKind === "endgame_advantage";
+    const momentPly1 = moment.ply ?? Number(plyKey);
+    const momentPly0 = Number.isFinite(momentPly1) ? momentPly1 - 1 : null;
+    const inEndgamePhase =
+      egStart0 != null &&
+      momentPly0 != null &&
+      momentPly0 >= egStart0;
     const isLiveEg =
       Boolean(moment.fen) &&
-      (Boolean(moment.severity) || Boolean(moment.inputs?.praise_mark));
+      (Boolean(moment.severity) || Boolean(moment.inputs?.praise_mark)) &&
+      inEndgamePhase;
     if (!isEgCheckpoint && !isLiveEg) continue;
     if (!args.eg?.reached_endgame && !isEgCheckpoint) continue;
+    if (isEgCheckpoint && egStart0 != null && momentPly0 != null && momentPly0 < egStart0) {
+      continue;
+    }
 
     let strategic: Record<string, string | number | boolean | null> = {};
     if (moment.fen) {
       try {
         const board = new Chess(moment.fen);
+        if (!isEgCheckpoint && nonPawnPieceCount(board) > ENDGAME_NON_PAWN_MAX) {
+          continue;
+        }
         const wp =
           typeof moment.inputs?.best_line_wp === "number"
             ? moment.inputs.best_line_wp

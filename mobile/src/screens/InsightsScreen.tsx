@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Animated,
   Easing,
@@ -10,7 +10,6 @@ import {
 } from "react-native";
 import Svg, { Circle } from "react-native-svg";
 import { LineChart } from "react-native-chart-kit";
-import { selectFactors } from "../api/selectors";
 import type { FactorItem } from "../api/types";
 import {
   AnalyticsScanBanner,
@@ -24,15 +23,27 @@ import { BrutalButton, DisplayTitle, EdgeCard, Eyebrow } from "../components/ui"
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
 import { useInsightsNav } from "../context/InsightsNavContext";
+import {
+  normalizeSpeed,
+  peerDeltaLabel,
+  ratingBand,
+} from "../data/baselines";
+import { selectPerformanceFactors } from "../engine/performanceFactors";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 import { agentLog } from "../debug/agentLog";
 import { CatalogScreen } from "./CatalogScreen";
 
 export function InsightsScreen() {
-  const { queryFilters, refreshToken, period } = useFilters();
+  const { queryFilters, refreshToken, period, speed } = useFilters();
   const {
     insights: data,
     recap,
+    games,
+    style,
+    openingPhase,
+    middlegamePhase,
+    endgamePhase,
+    baselines,
     gamesLoading,
     sessionKey,
     metricsReady,
@@ -48,13 +59,66 @@ export function InsightsScreen() {
   const loadKey = `${sessionKey || "x"}:${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`;
   const contentReady = metricsReady && !!data;
 
+  const peerBand = useMemo(() => {
+    const ratings = games
+      .map((g) => Number(g.user_rating))
+      .filter((n) => Number.isFinite(n));
+    if (!ratings.length) return null;
+    const mid = [...ratings].sort((a, b) => a - b)[
+      Math.floor(ratings.length / 2)
+    ];
+    return ratingBand(mid);
+  }, [games]);
+
+  const inferredSpeed = useMemo(() => {
+    const speedCounts = new Map<string, number>();
+    for (const g of games) {
+      const s = String(g.speed || "").toLowerCase();
+      if (!s) continue;
+      speedCounts.set(s, (speedCounts.get(s) || 0) + 1);
+    }
+    return (
+      [...speedCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null
+    );
+  }, [games]);
+
+  const peerSpeed = normalizeSpeed(speed) || normalizeSpeed(inferredSpeed);
+
+  const factors = useMemo(() => {
+    const baselineWinRate =
+      recap?.results?.win_rate ??
+      data?.style?.conditional?.baseline_win_rate ??
+      0;
+    return selectPerformanceFactors({
+      style,
+      opening: openingPhase?.aggregate,
+      middlegame: middlegamePhase?.aggregate,
+      endgame: endgamePhase?.aggregate,
+      baselines,
+      band: peerBand,
+      speed: peerSpeed,
+      baselineWinRate: Number(baselineWinRate) || 0,
+    });
+  }, [
+    style,
+    openingPhase,
+    middlegamePhase,
+    endgamePhase,
+    baselines,
+    peerBand,
+    peerSpeed,
+    recap,
+    data,
+  ]);
+
   useEffect(() => {
-    if (period === "all") return;
+    // Soft/cold path already remeshes. Only request when Insights has no metrics yet.
+    if (metricsReady) return;
     // #region agent log
-    agentLog("F", "InsightsScreen.tsx:mount", "request vault metrics on insights focus", {});
+    agentLog("F", "InsightsScreen.tsx:mount", "request vault remesh on insights focus", {});
     // #endregion
     requestVaultMetrics(false);
-  }, [requestVaultMetrics, sessionKey, refreshToken, period]);
+  }, [requestVaultMetrics, sessionKey, refreshToken, metricsReady]);
 
   useEffect(() => {
     if (period === "all" && showCatalog) setShowCatalog(false);
@@ -102,7 +166,7 @@ export function InsightsScreen() {
     setRefreshing(true);
     setError(null);
     try {
-      await refreshAnalytics(false);
+      await refreshAnalytics("pull");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load insights");
     } finally {
@@ -110,15 +174,14 @@ export function InsightsScreen() {
     }
   }, [refreshAnalytics, period]);
 
-  const factors = data ? selectFactors(data) : null;
   const results = recap?.results || {
     wins: 0,
     draws: 0,
     losses: 0,
-    win_rate: factors?.baseline_win_rate || 0,
+    win_rate: factors.baseline_win_rate || 0,
   };
   const ratingSeries = (recap?.rating_series || []).slice(-12);
-  const winRate = results.win_rate || factors?.baseline_win_rate || 0;
+  const winRate = results.win_rate || factors.baseline_win_rate || 0;
 
   useEffect(() => {
     // #region agent log
@@ -152,13 +215,14 @@ export function InsightsScreen() {
   if (!metricsReady) {
     return (
       <View style={[styles.stack, styles.metricsWait]}>
-        <AnalyticsScanBanner />
+        <AnalyticsScanBanner mode="full" />
       </View>
     );
   }
 
   return (
     <View style={styles.stack}>
+      <AnalyticsScanBanner mode="overlay" />
       <EvalPendingWarning />
       <Animated.View style={[styles.insightsLayer, { opacity: insightsOpacity }]}>
       <AnalyticsPageShell
@@ -249,7 +313,6 @@ export function InsightsScreen() {
                   <FactorCard
                     key={item.condition}
                     item={item}
-                    baseline={factors.baseline_win_rate}
                     positive
                   />
                 ))
@@ -267,7 +330,6 @@ export function InsightsScreen() {
                   <FactorCard
                     key={item.condition}
                     item={item}
-                    baseline={factors.baseline_win_rate}
                     positive={false}
                   />
                 ))
@@ -350,32 +412,69 @@ function GroupHeading({ label, accent }: { label: string; accent: string }) {
 
 function FactorCard({
   item,
-  baseline,
   positive,
 }: {
   item: FactorItem;
-  baseline: number;
   positive: boolean;
 }) {
   const accent = positive ? result.win : result.loss;
-  const widthPct = Math.max(8, Math.min(100, item.win_rate));
-  const baselinePct = Math.max(0, Math.min(100, baseline));
+  const valueText = item.displayValue ?? String(item.win_rate);
+  const unitText = item.unit ? ` ${item.unit}` : "";
+  const unit = item.unit ?? "";
+  const deltaLabel = peerDeltaLabel(item.win_rate, item.peerMean, unit);
+  const peerLabel =
+    item.peerDisplayValue != null
+      ? `peer ${item.peerDisplayValue}${unitText}`
+      : null;
+
+  const scaleMax = (() => {
+    const parts = [Math.abs(item.win_rate)];
+    if (item.peerMean != null && Number.isFinite(item.peerMean)) {
+      parts.push(Math.abs(item.peerMean) * 2);
+      parts.push(Math.abs(item.peerMean));
+    }
+    const max = Math.max(...parts, 1);
+    return max > 0 ? max : 1;
+  })();
+  const fillPct = Math.max(0, (Math.abs(item.win_rate) / scaleMax) * 100);
+  const peerPct =
+    item.peerMean != null && Number.isFinite(item.peerMean)
+      ? Math.max(0, (Math.abs(item.peerMean) / scaleMax) * 100)
+      : null;
 
   return (
     <EdgeCard style={styles.factorCard}>
       <Text style={styles.factorName}>{item.condition}</Text>
       <View style={styles.factorRow}>
-        <Text style={styles.factorValue}>{item.win_rate}%</Text>
-        <Text style={[styles.factorDelta, { color: accent }]}>
-          {item.diff > 0 ? "+" : ""}
-          {item.diff}% vs baseline
+        <Text style={[styles.factorValue, { color: accent }]}>
+          {valueText}
+          <Text style={styles.factorUnit}>{unitText}</Text>
         </Text>
+        {deltaLabel ? (
+          <Text style={[styles.factorDelta, { color: accent }]}>
+            {deltaLabel}
+          </Text>
+        ) : null}
       </View>
+      {peerLabel ? <Text style={styles.factorPeer}>{peerLabel}</Text> : null}
       <View style={styles.barTrack}>
         <View
-          style={[styles.barFill, { width: `${widthPct}%`, backgroundColor: accent }]}
+          style={[
+            styles.barFill,
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: accent,
+            },
+          ]}
         />
-        <View style={[styles.baselineMark, { left: `${baselinePct}%` }]} />
+        {peerPct != null ? (
+          <View
+            style={[
+              styles.baselineMark,
+              { left: `${Math.min(peerPct, 100)}%` },
+            ]}
+          />
+        ) : null}
       </View>
     </EdgeCard>
   );
@@ -467,9 +566,18 @@ const styles = StyleSheet.create({
     ...type.numberMd,
     color: colors.text,
   },
+  factorUnit: {
+    ...type.caption,
+    color: colors.textMuted,
+    fontFamily: font.sansMedium,
+  },
   factorDelta: {
     ...type.caption,
     fontFamily: font.sansMedium,
+  },
+  factorPeer: {
+    ...type.caption,
+    color: colors.textDim,
   },
   barTrack: {
     height: 6,

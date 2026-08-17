@@ -187,6 +187,28 @@ export async function getCacheAge(key: string): Promise<number | null> {
   }
 }
 
+
+export async function estimateAppCacheBytes(): Promise<number> {
+  try {
+    const keys = await AsyncStorage.getAllKeys();
+    const appKeys = keys.filter(
+      (key) =>
+        key.startsWith("@chess-wrapped:user-games:v1:") ||
+        (key.startsWith(PREFIX) && !key.includes("baselines"))
+    );
+    if (appKeys.length === 0) return 0;
+    const pairs = await AsyncStorage.multiGet(appKeys);
+    let bytes = 0;
+    for (const [key, value] of pairs) {
+      bytes += key.length * 2;
+      if (value) bytes += value.length * 2;
+    }
+    return bytes;
+  } catch {
+    return 0;
+  }
+}
+
 export async function clearAppCache(): Promise<number> {
   clearAllInflight();
   const keys = await AsyncStorage.getAllKeys();

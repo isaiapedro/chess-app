@@ -10,6 +10,7 @@ import {
   filterNormalizedGames,
   loadLocalGamesPage,
   toStudyGameList,
+  studyGamesHaveMoveSources,
   type NormalizedGame,
 } from "../data/platformGames";
 import { yieldForUi } from "../engine/backgroundWork";
@@ -133,6 +134,24 @@ function mergeHeuristicRowsIntoStore(
   return { games };
 }
 
+/** Replace one game's Metrics-tab heuristics with a more accurate Games-analyze pass. */
+export async function upsertHeuristicGame(
+  filters: Pick<QueryFilters, "username" | "platform">,
+  gameId: string,
+  entry: HeuristicGameEntry
+): Promise<void> {
+  const id = String(gameId || "").trim();
+  if (!id || !filters.username?.trim()) return;
+  if (!entry.opening || !entry.middlegame || !entry.endgame) return;
+  const store = await loadHeuristicStore(filters);
+  store.games[id] = {
+    opening: entry.opening,
+    middlegame: entry.middlegame,
+    endgame: entry.endgame,
+  };
+  await saveHeuristicStore(filters, store);
+}
+
 function sliceHeuristicStoreForPeriod(
   store: HeuristicStore,
   periodGames: StudyGame[]
@@ -226,6 +245,7 @@ async function tryRemeshSessionFromRelated(
       GAMES_TTL_MS
     );
     if (!cached?.length) continue;
+    if (!studyGamesHaveMoveSources(cached)) continue;
     await yieldForUi({ heavy: true });
     const filtered = filterNormalizedGames(
       cached as NormalizedGame[],
@@ -349,6 +369,7 @@ export async function ensureSession(
       ]);
       if (
         cachedGames?.length &&
+        studyGamesHaveMoveSources(cachedGames) &&
         derivedMatchesGames(cachedRecap, cachedInsights, cachedGames.length)
       ) {
         return {
@@ -362,11 +383,15 @@ export async function ensureSession(
         rebuildDerived: false,
       });
       if (fromStore) {
-        await writeSessionCaches(period, fromStore);
+        if (studyGamesHaveMoveSources(fromStore.games)) {
+          await writeSessionCaches(period, fromStore);
+        }
         return fromStore;
       }
       const remeshed = await tryRemeshSessionFromRelated(period);
       if (remeshed) return remeshed;
+
+      // Soft never hits network — pull/force own that. Open UI from empty.
       return {
         games: [],
         recap: emptyRecap(period),

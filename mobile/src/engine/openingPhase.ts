@@ -11,6 +11,49 @@ const CENTER_SQUARES: Square[] = ["d4", "e4", "d5", "e5"];
 const WHITE_MINOR_START = new Set<string>(["b1", "g1", "c1", "f1"]);
 const BLACK_MINOR_START = new Set<string>(["b8", "g8", "c8", "f8"]);
 
+const PIECE_START: Record<Color, Record<string, readonly string[]>> = {
+  w: {
+    n: ["b1", "g1"],
+    b: ["c1", "f1"],
+    r: ["a1", "h1"],
+    q: ["d1"],
+    k: ["e1"],
+  },
+  b: {
+    n: ["b8", "g8"],
+    b: ["c8", "f8"],
+    r: ["a8", "h8"],
+    q: ["d8"],
+    k: ["e8"],
+  },
+};
+
+export type OpeningTempoWasteHit = {
+  waste: boolean;
+  piece: string | null;
+};
+
+export function isOpeningTempoWasteMove(
+  board: Chess,
+  move: Pick<
+    Move,
+    "piece" | "from" | "isKingsideCastle" | "isQueensideCastle"
+  >,
+  color: Color
+): OpeningTempoWasteHit {
+  if (move.piece === "p") return { waste: false, piece: null };
+  if (move.isKingsideCastle() || move.isQueensideCastle()) {
+    return { waste: false, piece: null };
+  }
+  if (countMinorsDeveloped(board, color) >= 4) {
+    return { waste: false, piece: move.piece };
+  }
+  const homes = PIECE_START[color][move.piece];
+  if (!homes) return { waste: false, piece: move.piece };
+  if (homes.includes(move.from)) return { waste: false, piece: move.piece };
+  return { waste: true, piece: move.piece };
+}
+
 const ACCURACY_A = 103.1668;
 const ACCURACY_B = 0.04354;
 const ACCURACY_C = 3.1669;
@@ -25,6 +68,17 @@ export type OpeningGameRow = {
   opening_pawn_moves: number;
   accuracy_moves: number;
   phase_end_fullmove: number;
+  /** Coach-only — not on Insights metrics tab. */
+  opening_king_attackers_score?: number | null;
+  opening_king_attackers_rises?: number;
+  opening_opp_king_attackers_score?: number | null;
+  opening_opp_king_attackers_rises?: number;
+  opening_pawn_breaks?: number;
+  opening_defended_pawns?: number;
+  opening_unblocking_bishop_light?: number;
+  opening_unblocking_bishop_dark?: number;
+  opening_checks?: number;
+  opening_blocking_checks?: number;
   user_color?: string;
   opening_eco?: string;
   opening_name?: string;
@@ -256,8 +310,7 @@ export function analyzeOpeningGame(
       );
     }
 
-    if (fullMove > phaseEnd && castleFullmove != null) break;
-    if (fullMove > 40) break;
+    if (fullMove > phaseEnd) break;
   }
 
   if (minorsAt10 == null) {

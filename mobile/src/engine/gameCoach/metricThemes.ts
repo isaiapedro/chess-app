@@ -29,6 +29,9 @@ export const PHASE_METRIC_KEYS: Record<MetricPhaseName, readonly string[]> = {
     "positional.pawn_break",
     "positional.two_weaknesses",
     "positional.restriction",
+    "motif.trapped_piece",
+    "motif.sacrifice",
+    "motif.intermediate_move",
     "imbalance.space",
     "positional.color_complexes",
     "imbalance.bishop_pair",
@@ -74,6 +77,8 @@ export const THEME_TO_METRIC_KEY: Record<string, string> = {
   centre: "imbalance.space",
   center: "imbalance.space",
   sacrifice: "motif.sacrifice",
+  trapped_piece: "motif.trapped_piece",
+  piece_trap: "motif.trapped_piece",
   iqp: "structure.iqp",
   doubled_pawns: "structure.doubled_pawns",
   pawn_chain: "structure.pawn_chain",
@@ -140,6 +145,7 @@ const PHASE_ALLOW = {
     "piece.blockade",
     "attack.opposite_side_castling",
     "motif.sacrifice",
+    "motif.trapped_piece",
   ]),
 };
 

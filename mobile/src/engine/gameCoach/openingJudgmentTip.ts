@@ -9,6 +9,20 @@ import {
   type OpeningPeerJudgment,
   type OpeningPeerSignal,
 } from "./openingCoachInputs";
+import type { DerivedCoachNote } from "./derivedCoachPack";
+import {
+  clauseFromPackNote,
+  lessonFromPackNote,
+  planFromPackNote,
+} from "./packNoteContent";
+import {
+  checkpointEvalOverlay,
+  evalBandFromInputs,
+} from "./evalSwingIndex";
+import { polishCoachProse } from "./coachProse";
+import { openingIdentityPlan } from "./tipCoordinate";
+
+export type PackNoteByKey = Record<string, DerivedCoachNote>;
 
 const MAX_PRAISE = 1;
 const MAX_NUDGE = 1;
@@ -140,12 +154,15 @@ const METRIC_CLAUSE: Partial<
     bad: "challenging their central space before it clamps you",
   },
   queenside_advance: {
-    good: "useful queenside expansion",
+    good: "queenside tension with hanging-pawn contact",
     bad: "preparing queenside space only when the centre is stable",
   },
   kingside_advance: {
     good: "useful kingside expansion",
     bad: "expanding on the kingside only when the centre can hold",
+  },
+  hanging_pawns: {
+    good: "active hanging-pawn tension on the queenside",
   },
 };
 
@@ -178,6 +195,52 @@ const METRIC_CLAUSE_ALTS: Partial<
   },
 };
 
+const FILLER_OPENING_SOFT_KEYS = new Set([
+  "imbalance.space",
+  "piece.centralization",
+  "attack.king_safety",
+]);
+
+const FILLER_OPENING_METRICS = new Set([
+  "space_advantage_pct",
+  "center_control_pct",
+  "minors_developed",
+  "uncastled_rate_pct",
+  "castle_fullmove",
+]);
+
+function identityPraiseClause(openingKeyId: string | null | undefined): string | null {
+  const plan = openingIdentityPlan(openingKeyId);
+  if (!plan) return null;
+  const stripped = plan.replace(/^the\s+[^.]+?\s+plan is\s+/i, "").trim();
+  return stripped || plan;
+}
+
+function identitySignal(
+  openingKeyId: string | null | undefined,
+  openingName?: string | null
+): OpeningPeerSignal | null {
+  if (!openingKeyId || !openingKeyId.startsWith("opening.")) return null;
+  if (/irregular/i.test(String(openingName || ""))) return null;
+  if (!identityPraiseClause(openingKeyId) && !openingIdentityPlan(openingKeyId)) {
+    return null;
+  }
+  return {
+    metric: "opening_identity",
+    peerDelta: null,
+    polarity: "higher_better",
+    judgment: "good",
+    impact: 48,
+    softKeys: [openingKeyId],
+  };
+}
+
+function isOpeningFillerSignal(signal: OpeningPeerSignal): boolean {
+  if (signal.metric === "opening_identity") return false;
+  if (FILLER_OPENING_METRICS.has(signal.metric)) return true;
+  return signal.softKeys.every((k) => FILLER_OPENING_SOFT_KEYS.has(k));
+}
+
 function firstSentence(raw: string): string {
   const t = (raw || "").replace(/\s+/g, " ").trim();
   if (!t) return "";
@@ -190,7 +253,7 @@ function firstSentence(raw: string): string {
  * Rejects book refs, numbers, SAN-ish debris, and overlong lines.
  */
 export function stripPackToClause(raw: string | null | undefined): string | null {
-  let t = firstSentence(raw || "");
+  let t = firstSentence(polishCoachProse(raw || "") || raw || "");
   if (!t) return null;
   t = t.replace(/^[-•*]\s*/, "");
   t = t.replace(/^Apply the lesson:\s*/i, "");
@@ -271,29 +334,50 @@ function pickUnusedAlt(
 function clauseForSignal(
   signal: OpeningPeerSignal,
   softKey: string,
-  packByKey: Record<string, string> | null | undefined,
+  packByKey: PackNoteByKey | null | undefined,
   usedClauses: Set<string>,
   preferRephrase: boolean
 ): string | null {
   const judgment = signal.judgment as Exclude<OpeningPeerJudgment, "ok">;
   if (judgment !== "good" && judgment !== "bad") return null;
 
+  if (
+    (softKey.startsWith("opening.") || signal.metric === "opening_identity") &&
+    judgment === "good"
+  ) {
+    const identity = identityPraiseClause(softKey);
+    if (identity && !usedClauses.has(dedupeKey(identity))) return identity;
+  }
+
   const metricOverride = METRIC_CLAUSE[signal.metric]?.[judgment] ?? null;
   const templ = CLAUSE_TEMPLATES[softKey]?.[judgment] ?? null;
+  const note = packByKey?.[softKey];
   const pack =
     judgment === "bad"
-      ? stripPackToClause(packByKey?.[softKey])
-      : null;
+      ? clauseFromPackNote(note, "bad")
+      : clauseFromPackNote(note, "good");
   const packUsable =
     pack &&
     (pack.length >= 40 ||
       /[,—;]/.test(pack) ||
       /\bbecause\b|\bso that\b/i.test(pack));
 
+  const filler =
+    isOpeningFillerSignal(signal) || FILLER_OPENING_SOFT_KEYS.has(softKey);
+  if (filler) {
+    const fillerHit = [...usedClauses].some((c) =>
+      /usefulspace|gooddevelopment|solidkingsafety|centralizedpieces|roomforyourpieces/.test(
+        c
+      )
+    );
+    if (fillerHit && !metricOverride) return null;
+  }
+
   const candidates: string[] = [];
   if (packUsable && pack) candidates.push(pack);
   if (metricOverride) candidates.push(metricOverride);
-  if (templ) candidates.push(templ);
+  if (templ && !filler) candidates.push(templ);
+  if (templ && filler && !metricOverride) candidates.push(templ);
   if (pack && !packUsable) candidates.push(pack);
 
   const altMetric = METRIC_CLAUSE_ALTS[signal.metric]?.[judgment];
@@ -317,17 +401,17 @@ function clauseForSignal(
   return candidates[0] || null;
 }
 
-function rememberPhrase(clause: string): string {
+export function rememberPhrase(clause: string): string {
   const n = asNudgeLead(clause);
   if (
-    /^(fighting|getting|finishing|claiming|looking|avoiding|castling|meeting|using|gaining|contesting|preparing|countering|hitting|challenging|answering|striking|expanding|bringing|tucking)\b/i.test(
+    /^(fighting|getting|finishing|claiming|looking|avoiding|castling|meeting|using|gaining|contesting|preparing|countering|hitting|challenging|answering|striking|expanding|bringing|tucking|executing|pressing|opening|activating|improving|calculating)\b/i.test(
       n
     )
   ) {
     return `just remember ${n}`;
   }
   if (
-    /^(use|fight|contest|finish|castle|gain|claim|centralize|get|look|avoid|meet|prepare|counter|hit|challenge|answer|strike|expand)\b/i.test(
+    /^(use|fight|contest|finish|castle|gain|claim|centralize|get|look|avoid|meet|prepare|counter|hit|challenge|answer|strike|expand|execute|press|open|activate|improve|calculate)\b/i.test(
       n
     )
   ) {
@@ -336,11 +420,64 @@ function rememberPhrase(clause: string): string {
   return `just remember ${n}`;
 }
 
+/** Opening-grade assemble: lead/core + just remember nudge (+ optional plan). Cap ~3 clauses. */
+export function assembleDialogueTip(args: {
+  lead?: string | null;
+  core?: string | null;
+  nudge?: string | null;
+  plan?: string | null;
+}): string {
+  const lead = (args.lead || "").replace(/\s+/g, " ").trim();
+  const core = (args.core || "").replace(/\s+/g, " ").trim();
+  const nudgeRaw = (args.nudge || "").replace(/\s+/g, " ").trim();
+  const plan = (args.plan || "").replace(/\s+/g, " ").trim();
+
+  const headParts = [lead, core].filter(Boolean);
+  let head = "";
+  if (headParts.length === 1) head = headParts[0]!;
+  else if (headParts.length >= 2) {
+    const a = headParts[0]!;
+    const b = headParts[1]!;
+    head = /[,:;]$/.test(a) || /^[a-z]/.test(b) ? `${a} ${b}` : `${a}, ${b}`;
+  }
+
+  const nudge =
+    nudgeRaw && !/^just remember\b/i.test(nudgeRaw)
+      ? rememberPhrase(nudgeRaw)
+      : nudgeRaw;
+
+  let text = "";
+  if (head && nudge) {
+    text = `${head.replace(/[.!?]+$/, "")}, ${nudge}`;
+  } else if (head) {
+    text = head;
+  } else if (nudge) {
+    text = nudge.charAt(0).toUpperCase() + nudge.slice(1);
+  }
+
+  if (plan) {
+    const planBit = plan.replace(/[.!?]+$/, "").trim();
+    const planLow = planBit.charAt(0).toLowerCase() + planBit.slice(1);
+    if (text && !text.toLowerCase().includes(planLow.slice(0, 24).toLowerCase())) {
+      text = `${text.replace(/[.!?]+$/, "")}; typical idea: ${planLow}`;
+    } else if (!text) {
+      text = `Typical idea: ${planLow}`;
+    }
+  }
+
+  text = polishCoachProse(text.replace(/\s+/g, " ").trim());
+  if (text) {
+    text = text.charAt(0).toUpperCase() + text.slice(1);
+    if (!/[.!?]$/.test(text)) text = `${text}.`;
+  }
+  return text.slice(0, 420);
+}
+
 function collectClauses(
   signals: OpeningPeerSignal[],
   judgment: "good" | "bad",
   cap: number,
-  packByKey: Record<string, string> | null | undefined,
+  packByKey: PackNoteByKey | null | undefined,
   used: ReturnType<typeof priorSets>,
   preferRephrase: boolean
 ): { clauses: string[]; softKeys: string[]; metrics: string[] } {
@@ -383,11 +520,11 @@ function joinPraise(parts: string[]): string {
   return `${parts.slice(0, -1).join(", ")}, and ${parts[parts.length - 1]}`;
 }
 
-function asNudgeLead(clause: string): string {
+export function asNudgeLead(clause: string): string {
   const trimmed = clause.replace(/[.!?]+$/, "").trim();
   const lower = trimmed.charAt(0).toLowerCase() + trimmed.slice(1);
   if (
-    /^(use|fight|fighting|contest|finish|finishing|castle|castling|gain|claim|claiming|centralize|get|getting|look|looking|avoid|avoiding|meet|meeting|prepare|preparing|counter|countering|hit|hitting|challenge|challenging|answer|answering|strike|striking|expand|expanding|bring|bringing|tuck|tucking)\b/i.test(
+    /^(use|fight|fighting|contest|finish|finishing|castle|castling|gain|claim|claiming|centralize|get|getting|look|looking|avoid|avoiding|meet|meeting|prepare|preparing|counter|countering|hit|hitting|challenge|challenging|answer|answering|strike|striking|expand|expanding|bring|bringing|tuck|tucking|execute|executing|press|pressing|open|opening|activate|activating|improve|improving|calculate|calculating)\b/i.test(
       trimmed
     )
   ) {
@@ -407,20 +544,32 @@ function enrichNudgeWithSpace(nudge: string, hasSpaceBad: boolean): string {
 
 function openingPlanClause(
   openingKeyId: string | null | undefined,
-  packByKey?: Record<string, string> | null,
+  packByKey?: PackNoteByKey | null,
   usedClauses?: Set<string>
 ): string | null {
   if (!openingKeyId || !openingKeyId.startsWith("opening.")) return null;
-  const pack = stripPackToClause(packByKey?.[openingKeyId]);
-  if (!pack) return null;
-  if (/irregular/i.test(pack)) return null;
-  const lead = asNudgeLead(pack);
+  const note = packByKey?.[openingKeyId];
+  const pack =
+    planFromPackNote(note) ||
+    lessonFromPackNote(note) ||
+    null;
+  const identity = openingIdentityPlan(openingKeyId);
+  const praise = identityPraiseClause(openingKeyId);
+  if (praise && usedClauses?.has(dedupeKey(praise))) return null;
+  if (identity && usedClauses?.has(dedupeKey(identity))) return null;
+  const raw = pack && !/irregular/i.test(pack) ? pack : identity;
+  if (!raw) return null;
+  if (/irregular/i.test(raw)) return null;
+  const lead = asNudgeLead(raw);
   if (usedClauses?.has(dedupeKey(lead))) return null;
+  if (praise && dedupeKey(lead).includes(dedupeKey(praise).slice(0, 24))) {
+    return null;
+  }
   return lead;
 }
 
 function principlePlanClause(
-  packByKey?: Record<string, string> | null,
+  packByKey?: PackNoteByKey | null,
   usedClauses?: Set<string>
 ): string | null {
   const keys = [
@@ -429,7 +578,11 @@ function principlePlanClause(
     "piece.centralization",
   ];
   for (const k of keys) {
-    const pack = stripPackToClause(packByKey?.[k]);
+    const note = packByKey?.[k];
+    const pack =
+      planFromPackNote(note) ||
+      lessonFromPackNote(note) ||
+      null;
     if (!pack) continue;
     const lead = asNudgeLead(pack);
     if (usedClauses?.has(dedupeKey(lead))) continue;
@@ -522,27 +675,45 @@ export function composeOpeningJudgmentTipDetailed(args: {
   inputs?: Record<string, string | number | boolean | null> | null;
   openingName?: string | null;
   openingKeyId?: string | null;
-  packByKey?: Record<string, string> | null;
+  packByKey?: PackNoteByKey | null;
   priorTopics?: OpeningTipPrior | null;
   /** Override peer signals (middlegame weave uses MG peer gaps). */
   signals?: OpeningPeerSignal[] | null;
 }): OpeningJudgmentTipResult {
   const used = priorSets(args.priorTopics);
   const preferUnused = Boolean(args.priorTopics?.softKeys?.length);
-  const signals = args.signals?.length
-    ? [...args.signals].sort(
-        (a, b) =>
-          Math.abs(b.impact) - Math.abs(a.impact) ||
-          a.metric.localeCompare(b.metric)
-      )
-    : buildOpeningPeerSignals(args.inputs)
-        .slice()
-        .sort((a, b) => {
-          const aUsed = a.softKeys.some((k) => used.softKeys.has(k)) ? 1 : 0;
-          const bUsed = b.softKeys.some((k) => used.softKeys.has(k)) ? 1 : 0;
-          if (preferUnused && aUsed !== bUsed) return aUsed - bUsed;
-          return Math.abs(b.impact) - Math.abs(a.impact);
-        });
+  const identity = identitySignal(args.openingKeyId, args.openingName);
+  const rawSignals = args.signals?.length
+    ? [...args.signals]
+    : buildOpeningPeerSignals(args.inputs);
+  const hasIdentity = Boolean(identity);
+  const hasAdvance = rawSignals.some(
+    (s) =>
+      s.metric === "queenside_advance" ||
+      s.metric === "kingside_advance" ||
+      s.metric === "hanging_pawns"
+  );
+  const filtered = rawSignals.filter((s) => {
+    if (!hasIdentity && !hasAdvance) return true;
+    if (isOpeningFillerSignal(s)) return false;
+    return true;
+  });
+  if (identity) filtered.unshift(identity);
+  const signals = filtered.sort((a, b) => {
+    const aId = a.metric === "opening_identity" ? 0 : 1;
+    const bId = b.metric === "opening_identity" ? 0 : 1;
+    if (aId !== bId) return aId - bId;
+    const aAdv = isOpeningFillerSignal(a) ? 1 : 0;
+    const bAdv = isOpeningFillerSignal(b) ? 1 : 0;
+    if (hasIdentity && aAdv !== bAdv) return aAdv - bAdv;
+    const aUsed = a.softKeys.some((k) => used.softKeys.has(k)) ? 1 : 0;
+    const bUsed = b.softKeys.some((k) => used.softKeys.has(k)) ? 1 : 0;
+    if (preferUnused && aUsed !== bUsed) return aUsed - bUsed;
+    return (
+      Math.abs(b.impact) - Math.abs(a.impact) ||
+      a.metric.localeCompare(b.metric)
+    );
+  });
 
   const praisePack = collectClauses(
     signals,
@@ -581,17 +752,26 @@ export function composeOpeningJudgmentTipDetailed(args: {
   const planUsed = new Set(used.clauses);
   for (const c of praisePack.clauses) planUsed.add(dedupeKey(c));
   for (const c of nudges) planUsed.add(dedupeKey(c));
-  const plan = namedOpening
+  const band = evalBandFromInputs(args.inputs);
+  const overlay = checkpointEvalOverlay(band, "opening");
+  let plan = namedOpening
     ? openingPlanClause(args.openingKeyId, args.packByKey, planUsed)
     : null;
+  if (band === "losing" || band === "worse") {
+    plan = overlay.plan || plan;
+  } else {
+    plan = plan || overlay.plan;
+  }
 
   const usedSoftKeys = [...praisePack.softKeys, ...nudgePack.softKeys];
   const usedMetrics = [...praisePack.metrics, ...nudgePack.metrics];
+  if (band !== "unknown") usedMetrics.push(`eval:${band}`);
   const usedClauses = [
     ...praisePack.clauses.map(dedupeKey),
     ...nudges.map(dedupeKey),
   ];
   const topics: string[] = [];
+  if (band !== "unknown") topics.push(`eval:${band}`);
   if (advTopic && !used.topics.has(advTopic)) topics.push(advTopic);
 
   if (!nudges.length && advTopic && !used.topics.has(advTopic)) {
@@ -599,6 +779,10 @@ export function composeOpeningJudgmentTipDetailed(args: {
     usedSoftKeys.push("imbalance.space");
     usedClauses.push(dedupeKey(nudges[0]!));
     if (!topics.includes(advTopic)) topics.push(advTopic);
+  }
+  if (!nudges.length && overlay.lessonHint && (band === "winning" || band === "losing")) {
+    nudges = [overlay.lessonHint];
+    usedClauses.push(dedupeKey(nudges[0]!));
   }
 
   if (plan) {
@@ -608,24 +792,43 @@ export function composeOpeningJudgmentTipDetailed(args: {
 
   let text: string;
   const praise = praisePack.clauses;
+  const planLabel =
+    band === "winning" || band === "losing" ? "plan" : "typical idea";
 
   if (praise.length && nudges.length) {
-    const head = joinPraise(praise);
+    let head = joinPraise(praise);
+    if (overlay.leadPrefix) {
+      head = `${overlay.leadPrefix} — ${head.charAt(0).toLowerCase()}${head.slice(1)}`;
+    }
     const nudgeBit = rememberPhrase(nudges[0]!);
     text =
       plan && !used.topics.has("opening_plan")
-        ? `${head}, ${nudgeBit}; typical idea: ${plan}`
+        ? `${head}, ${nudgeBit}; ${planLabel}: ${plan}`
         : `${head}, ${nudgeBit}`;
   } else if (praise.length && plan) {
-    text = `${joinPraise(praise)}; typical idea: ${plan}`;
+    let head = joinPraise(praise);
+    if (overlay.leadPrefix) {
+      head = `${overlay.leadPrefix} — ${head.charAt(0).toLowerCase()}${head.slice(1)}`;
+    }
+    text = `${head}; ${planLabel}: ${plan}`;
   } else if (praise.length) {
-    text = `${joinPraise(praise)} — keep building on that`;
+    let head = joinPraise(praise);
+    if (overlay.leadPrefix) {
+      head = `${overlay.leadPrefix} — ${head.charAt(0).toLowerCase()}${head.slice(1)}`;
+    }
+    text = `${head}. Keep building on that`;
   } else if (nudges.length) {
     const remembered = rememberPhrase(nudges[0]!);
-    text = remembered.charAt(0).toUpperCase() + remembered.slice(1);
-    if (plan) text = `${text}; typical idea: ${plan}`;
+    text = overlay.leadPrefix
+      ? `${overlay.leadPrefix}; ${remembered}`
+      : remembered.charAt(0).toUpperCase() + remembered.slice(1);
+    if (plan) text = `${text}; ${planLabel}: ${plan}`;
+  } else if (overlay.leadPrefix && plan) {
+    text = `${overlay.leadPrefix}; ${planLabel}: ${plan}`;
   } else if (plan) {
-    text = `Typical idea: ${plan}`;
+    text = `${planLabel.charAt(0).toUpperCase()}${planLabel.slice(1)}: ${plan}`;
+  } else if (overlay.leadPrefix) {
+    text = overlay.leadPrefix;
   } else if (args.openingKeyId) {
     text =
       "Follow the usual plans: develop, castle, and fight for the centre.";
@@ -634,8 +837,12 @@ export function composeOpeningJudgmentTipDetailed(args: {
       "Develop the minors, castle, and contest the centre before launching a plan.";
   }
 
+  text = text.replace(/\s+/g, " ").trim();
+  if (text && !/[.!?]$/.test(text)) text = `${text}.`;
+  if (text) text = text.charAt(0).toUpperCase() + text.slice(1);
+
   return {
-    text,
+    text: text.slice(0, 420),
     softKeys: [...new Set(usedSoftKeys)],
     metrics: [...new Set(usedMetrics)],
     clauses: [...new Set(usedClauses.filter(Boolean))],
@@ -650,7 +857,7 @@ export function composeOpeningJudgmentTip(args: {
   inputs?: Record<string, string | number | boolean | null> | null;
   openingName?: string | null;
   openingKeyId?: string | null;
-  packByKey?: Record<string, string> | null;
+  packByKey?: PackNoteByKey | null;
   priorTopics?: OpeningTipPrior | null;
 }): string {
   return composeOpeningJudgmentTipDetailed(args).text;

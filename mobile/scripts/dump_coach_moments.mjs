@@ -61,6 +61,7 @@ import {
   tacticalFactInputs,
 } from "../src/engine/gameCoach/tacticalFact.ts";
 import { rankLinesByStm } from "../src/engine/gameCoach/tacticSharpness.ts";
+import { classifyCoachMark } from "../src/engine/gameCoach/coachMarkClassify.ts";
 import { phaseForCoachMoment } from "../src/engine/gameCoach/phaseSplits.ts";
 import {
   buildCommentRefs,
@@ -172,6 +173,8 @@ function phaseForPly(ply, coach, structuralKind) {
 }
 
 function markFromMoment(moment) {
+  const praise = moment?.inputs?.praise_mark;
+  if (praise === "brilliant") return "brilliant";
   const s = moment?.severity;
   if (
     s === "blunder" ||
@@ -186,6 +189,91 @@ function markFromMoment(moment) {
     return s;
   }
   return null;
+}
+
+function engineRowAtPly(engineRows, ply1) {
+  if (ply1 == null) return null;
+  const hit = engineRows.find((r) => r && Number(r.ply) === Number(ply1));
+  if (hit) return hit;
+  return engineRows[Number(ply1) - 1] || null;
+}
+
+function injectMissingBrilliantMoments(args) {
+  const { coach, engineRows, historySans, userColor } = args;
+  const byPly = coach.momentsByPly;
+  if (!byPly || !Array.isArray(historySans)) return;
+  for (let i = 0; i < historySans.length; i++) {
+    const ply1 = i + 1;
+    const whiteMove = i % 2 === 0;
+    const isUser = userColor === "white" ? whiteMove : !whiteMove;
+    if (!isUser) continue;
+    const existing = byPly[ply1] || byPly[String(ply1)] || null;
+    if (markFromMoment(existing) === "brilliant") continue;
+    const row = engineRowAtPly(engineRows, ply1);
+    const next = engineRowAtPly(engineRows, ply1 + 1);
+    if (!row?.fen) continue;
+    const playedSan = historySans[i];
+    const rawLines = Array.isArray(row.lines) ? row.lines : [];
+    const lines = rawLines.length ? rankLinesByStm(row.fen, rawLines) : [];
+    const pv1 = lines[0]?.san || row.bestSan || null;
+    const playedBest = Boolean(pv1 && playedSan && pv1 === playedSan);
+    const mark = classifyCoachMark({
+      side: userColor,
+      evalBeforeCp: row.cpWhite ?? null,
+      evalAfterCp: next?.cpWhite ?? null,
+      playedBest,
+      lines,
+      fenBefore: row.fen,
+      playedSan,
+    });
+    if (mark !== "brilliant") continue;
+    const praiseInputs = {
+      ...(existing?.inputs || {}),
+      praise_mark: "brilliant",
+    };
+    if (existing) {
+      existing.inputs = praiseInputs;
+      continue;
+    }
+    byPly[ply1] = {
+      ply: ply1,
+      moveNumber: Math.floor(i / 2) + 1,
+      severity: null,
+      dropCp: 35,
+      playedSan,
+      bestSan: pv1 || playedSan,
+      fen: row.fen,
+      evalBeforeCp: row.cpWhite,
+      evalAfterCp: next?.cpWhite,
+      source: "live",
+      inputs: praiseInputs,
+    };
+  }
+}
+
+function reconstructDumpMark(args) {
+  const { moment, engineRows, historySans, userColor } = args;
+  const existing = markFromMoment(moment);
+  if (existing) return existing;
+  const ply1 = Number(moment?.ply);
+  if (!Number.isFinite(ply1) || ply1 < 1) return null;
+  const row = engineRowAtPly(engineRows, ply1);
+  const next = engineRowAtPly(engineRows, ply1 + 1);
+  const playedSan = moment.playedSan || historySans[ply1 - 1];
+  if (!row?.fen || !playedSan) return null;
+  const rawLines = Array.isArray(row.lines) ? row.lines : [];
+  const lines = rawLines.length ? rankLinesByStm(row.fen, rawLines) : [];
+  const pv1 = lines[0]?.san || row.bestSan || moment.bestSan || null;
+  const playedBest = Boolean(pv1 && playedSan && pv1 === playedSan);
+  return classifyCoachMark({
+    side: userColor,
+    evalBeforeCp: moment.evalBeforeCp ?? row.cpWhite ?? null,
+    evalAfterCp: moment.evalAfterCp ?? next?.cpWhite ?? null,
+    playedBest,
+    lines,
+    fenBefore: row.fen,
+    playedSan,
+  });
 }
 
 function loadPackEntries() {
@@ -307,7 +395,29 @@ function enrichRequestFromMomentInputs(req, moment) {
   );
   return {
     ...req,
-    inputs: { ...(req.inputs || {}), ...inputs },
+    inputs: {
+      ...(req.inputs || {}),
+      ...inputs,
+      ...(req.inputs?.played_tempo_waste
+        ? {
+            played_tempo_waste: req.inputs.played_tempo_waste,
+            played_tempo_piece: req.inputs.played_tempo_piece ?? null,
+            tempo_waste_rate_pct: req.inputs.tempo_waste_rate_pct ?? 1,
+          }
+        : {}),
+      ...(req.inputs?.undeveloped_minors != null
+        ? { undeveloped_minors: req.inputs.undeveloped_minors }
+        : {}),
+      ...(req.inputs?.minors_developed != null
+        ? { minors_developed: req.inputs.minors_developed }
+        : {}),
+      ...(req.inputs?.opp_king_in_centre != null
+        ? { opp_king_in_centre: req.inputs.opp_king_in_centre }
+        : {}),
+      ...(req.inputs?.opp_king_uncastled != null
+        ? { opp_king_uncastled: req.inputs.opp_king_uncastled }
+        : {}),
+    },
     engineLineSans: req.engineLineSans.length
       ? req.engineLineSans
       : engineLineSans,
@@ -349,7 +459,7 @@ function dumpMomentCommentRefs(row) {
   lines.push("═".repeat(72));
   lines.push(
     `MOMENT ply=${moment.ply} move=${moment.moveNumber ?? "?"} ` +
-      `mark=${moment.severity ?? "—"} structuralKind=${moment.structuralKind ?? "—"} ` +
+      `mark=${row.mark ?? moment.severity ?? "—"} structuralKind=${moment.structuralKind ?? "—"} ` +
       `phase=${phase} dropCp=${moment.dropCp ?? 0}`
   );
   lines.push(
@@ -386,7 +496,7 @@ function dumpMoment(row) {
   lines.push("═".repeat(72));
   lines.push(
     `MOMENT ply=${moment.ply} move=${moment.moveNumber ?? "?"} ` +
-      `mark=${moment.severity ?? "—"} structuralKind=${moment.structuralKind ?? "—"} ` +
+      `mark=${row.mark ?? moment.severity ?? "—"} structuralKind=${moment.structuralKind ?? "—"} ` +
       `source=${moment.source ?? "—"} dropCp=${moment.dropCp ?? 0}`
   );
   lines.push("─".repeat(72));
@@ -683,6 +793,17 @@ function main() {
     process.exit(1);
   }
   const userColor = data.userColor === "white" ? "white" : "black";
+  const hadEgAdv =
+    data.style?.had_endgame_advantage ??
+    data.coach?.style?.had_endgame_advantage ??
+    coach.had_endgame_advantage;
+  if (hadEgAdv) {
+    for (const m of Object.values(coach.momentsByPly)) {
+      if (m?.structuralKind === "middlegame_aggregate") {
+        m.inputs = { ...(m.inputs || {}), had_endgame_advantage: true };
+      }
+    }
+  }
 
   let pgnPath = absPath(args.pgnPath);
   if (!pgnPath) {
@@ -739,18 +860,31 @@ function main() {
     return engineRows[idx]?.cpWhite ?? null;
   }
 
+  const historySans = Array.isArray(data.sans) ? data.sans.filter(Boolean) : [];
+  injectMissingBrilliantMoments({
+    coach,
+    engineRows,
+    historySans,
+    userColor,
+  });
   const moments = Object.values(coach.momentsByPly).sort(
     (a, b) => (a.ply || 0) - (b.ply || 0)
   );
-
-  const historySans = Array.isArray(data.sans) ? data.sans.filter(Boolean) : [];
   const rows = [];
   let openingPriorTopics = null;
   let gamePlan = emptyGamePlanState(openingKeyId);
   let stickySituations = [];
   for (const moment of moments) {
     const phase = phaseForPly(moment.ply, coach, moment.structuralKind);
-    const mark = markFromMoment(moment);
+    const mark = reconstructDumpMark({
+      moment,
+      engineRows,
+      historySans,
+      userColor,
+    });
+    if (Number(moment.ply) === historySans.length) {
+      moment.inputs = { ...(moment.inputs || {}), game_over: true };
+    }
     const engineSans = String(moment.inputs?.engine_line || "")
       .split(/\s+/)
       .filter(Boolean);

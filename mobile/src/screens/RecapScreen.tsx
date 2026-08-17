@@ -36,7 +36,22 @@ import {
   peerTimeInvestedCaption,
   ratingBand,
 } from "../data/baselines";
+import { AppIcon } from "../icons";
+import {
+  BookOpenText,
+  Clapperboard,
+  Ruler,
+  Weight,
+} from "lucide-react-native";
+import type { LucideIcon } from "lucide-react-native";
 import { colors, font, radius, result, spacing, type } from "../theme";
+
+const COMPARISON_ICONS: Record<string, LucideIcon> = {
+  "book-open-text": BookOpenText,
+  ruler: Ruler,
+  weight: Weight,
+  clapperboard: Clapperboard,
+};
 
 function debugRecapLog(
   message: string,
@@ -68,16 +83,32 @@ function debugRecapLog(
 }
 
 const STREAK_OUTLINE_COLOR = "#7C2D12";
-const STREAK_OUTLINE = [
-  [-1, -1],
-  [0, -1],
-  [1, -1],
-  [-1, 0],
-  [1, 0],
-  [-1, 1],
-  [0, 1],
-  [1, 1],
-] as const;
+
+function streakOutlineOffsets(px: number): [number, number][] {
+  const out: [number, number][] = [];
+  for (let dx = -px; dx <= px; dx += 1) {
+    for (let dy = -px; dy <= px; dy += 1) {
+      if (dx === 0 && dy === 0) continue;
+      out.push([dx, dy]);
+    }
+  }
+  return out;
+}
+
+function streakTypeSize(n: number): {
+  fontSize: number;
+  lineHeight: number;
+  letterSpacing: number;
+  outlinePx: number;
+} {
+  if (n >= 1000)
+    return { fontSize: 14, lineHeight: 14, letterSpacing: -0.6, outlinePx: 1 };
+  if (n >= 100)
+    return { fontSize: 16, lineHeight: 16, letterSpacing: -0.5, outlinePx: 1 };
+  if (n >= 10)
+    return { fontSize: 20, lineHeight: 20, letterSpacing: -0.3, outlinePx: 2 };
+  return { fontSize: 26, lineHeight: 26, letterSpacing: -0.3, outlinePx: 2 };
+}
 
 const PERIOD_NOUN: Record<Period, string> = {
   all: "Story",
@@ -138,7 +169,7 @@ export function RecapScreen() {
     setRefreshing(true);
     setError(null);
     try {
-      await refreshAnalytics(false);
+      await refreshAnalytics("pull");
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to load recap");
     } finally {
@@ -157,8 +188,13 @@ export function RecapScreen() {
       ),
     };
 
+    const speedFilter = normalizeSpeed(speed);
     const peerSpeed =
-      normalizeSpeed(speed) ||
+      speedFilter ||
+      normalizeSpeed(
+        Object.entries(data.headline?.games_by_speed || {})
+          .sort((a, b) => (b[1] || 0) - (a[1] || 0))[0]?.[0]
+      ) ||
       normalizeSpeed(
         Object.entries(data.rating_series_by_speed || {})
           .sort(
@@ -168,17 +204,33 @@ export function RecapScreen() {
     const band = ratingBand(base.currentRating ?? base.peakRating);
     if (!baselines?.available || !band || !peerSpeed) return withWdl;
 
+    const gamesForPeer = speedFilter
+      ? Number(data.headline?.total_games ?? base.gamesCount ?? 0)
+      : Number(
+          data.headline?.games_by_speed?.[peerSpeed] ??
+            data.headline?.total_games ??
+            base.gamesCount ??
+            0
+        );
+    const activitySecondsForPeer = speedFilter
+      ? Number(data.headline?.activity_est_seconds ?? 0)
+      : Number(
+          data.headline?.activity_est_seconds_by_speed?.[peerSpeed] ??
+            data.headline?.activity_est_seconds ??
+            0
+        );
+
     const gamesCaption = peerGamesPlayedCaption(
       baselines,
-      Number(data.headline?.total_games ?? base.gamesCount ?? 0),
+      gamesForPeer,
       band,
       peerSpeed,
       period
     );
     const timeCaption = peerTimeInvestedCaption(
       baselines,
-      Number(data.headline?.total_hours ?? 0),
-      Number(data.headline?.total_games ?? base.gamesCount ?? 0),
+      activitySecondsForPeer / 3600,
+      gamesForPeer,
       band,
       peerSpeed,
       period
@@ -197,6 +249,12 @@ export function RecapScreen() {
       }),
     };
   }, [baselines, data, period, speed]);
+  const streakGlyph = view
+    ? (() => {
+        const { outlinePx, ...glyph } = streakTypeSize(view.currentWinStreak);
+        return { outlinePx, glyph };
+      })()
+    : null;
   const badge = view?.badges[activeBadge];
   const periodNoun = PERIOD_NOUN[period];
 
@@ -259,22 +317,33 @@ export function RecapScreen() {
                 {view.ratingChange}
               </Pill>
             ) : null}
-            {view.currentWinStreak >= 2 ? (
+            {view.currentWinStreak >= 2 && streakGlyph ? (
               <View style={styles.streakBadge}>
                 <Text style={styles.streakFire}>🔥</Text>
                 <View style={styles.streakCountWrap}>
-                  {STREAK_OUTLINE.map(([dx, dy]) => (
+                  <View style={styles.streakCountInner}>
+                    {streakOutlineOffsets(streakGlyph.outlinePx).map(
+                      ([dx, dy]) => (
+                        <Text
+                          key={`${dx},${dy}`}
+                          allowFontScaling={false}
+                          style={[
+                            styles.streakCountOutline,
+                            streakGlyph.glyph,
+                            { left: dx, top: dy },
+                          ]}
+                        >
+                          {view.currentWinStreak}
+                        </Text>
+                      )
+                    )}
                     <Text
-                      key={`${dx},${dy}`}
-                      style={[
-                        styles.streakCountOutline,
-                        { transform: [{ translateX: dx }, { translateY: dy }] },
-                      ]}
+                      allowFontScaling={false}
+                      style={[styles.streakCount, streakGlyph.glyph]}
                     >
                       {view.currentWinStreak}
                     </Text>
-                  ))}
-                  <Text style={styles.streakCount}>{view.currentWinStreak}</Text>
+                  </View>
                 </View>
               </View>
             ) : null}
@@ -336,16 +405,26 @@ export function RecapScreen() {
       <View style={styles.sectionPad}>
         <SectionLabel>Time spent instead</SectionLabel>
         <View style={styles.grid}>
-          {view.comparisons.map((item) => (
-            <EdgeCard key={item.label} style={styles.gridCard}>
-              <Text style={styles.compIcon}>{item.icon}</Text>
-              <Text style={[styles.compValue, item.small && styles.compValueSmall]}>
-                {item.value}
-              </Text>
-              <Text style={styles.compLabel}>{item.label}</Text>
-              <Text style={styles.compSub}>{item.sub}</Text>
-            </EdgeCard>
-          ))}
+          {view.comparisons.map((item) => {
+            const CompIcon = COMPARISON_ICONS[item.icon];
+            return (
+              <EdgeCard key={item.label} style={styles.gridCard}>
+                {CompIcon ? (
+                  <AppIcon
+                    icon={CompIcon}
+                    size={18}
+                    color={colors.textMuted}
+                    style={styles.compIcon}
+                  />
+                ) : null}
+                <Text style={[styles.compValue, item.small && styles.compValueSmall]}>
+                  {item.value}
+                </Text>
+                <Text style={styles.compLabel}>{item.label}</Text>
+                <Text style={styles.compSub}>{item.sub}</Text>
+              </EdgeCard>
+            );
+          })}
         </View>
       </View>
       </ScrollView>
@@ -439,39 +518,42 @@ const styles = StyleSheet.create({
     marginBottom: 8,
     alignItems: "center",
     justifyContent: "flex-end",
+    overflow: "visible",
   },
   streakFire: {
     fontSize: 48,
     lineHeight: 50,
-    opacity: 0.9,
+    opacity: 0.8,
   },
   streakCountWrap: {
     position: "absolute",
     left: 0,
     right: 0,
-    bottom: 4,
+    top: 0,
+    bottom: 0,
     alignItems: "center",
-    justifyContent: "flex-end",
+    justifyContent: "center",
+    paddingTop: 8,
+    overflow: "visible",
     zIndex: 2,
+  },
+  streakCountInner: {
+    position: "relative",
+    overflow: "visible",
   },
   streakCountOutline: {
     position: "absolute",
-    left: 0,
-    right: 0,
-    textAlign: "center",
     color: STREAK_OUTLINE_COLOR,
     fontFamily: font.sansBold,
-    fontSize: 26,
-    lineHeight: 29,
     fontVariant: ["tabular-nums"],
+    includeFontPadding: false,
   },
   streakCount: {
     color: "#FFF7ED",
     fontFamily: font.sansBold,
-    fontSize: 26,
-    lineHeight: 29,
     textAlign: "center",
     fontVariant: ["tabular-nums"],
+    includeFontPadding: false,
     zIndex: 1,
   },
   grid: {
@@ -523,8 +605,6 @@ const styles = StyleSheet.create({
     color: colors.textSoft,
   },
   compIcon: {
-    color: colors.textMuted,
-    fontSize: 16,
     marginBottom: 8,
   },
   compValue: {

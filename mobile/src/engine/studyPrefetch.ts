@@ -14,7 +14,7 @@ import {
   GLOBAL_FIRST_SCAN_MAX_GAMES,
   TARGET_MISTAKE_MOMENTS,
 } from "./analysisConfig";
-import { candidateKey, consumeCandidates } from "./candidateBucket";
+import { candidateKey, loadConsumedKeys } from "./candidateBucket";
 import { DEBUG_DISABLE_BACKGROUND_JOBS } from "./debugFlags";
 import {
   createEvalLookup,
@@ -192,28 +192,11 @@ export async function prioritizeRecentMistakesInCache(options: {
         }
       : storedSession;
   const solved = await loadSolvedMistakeKeys(filters);
-
-  if (session?.moments.length) {
-    if (session.moments.length >= TARGET_MISTAKE_MOMENTS) {
-      const capped = capMistakeMoments(session.moments);
-      await saveMistakesSession(filters, {
-        sessionId: mistakesSessionId(),
-        moments: capped,
-        completedKeys: session.completedKeys || [],
-      });
-      const cached = parseMistakesCachePayload(
-        await readMistakesCacheForPeriod(
-          filters,
-          games.map((game) => String(game.id))
-        )
-      );
-      if (!cached) return null;
-      return {
-        ...cached,
-        moments: capped,
-      };
-    }
-  }
+  const vault = await loadPermanentEvalStore(filters);
+  const excludeKeys = new Set([
+    ...solved,
+    ...(vault.consumedMistakeKeys || []),
+  ]);
 
   const cached = parseMistakesCachePayload(
     await readMistakesCacheForPeriod(
@@ -225,12 +208,11 @@ export async function prioritizeRecentMistakesInCache(options: {
 
   const baseMoments = session?.moments.length
     ? session.moments
-    : filterUnsolvedMoments(cached?.moments || [], solved);
+    : filterUnsolvedMoments(cached?.moments || [], excludeKeys);
   const existingKeys = new Set(baseMoments.map((item) => candidateKey(item)));
-  const vault = await loadPermanentEvalStore(filters);
   const fresh = filterUnsolvedMoments(
     collectFreshRecentCandidates(games, vault, existingKeys),
-    solved
+    excludeKeys
   );
 
   let nextMoments = baseMoments;
@@ -284,8 +266,7 @@ export async function prioritizeRecentMistakesInCache(options: {
     });
     if (signal?.cancelled) return null;
     if (batch.moments.length) {
-      await consumeCandidates(filters, "mistake", batch.moments);
-      nextMoments = mergeSessionMoments(nextMoments, batch.moments, solved);
+      nextMoments = mergeSessionMoments(nextMoments, batch.moments, excludeKeys);
       nextPending = batch.pendingCandidates.length
         ? batch.pendingCandidates
         : nextPending;
@@ -304,9 +285,11 @@ export async function prioritizeRecentMistakesInCache(options: {
     }
   }
 
-  nextMoments = capMistakeMoments(nextMoments);
-  nextPending = filterUnsolvedMoments(nextPending, solved);
-  nextDeferred = filterUnsolvedMoments(nextDeferred, solved);
+  nextMoments = session?.moments.length
+    ? nextMoments
+    : capMistakeMoments(nextMoments);
+  nextPending = filterUnsolvedMoments(nextPending, excludeKeys);
+  nextDeferred = filterUnsolvedMoments(nextDeferred, excludeKeys);
   if (!session?.moments.length) {
     const ordered = orderMomentsByRecentGames(nextMoments, games);
     if (
@@ -465,26 +448,30 @@ export async function prefetchStudyContent(options: {
           fetchExplorer: explorer,
         });
         if (signal.cancelled || !batch.moments.length) return false;
-        await consumeCandidates(filters, "mistake", batch.moments);
+        const solved = await loadSolvedMistakeKeys(filters);
+        const consumed = await loadConsumedKeys(filters);
+        const excludeKeys = new Set([...solved, ...consumed.mistake]);
+        const existingSession = await loadMistakesSession(filters);
+        const fresh = orderMomentsByRecentGames(
+          filterUnsolvedMoments(batch.moments, excludeKeys),
+          allGames
+        );
+        const moments = existingSession?.moments.length
+          ? mergeSessionMoments(existingSession.moments, fresh, excludeKeys)
+          : capMistakeMoments(fresh);
         const reservoir = await periodReservoirStatus(
           filters,
           games,
           "mistake",
           { pendingCount: batch.pendingCandidates.length }
         );
-        const solved = await loadSolvedMistakeKeys(filters);
-        const existingSession = await loadMistakesSession(filters);
-        const fresh = orderMomentsByRecentGames(
-          filterUnsolvedMoments(batch.moments, solved),
-          allGames
+        const pending = filterUnsolvedMoments(
+          batch.pendingCandidates,
+          new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
         );
-        const moments = existingSession?.moments.length
-          ? mergeSessionMoments(existingSession.moments, fresh, solved)
-          : capMistakeMoments(fresh);
-        const pending = filterUnsolvedMoments(batch.pendingCandidates, solved);
         const deferred = filterUnsolvedMoments(
           batch.deferredCandidates || [],
-          solved
+          new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
         );
         await writeCache(studyMistakesCacheKey(filters), {
           moments,

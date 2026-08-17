@@ -190,9 +190,7 @@ def analyze_opening_game(
             wp_after = win_probability_from_cp(after_user) * 100.0
             accuracy_samples.append(move_accuracy_pct(wp_before, wp_after))
 
-        if full_move > phase_end and castle_fullmove is not None:
-            break
-        if full_move > 40:
+        if full_move > phase_end:
             break
 
     if minors_at_10 is None:

@@ -22,6 +22,11 @@ import {
   TARGET_MISTAKE_MOMENTS,
 } from "./analysisConfig";
 import { selectRecentPeriodCandidates } from "./candidateBucket";
+import {
+  formatEvalCp,
+  isMateScore,
+  mateMovesFromCp,
+} from "./winProb";
 
 export type StudyGame = {
   id: string;
@@ -93,7 +98,6 @@ const STRICT_DROP_CP = HIGH_STRICT_DROP_CP;
 const STRICT_PRIORITY = HIGH_STRICT_PRIORITY;
 const TARGET_MOMENTS = TARGET_MISTAKE_MOMENTS;
 const EVAL_CLAMP = 2000;
-const MATE_CP_THRESHOLD = 50000;
 const MATE_MOVE_SPAN = 100;
 const GOOD_MOVE_MAX_LOSS_CP = 50;
 const GAP_TOLERANCE_FRACTION = 0.2;
@@ -102,32 +106,41 @@ const GAP_TOLERANCE_MAX_CP = 150;
 const CONTINUATION_PLIES = MIN_CONTINUATION_PLIES;
 
 export function clampCp(value: number): number {
-  const abs = Math.abs(value);
-  if (abs >= MATE_CP_THRESHOLD) {
-    const moves = Math.max(0, Math.min(99, Math.round((100000 - abs) / 1000)));
-    const encoded = EVAL_CLAMP + (MATE_MOVE_SPAN - moves);
-    return value > 0 ? encoded : -encoded;
-  }
+  if (isMateScore(value)) return value;
   return Math.max(-EVAL_CLAMP, Math.min(EVAL_CLAMP, value));
 }
 
 export function displayCp(value: number): number {
   const abs = Math.abs(value);
-  if (abs > EVAL_CLAMP) return value > 0 ? EVAL_CLAMP : -EVAL_CLAMP;
+  if (isMateScore(value) || abs > EVAL_CLAMP) {
+    return value > 0 ? EVAL_CLAMP : -EVAL_CLAMP;
+  }
   return value;
 }
 
+export function isMateCp(value: number): boolean {
+  return isMateScore(value) || Math.abs(value) > EVAL_CLAMP;
+}
+
+/** White fill % for the eval bar. Mate → solid 0 or 100. */
+export function evalBarWhiteShare(cp: number): number {
+  if (isMateCp(cp)) return cp > 0 ? 100 : 0;
+  return Math.max(8, Math.min(92, 50 + displayCp(cp) / 4));
+}
+
 export function formatEval(value: number): string {
+  if (isMateScore(value)) return formatEvalCp(value);
   const abs = Math.abs(value);
   if (abs > EVAL_CLAMP) {
+    const n = mateMovesFromCp(value);
+    if (n != null) return formatEvalCp(value);
     const moves = Math.max(0, Math.round(MATE_MOVE_SPAN - (abs - EVAL_CLAMP)));
     const side = value > 0 ? "w" : "b";
     return moves === 0
       ? `Checkmate for ${side}`
       : `Mate in ${moves} for ${side}`;
   }
-  const pawns = value / 100;
-  return `${pawns > 0 ? "+" : ""}${pawns.toFixed(2)}`;
+  return formatEvalCp(value);
 }
 
 export function toWhiteCp(fen: string, sideToMoveCp: number): number {

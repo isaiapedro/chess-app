@@ -139,17 +139,28 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
     if (v !== "day") setDayCalendarOpen(false);
   }, []);
 
+  const resolvedUsername = auth.isLoggedIn ? auth.username : username;
+  const resolvedPlatform =
+    auth.isLoggedIn && auth.platform ? auth.platform : platform;
+
   const queryFilters = useMemo<QueryFilters>(() => {
     const range = resolveDateRange(period, selectedDay);
     return {
-      username: username.trim(),
-      platform,
+      username: resolvedUsername.trim(),
+      platform: resolvedPlatform,
       timeframe: PERIOD_TIMEFRAME[period],
       speed,
       dateFrom: range.dateFrom,
       dateTo: range.dateTo,
     };
-  }, [username, platform, period, selectedDay, speed]);
+  }, [
+    resolvedUsername,
+    resolvedPlatform,
+    period,
+    selectedDay,
+    speed,
+    refreshToken,
+  ]);
 
   const periodLabel = useMemo(
     () => buildPeriodLabel(period, selectedDay),
@@ -158,9 +169,9 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
 
   const value = useMemo(
     () => ({
-      username,
+      username: resolvedUsername,
       setUsername,
-      platform,
+      platform: resolvedPlatform,
       setPlatform,
       period,
       setPeriod: setPeriodAndCloseCalendar,
@@ -178,8 +189,8 @@ export function FilterProvider({ children }: { children: React.ReactNode }) {
       refresh,
     }),
     [
-      username,
-      platform,
+      resolvedUsername,
+      resolvedPlatform,
       period,
       setPeriodAndCloseCalendar,
       selectedDay,

@@ -35,6 +35,7 @@ import {
   selectRecentPeriodCandidates,
   stubOpeningMoment,
 } from "./candidateBucket";
+import { yieldForUi } from "./backgroundWork";
 
 export type OpeningChoice = {
   key: string;
@@ -881,6 +882,7 @@ export async function analyzeOpeningMoments(options: {
         REFINE_MULTIPV,
         REFINE_MOVETIME
       );
+      await yieldForUi({ heavy: true });
       const beforeCp = clampCp(toWhiteCp(moment.fen, beforeRaw.cpWhite));
       const afterCp = clampCp(toWhiteCp(fenAfter, afterRaw.cpWhite));
       const userBefore = userIsWhite ? beforeCp : -beforeCp;

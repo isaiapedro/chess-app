@@ -1,11 +1,19 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Animated, Easing, Pressable, StyleSheet, View } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
 import { BlurView } from "expo-blur";
+import type { LucideIcon } from "lucide-react-native";
+import {
+  ChartBarBig,
+  GraduationCap,
+  RefreshCw,
+  User,
+  Zap,
+} from "lucide-react-native";
 import PagerView from "react-native-pager-view";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { useFilters } from "../context/FilterContext";
 import { useTabSwipe } from "../context/TabSwipeContext";
+import { AppIcon } from "../icons";
 import { RecapScreen } from "../screens/RecapScreen";
 import { InsightsScreen } from "../screens/InsightsScreen";
 import { StudyScreen } from "../screens/StudyScreen";
@@ -32,12 +40,12 @@ type TabFrame = {
   height: number;
 };
 
-const TAB_ICONS: Record<TabName, keyof typeof Ionicons.glyphMap> = {
-  Wrapped: "sync-outline",
-  Insights: "bar-chart-outline",
-  Study: "school-outline",
-  Games: "flash-outline",
-  Profile: "person-outline",
+const TAB_ICONS: Record<TabName, LucideIcon> = {
+  Wrapped: RefreshCw,
+  Insights: ChartBarBig,
+  Study: GraduationCap,
+  Games: Zap,
+  Profile: User,
 };
 
 function TabFadePage({
@@ -257,10 +265,11 @@ export function TabNavigator() {
                 accessibilityState={{ selected: active }}
               >
                 <View style={styles.tabPill}>
-                  <Ionicons
-                    name={TAB_ICONS[name]}
+                  <AppIcon
+                    icon={TAB_ICONS[name]}
                     size={26.4}
                     color={active ? colors.text : colors.textDim}
+                    bold={active}
                   />
                 </View>
               </Pressable>

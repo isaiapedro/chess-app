@@ -1,4 +1,4 @@
-import React, { useMemo } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Pressable,
   StyleSheet,
@@ -76,12 +76,18 @@ export function FilterHeader() {
 
   const { width: screenWidth } = useWindowDimensions();
   const hangClearance = HANG_SIZE + screenWidth / 5 - 4 + 10;
-  const days = useMemo(() => weekDays(selectedDay), [selectedDay]);
+  const [weekAnchor, setWeekAnchor] = useState(selectedDay);
+  const days = useMemo(() => weekDays(weekAnchor), [weekAnchor]);
   const today = useMemo(() => {
     const t = new Date();
     t.setHours(0, 0, 0, 0);
     return t;
   }, []);
+
+  useEffect(() => {
+    if (!dayCalendarOpen) return;
+    setWeekAnchor(selectedDay);
+  }, [dayCalendarOpen]);
 
   return (
     <View style={styles.wrap}>
@@ -110,7 +116,7 @@ export function FilterHeader() {
         <View style={[styles.weekRow, { paddingRight: hangClearance }]}>
           <Pressable
             style={styles.navBtn}
-            onPress={() => setSelectedDay(addDays(selectedDay, -7))}
+            onPress={() => setWeekAnchor(addDays(weekAnchor, -7))}
             hitSlop={8}
           >
             <Text style={styles.navText}>‹</Text>
@@ -156,11 +162,9 @@ export function FilterHeader() {
           <Pressable
             style={styles.navBtn}
             onPress={() => {
-              const next = addDays(selectedDay, 7);
+              const next = addDays(weekAnchor, 7);
               if (startOfWeek(next).getTime() <= startOfWeek(today).getTime()) {
-                setSelectedDay(
-                  next.getTime() > today.getTime() ? today : next
-                );
+                setWeekAnchor(next);
               }
             }}
             hitSlop={8}

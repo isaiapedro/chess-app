@@ -4,6 +4,8 @@
  * Strip books, chapters, games, move sequences.
  */
 
+import { polishCoachProse } from "./coachProse";
+
 const SOFT_MAX = 420;
 
 const SECTION_TITLES =
@@ -160,6 +162,7 @@ export function reformatCoachNote(
   if (isCorruptPackNote(out)) return "";
   const minLen = keepN <= 1 ? 28 : 40;
   if (out.length < minLen) return "";
+  out = polishCoachProse(out) || out;
   return softTrim(out, softMax);
 }
 

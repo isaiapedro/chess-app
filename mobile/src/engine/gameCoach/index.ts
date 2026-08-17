@@ -58,6 +58,10 @@ export {
   buildMiddlegameStructureSnap,
   buildMiddlegameStrategicInputs,
   classifyPawnBreakClass,
+  preferCenterStrike,
+  engineLinePawnPushScores,
+  wingFromEnginePawnPushes,
+  wingFromBestSan,
   softKeysFromMgStructure,
   enrichMiddlegameStrategicMoments,
   isBenoniAsymmetric,
@@ -93,6 +97,33 @@ export {
   composeMiddlegameJudgmentTipDetailed,
 } from "./middlegameJudgmentTip";
 export {
+  composeEndgameJudgmentTip,
+  composeEndgameJudgmentTipDetailed,
+} from "./endgameJudgmentTip";
+export {
+  assemblePhaseCheckpointTip,
+  phaseRememberPhrase,
+  checkpointMistakeTakesOver,
+} from "./phaseCheckpointTip";
+export {
+  buildEvalSwingIndex,
+  formatEvalSwingSummary,
+  classifyCheckpointEvalBand,
+  evalBandFromInputs,
+  checkpointEvalOverlay,
+  type CheckpointEvalBand,
+  type EvalSwingIndex,
+  type EvalSwingEvent,
+} from "./evalSwingIndex";
+export {
+  buildCommentRefs,
+  formatCommentRefs,
+  formatCommentRefsCompact,
+  type CommentRefs,
+  type CommentTopChoice,
+  type TipMetaBits,
+} from "./commentRefs";
+export {
   composeMomentJudgmentTip,
 } from "./momentJudgmentTip";
 export type { MomentJudgmentTipResult } from "./momentJudgmentTip";
@@ -116,6 +147,26 @@ export {
   deltaHelpsEngine,
   formatMetricSignalShort,
 } from "./engineLineExplain";
+export {
+  rankMetricAxes,
+  significantRankedAxes,
+  wideRankedAxes,
+  primaryFieldFromRanked,
+} from "./metricAxisRank";
+export {
+  buildTipCoordinate,
+  localizeTipCoordinate,
+  detectLocationFactors,
+  engineVsPlayedClause,
+  scanPillarConditions,
+  openingIdentityPlan,
+} from "./tipCoordinate";
+export type {
+  TipCoordinate,
+  TipPillars,
+  LocalizedTip,
+  PillarConditionScan,
+} from "./tipCoordinate";
 export type {
   EngineLineExplainResult,
   MetricSignal,
@@ -175,6 +226,7 @@ export {
 } from "./analysisCache";
 export {
   detectStructureThemes,
+  confirmedStructureThemesByPly,
   detectOpeningFamily,
   resolveOpeningPackKey,
 } from "./structureDetect";
@@ -188,6 +240,8 @@ export {
   situationCastlingSnaps,
   isClosedCenter,
   isOppositeSideCastling,
+  centerFluidityIndex,
+  kingCenterFileExposure,
   isMaroczyBind,
   maroczyBinderColor,
   isCarlsbad,
@@ -230,17 +284,63 @@ export {
   missedForcingLine,
 } from "./tacticalFact";
 export type { TacticalFact } from "./tacticalFact";
+export { detectBoardMotif } from "./boardMotif";
+export type { BoardMotifKind, BoardMotifHit } from "./boardMotif";
+export {
+  forcingRatio,
+  measureTacticSharpness,
+  tacticSharpnessInputs,
+  mergeMultiPvGapLines,
+  rankLinesByStm,
+  multipvWpGap,
+  SHARP_FORCING_RATIO,
+  SHARP_PV_GAP_WP,
+  IMPORTANT_PV_GAP,
+} from "./tacticSharpness";
+export type { TacticSharpness } from "./tacticSharpness";
+export {
+  safeMobilityForSquare,
+  findZeroSafeMobilityPieces,
+  isSafeDestination,
+  pieceLabelFor,
+  sampleMaterialAlongSans,
+  detectDelayedPieceCapture,
+  detectNewlyTrappedAlongSans,
+  TRAPPED_PV_MIN_PLY,
+  TRAPPED_PV_MAX_PLY,
+} from "../trappedPiece";
+export type {
+  SafeMobilityResult,
+  PvMaterialSample,
+  DelayedCaptureResult,
+} from "../trappedPiece";
 export {
   knightVsBishopSnap,
   goodVsBadBishopSnap,
   pawnStormTempoSnap,
+  pawnStormTempoDelta,
   classifyRookEndingShape,
   PawnStormTracker,
 } from "./tier3Metrics";
 export type { RookEndingShape } from "./tier3Metrics";
 export {
   COACH_MARK_SOURCES,
+  COACH_MARK_ORDER,
+  COACH_MARK_LABELS,
+  COACH_MARK_COLORS,
+  countCoachMarks,
+  countCoachMarksBySide,
+  sideAccuracyPct,
+} from "./coachMarks";
+export {
   classifyCoachMark,
   type CoachMark,
-} from "./coachMarks";
-export { computePhaseSplits, type PhaseSplits } from "./phaseSplits";
+} from "./coachMarkClassify";
+export {
+  computePhaseSplits,
+  phaseForPlyBounds,
+  phaseForCoachMoment,
+  type PhaseSplits,
+  type CoachPhaseName,
+  type CoachPhaseBounds,
+} from "./phaseSplits";

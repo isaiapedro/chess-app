@@ -1,6 +1,9 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ActivityIndicator,
+  Animated,
+  Easing,
+  Image,
   Platform,
   Pressable,
   ScrollView,
@@ -23,36 +26,71 @@ import {
 } from "../components/ui";
 import { FadeFromBlank } from "../components/LoadingSkeletons";
 import { useFilters } from "../context/FilterContext";
+import { useAnalytics } from "../context/AnalyticsContext";
 import { useTabSwipe } from "../context/TabSwipeContext";
 import {
   analyzeSelectedGame,
   buildReplayPlies,
   formatEval,
   linesFromEval,
+  stampAccuracyMarks,
   type EngineLine,
   type GameCoachPly,
   type GameCoachResult,
 } from "../engine/gameCoach/analyzeGame";
+import { formatCommentRefsCompact } from "../engine/gameCoach/commentRefs";
 import {
   loadCachedGameAnalysis,
   saveCachedGameAnalysis,
 } from "../engine/gameCoach/analysisCache";
-import { COACH_MARK_SOURCES } from "../engine/gameCoach/coachMarks";
+import {
+  COACH_MARK_COLORS,
+  COACH_MARK_LABELS,
+  COACH_MARK_ORDER,
+  COACH_MARK_SOURCES,
+  COACH_THEORY_LEAVE_MARKS,
+  countCoachMarksBySide,
+  sideAccuracyPct,
+} from "../engine/gameCoach/coachMarks";
 import { formatOpeningLabel } from "../engine/gameCoach/ecoLabels";
 import { formatOpponentName } from "../data/opponentAvatar";
 import { computePhaseSplits } from "../engine/gameCoach/phaseSplits";
 import { useStockfish } from "../engine/StockfishProvider";
-import { GLOBAL_DEPTH } from "../engine/analysisConfig";
-import { displayCp, toWhiteCp } from "../engine/analyzeMistakes";
+import {
+  COACH_ANALYZE_DEPTH,
+  COACH_ANALYZE_MOVETIME,
+  COACH_ANALYZE_MULTIPV,
+  EVAL_BAR_SPEED_PCT_PER_SEC,
+  LIVE_EVAL_MULTIPV,
+} from "../engine/analysisConfig";
+import { evalBarWhiteShare, toWhiteCp } from "../engine/analyzeMistakes";
+import { sameMove, sanToUci } from "../engine/chessMoves";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import { ensureStudyGames } from "../storage/analyticsLoaders";
 import type { NormalizedGame } from "../data/platformGames";
+import {
+  filterNormalizedGames,
+  gameHasMoveSource,
+  resolveGameWithMoves,
+  toStudyGameList,
+} from "../data/platformGames";
+import type { QueryFilters } from "../api/client";
 import { fetchExplorer } from "../api/client";
-import { colors, font, radius, result, spacing, type } from "../theme";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 /** Matches TabNavigator order: Wrapped, Insights, Study, Games, Profile */
 const GAMES_TAB_INDEX = 3;
 const GAMES_PAGE_SIZE = 20;
+
+function viewFilteredGames(
+  games: StudyGame[],
+  filters: QueryFilters
+): StudyGame[] {
+  if (!filters.speed && !filters.color && !filters.result) return games;
+  return toStudyGameList(
+    filterNormalizedGames(games as NormalizedGame[], filters)
+  );
+}
 
 function navHaptic() {
   if (Platform.OS === "web") return;
@@ -113,10 +151,31 @@ function resultTone(value?: string): string {
   return colors.textMuted;
 }
 
+function userKingBadge(value?: string): "win" | "loss" | null {
+  const v = String(value || "").toLowerCase();
+  if (v.includes("win")) return "win";
+  if (v.includes("loss")) return "loss";
+  return null;
+}
+
+function overlayMatchScore(value?: string): string {
+  const v = String(value || "").toLowerCase();
+  if (v.includes("win")) return "1 - 0";
+  if (v.includes("draw") || v === "1/2-1/2") return "1/2 - 1/2";
+  if (v.includes("loss")) return "0 - 1";
+  return "–";
+}
+
 export function GamesScreen() {
   const { queryFilters, refreshToken } = useFilters();
+  const {
+    games: analyticsGames,
+    gamesLoading: analyticsGamesLoading,
+    requestVaultRemesh,
+  } = useAnalytics();
   const { activeTabIndex } = useTabSwipe();
-  const { ready: engineReady, error: engineError, evaluate } = useStockfish();
+  const { ready: engineReady, error: engineError, evaluate, startLiveEval } =
+    useStockfish();
   const gamesTabActive = activeTabIndex === GAMES_TAB_INDEX;
 
   const [listLoading, setListLoading] = useState(false);
@@ -127,19 +186,27 @@ export function GamesScreen() {
   const allGamesRef = useRef<StudyGame[]>([]);
   const loadedFiltersKey = useRef<string | null>(null);
   const lastRefreshRef = useRef(refreshToken);
+  const visibleCountRef = useRef(GAMES_PAGE_SIZE);
 
   const [selectedGame, setSelectedGame] = useState<NormalizedGame | null>(null);
+  const [openingGame, setOpeningGame] = useState(false);
   const [plies, setPlies] = useState<GameCoachPly[]>([]);
   const [plyIndex, setPlyIndex] = useState(-1);
   const [analysis, setAnalysis] = useState<GameCoachResult | null>(null);
+  const [showAccuracyOverlay, setShowAccuracyOverlay] = useState(false);
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeProgress, setAnalyzeProgress] = useState<string | null>(null);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [liveLines, setLiveLines] = useState<EngineLine[]>([]);
   const [liveCp, setLiveCp] = useState<number | null>(null);
   const [liveBusy, setLiveBusy] = useState(false);
+  const [boardAnimUci, setBoardAnimUci] = useState<string | null>(null);
   const cancelRef = useRef({ cancelled: false });
-  const liveReq = useRef(0);
+  const skipAnimateRef = useRef(false);
+  const plyIndexRef = useRef(plyIndex);
+  const pliesRef = useRef(plies);
+  plyIndexRef.current = plyIndex;
+  pliesRef.current = plies;
 
   const filtersKey = useMemo(
     () =>
@@ -165,6 +232,7 @@ export function GamesScreen() {
     setAnalyzeProgress(null);
     setLiveLines([]);
     setLiveCp(null);
+    setBoardAnimUci(null);
     setGames([]);
     setHasMore(false);
     setVisibleCount(GAMES_PAGE_SIZE);
@@ -175,6 +243,7 @@ export function GamesScreen() {
   const applyVisible = useCallback((all: StudyGame[], count: number) => {
     allGamesRef.current = all;
     const next = Math.min(Math.max(count, GAMES_PAGE_SIZE), all.length || count);
+    visibleCountRef.current = next;
     setVisibleCount(next);
     setGames(all.slice(0, next));
     setHasMore(all.length > next);
@@ -192,10 +261,12 @@ export function GamesScreen() {
       setListLoading(true);
       setListError(null);
       try {
-        // Same cache + ingest path as Study / puzzles — soft hits AsyncStorage.
-        const all = await ensureStudyGames(queryFilters, force);
+        const all = await ensureStudyGames(
+          queryFilters,
+          force ? true : false
+        );
         loadedFiltersKey.current = filtersKey;
-        applyVisible(all, GAMES_PAGE_SIZE);
+        applyVisible(all, visibleCountRef.current);
       } catch (err) {
         setListError(err instanceof Error ? err.message : "Failed to load games");
       } finally {
@@ -205,49 +276,76 @@ export function GamesScreen() {
     [queryFilters, filtersKey, applyVisible]
   );
 
-  // Focus Games tab: reuse cache; refreshToken (same as puzzles) forces newer fetch.
   useEffect(() => {
     if (!gamesTabActive) return;
     const force = refreshToken !== lastRefreshRef.current;
     lastRefreshRef.current = refreshToken;
-    if (
-      !force &&
-      loadedFiltersKey.current === filtersKey &&
-      allGamesRef.current.length > 0
-    ) {
+    if (force) {
+      void loadList(true);
       return;
     }
-    void loadList(force);
-  }, [gamesTabActive, filtersKey, refreshToken, loadList]);
+    if (analyticsGames.length) {
+      const filtered = viewFilteredGames(analyticsGames, queryFilters);
+      loadedFiltersKey.current = filtersKey;
+      setListError(null);
+      setListLoading(false);
+      applyVisible(filtered, visibleCountRef.current);
+      return;
+    }
+    if (!analyticsGamesLoading) {
+      void loadList(false);
+    }
+  }, [
+    gamesTabActive,
+    filtersKey,
+    refreshToken,
+    analyticsGames,
+    analyticsGamesLoading,
+    queryFilters,
+    loadList,
+    applyVisible,
+  ]);
 
   const openGame = useCallback(
     async (game: StudyGame) => {
       cancelRef.current.cancelled = true;
+      const openToken = { cancelled: false };
+      cancelRef.current = openToken;
+
       setAnalyzing(false);
       setAnalyzeProgress(null);
       setAnalyzeError(null);
       setLiveLines([]);
       setLiveCp(null);
+      setBoardAnimUci(null);
       setPlyIndex(-1);
+      setPlies([]);
+      setAnalysis(null);
+      setShowAccuracyOverlay(false);
+      setOpeningGame(true);
 
       const fromList =
         allGamesRef.current.find((g) => g.id === game.id) || game;
-      const full = fromList as NormalizedGame;
-      setSelectedGame(full);
-      const source = full.pgn_str || full.moves_str || "";
-      setPlies(buildReplayPlies(source));
+      setSelectedGame(fromList as NormalizedGame);
 
-      const cached = await loadCachedGameAnalysis(
-        queryFilters.platform,
-        queryFilters.username,
-        full.id
-      );
-      if (cached?.plies?.length) {
-        setAnalysis(cached);
-        setPlies(cached.plies);
-        setAnalyzeProgress(null);
-      } else {
-        setAnalysis(null);
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      if (openToken.cancelled) {
+        setOpeningGame(false);
+        return;
+      }
+
+      try {
+        let full = fromList as NormalizedGame;
+        if (!gameHasMoveSource(full)) {
+          full = await resolveGameWithMoves(queryFilters, fromList);
+          if (openToken.cancelled) return;
+          setSelectedGame(full);
+        }
+
+        const source = (full.moves_str || full.pgn_str || "").trim();
+        setPlies(source ? buildReplayPlies(source) : []);
+      } finally {
+        if (!openToken.cancelled) setOpeningGame(false);
       }
     },
     [queryFilters]
@@ -255,10 +353,12 @@ export function GamesScreen() {
 
   const closeGame = useCallback(() => {
     cancelRef.current.cancelled = true;
+    setOpeningGame(false);
     setSelectedGame(null);
     setPlies([]);
     setPlyIndex(-1);
     setAnalysis(null);
+    setShowAccuracyOverlay(false);
     setAnalyzing(false);
     setAnalyzeProgress(null);
     setAnalyzeError(null);
@@ -268,7 +368,7 @@ export function GamesScreen() {
 
   const runAnalyze = useCallback(async () => {
     if (!selectedGame || !engineReady) return;
-    const source = selectedGame.pgn_str || selectedGame.moves_str || "";
+    const source = (selectedGame.moves_str || selectedGame.pgn_str || "").trim();
     if (!source.trim()) {
       setAnalyzeError("This game has no PGN/moves to analyze.");
       return;
@@ -276,8 +376,24 @@ export function GamesScreen() {
     cancelRef.current = { cancelled: false };
     setAnalyzing(true);
     setAnalyzeError(null);
-    setAnalyzeProgress("Starting Stockfish 18…");
+    setAnalyzeProgress("Loading analysis…");
     try {
+      const cached = await loadCachedGameAnalysis(
+        queryFilters.platform,
+        queryFilters.username,
+        selectedGame.id
+      );
+      if (cancelRef.current.cancelled) return;
+      if (cached?.plies?.length) {
+        const plies = stampAccuracyMarks(cached.plies);
+        setAnalysis({ ...cached, plies });
+        setPlies(plies);
+        setShowAccuracyOverlay(true);
+        setAnalyzeProgress(null);
+        return;
+      }
+
+      setAnalyzeProgress("Starting Stockfish 18…");
       const result = await analyzeSelectedGame({
         gameId: selectedGame.id,
         pgn: selectedGame.pgn_str,
@@ -287,9 +403,19 @@ export function GamesScreen() {
         userColor: selectedGame.user_color,
         platform: queryFilters.platform,
         username: queryFilters.username,
+        userRating:
+          selectedGame.user_rating == null
+            ? null
+            : Number(selectedGame.user_rating),
+        speed: selectedGame.speed ?? null,
+        timeControl: selectedGame.time_control ?? null,
+        result: selectedGame.result ?? null,
+        createdAt: selectedGame.created_at ?? null,
+        opponentName: selectedGame.opponent_name ?? null,
         evaluate,
-        depth: GLOBAL_DEPTH,
-        multiPv: 3,
+        depth: COACH_ANALYZE_DEPTH,
+        multiPv: COACH_ANALYZE_MULTIPV,
+        movetimeMs: COACH_ANALYZE_MOVETIME,
         signal: cancelRef.current,
         fetchExplorer: async (fen, source, ratings) => {
           const res = await fetchExplorer(
@@ -313,13 +439,16 @@ export function GamesScreen() {
         },
       });
       if (cancelRef.current.cancelled) return;
-      setAnalysis(result);
-      setPlies(result.plies);
+      const plies = stampAccuracyMarks(result.plies);
+      setAnalysis({ ...result, plies });
+      setPlies(plies);
+      setShowAccuracyOverlay(true);
       await saveCachedGameAnalysis(
         queryFilters.platform,
         queryFilters.username,
         result
       );
+      requestVaultRemesh();
       setAnalyzeProgress(null);
     } catch (err) {
       if (!cancelRef.current.cancelled) {
@@ -328,7 +457,7 @@ export function GamesScreen() {
     } finally {
       setAnalyzing(false);
     }
-  }, [selectedGame, engineReady, evaluate, queryFilters]);
+  }, [selectedGame, engineReady, evaluate, queryFilters, requestVaultRemesh]);
 
   const orientation =
     selectedGame?.user_color === "black" ? "black" : "white";
@@ -340,11 +469,18 @@ export function GamesScreen() {
 
   const currentPly = plyIndex >= 0 ? plies[plyIndex] : null;
 
-  // Live MultiPV for current position after analyze (or from cached ply lines)
+  // Live MultiPV: uncapped thinking; accuracy marks stay from analyze pass only
   useEffect(() => {
-    if (!selectedGame || !analysis || !engineReady) {
+    if (
+      !gamesTabActive ||
+      !selectedGame ||
+      !analysis ||
+      !engineReady ||
+      analyzing
+    ) {
       setLiveLines([]);
-      setLiveCp(null);
+      if (!analyzing) setLiveCp(null);
+      setLiveBusy(false);
       return;
     }
     const fenNow =
@@ -353,42 +489,74 @@ export function GamesScreen() {
         : plies[plyIndex]?.fenAfter || fen;
 
     const stored =
+      plyIndex < 0 ? plies[0]?.lines : plies[plyIndex]?.lines;
+    const seedCp =
       plyIndex < 0
-        ? plies[0]?.lines
-        : plies[plyIndex]?.lines;
-    if (stored && stored.length) {
-      setLiveLines(stored);
-      setLiveCp(
-        plyIndex < 0
-          ? plies[0]?.evalBeforeCp ?? null
-          : plies[plyIndex]?.evalAfterCp ?? plies[plyIndex]?.evalBeforeCp ?? null
-      );
-    }
+        ? plies[0]?.evalBeforeCp ?? null
+        : plies[plyIndex]?.evalAfterCp ??
+          plies[plyIndex]?.evalBeforeCp ??
+          null;
+    if (seedCp != null) setLiveCp(seedCp);
+    if (stored && stored.length) setLiveLines(stored);
 
-    const req = ++liveReq.current;
     setLiveBusy(true);
-    void (async () => {
-      try {
-        const ev = await evaluate(fenNow, GLOBAL_DEPTH, 3, 0);
-        if (liveReq.current !== req) return;
-        setLiveCp(toWhiteCp(fenNow, ev.cpWhite));
-        setLiveLines(linesFromEval(fenNow, ev));
-      } catch {
-        if (liveReq.current !== req) return;
-      } finally {
-        if (liveReq.current === req) setLiveBusy(false);
-      }
-    })();
-  }, [selectedGame, analysis, engineReady, plyIndex, plies, fen, evaluate]);
+    const stop = startLiveEval(fenNow, LIVE_EVAL_MULTIPV, (ev) => {
+      setLiveCp(toWhiteCp(fenNow, ev.cpWhite));
+      setLiveLines(linesFromEval(fenNow, ev));
+      setLiveBusy(false);
+    });
+    return () => {
+      stop();
+    };
+  }, [
+    gamesTabActive,
+    selectedGame,
+    analysis,
+    engineReady,
+    analyzing,
+    plyIndex,
+    plies,
+    fen,
+    startLiveEval,
+  ]);
 
-  const whiteShare = Math.max(
-    8,
-    Math.min(92, 50 + displayCp(liveCp ?? 0) / 4)
-  );
+  const barAnim = useRef(new Animated.Value(50)).current;
+  const barAnimCurrent = useRef(50);
+
+  useEffect(() => {
+    const target = evalBarWhiteShare(liveCp ?? 0);
+    barAnim.stopAnimation((value) => {
+      const from = typeof value === "number" ? value : barAnimCurrent.current;
+      barAnimCurrent.current = from;
+      const dist = Math.abs(target - from);
+      const durationMs = Math.max(
+        1,
+        (dist / EVAL_BAR_SPEED_PCT_PER_SEC) * 1000
+      );
+      Animated.timing(barAnim, {
+        toValue: target,
+        duration: durationMs,
+        easing: Easing.linear,
+        useNativeDriver: false,
+      }).start(({ finished }) => {
+        if (finished) barAnimCurrent.current = target;
+      });
+    });
+  }, [liveCp, barAnim]);
+
+  const barWidth = barAnim.interpolate({
+    inputRange: [0, 100],
+    outputRange: ["0%", "100%"],
+  });
 
   const currentNote = useMemo(() => {
     if (plyIndex < 0) return "";
     return plies[plyIndex]?.note || "";
+  }, [plyIndex, plies]);
+
+  const currentNoteRefs = useMemo(() => {
+    if (plyIndex < 0) return "";
+    return formatCommentRefsCompact(plies[plyIndex]?.noteRefs);
   }, [plyIndex, plies]);
 
   const graphPoints = useMemo(
@@ -401,8 +569,12 @@ export function GamesScreen() {
           mark: p.mark,
         }))
         .filter(
-          (p): p is { plyIndex: number; ply: number; cp: number; mark: typeof p.mark } =>
-            p.cp != null
+          (p): p is {
+            plyIndex: number;
+            ply: number;
+            cp: number;
+            mark: typeof p.mark;
+          } => p.cp != null
         ),
     [plies]
   );
@@ -414,11 +586,28 @@ export function GamesScreen() {
     return computePhaseSplits(analysis.plies, userColor);
   }, [analysis, selectedGame?.user_color]);
 
-  const currentMark =
-    plyIndex >= 0 ? plies[plyIndex]?.mark || null : null;
+  // Accuracy icons: only from Analyze pass (ply.mark), never from live eval
+  const markedPly =
+    plyIndex >= 0 && plies[plyIndex]
+      ? !boardAnimUci ||
+        plies[plyIndex].uci.slice(0, 4) === boardAnimUci.slice(0, 4)
+        ? plies[plyIndex]
+        : null
+      : null;
+  const currentMark = markedPly?.mark || null;
 
+  // Board last-move glow only when ply has a coach comment.
   const highlightUci =
-    plyIndex >= 0 && plies[plyIndex] ? plies[plyIndex].uci : null;
+    plyIndex >= 0 && plies[plyIndex]?.note?.trim()
+      ? plies[plyIndex].uci
+      : null;
+
+  const kingBadge =
+    plyIndex >= 0 &&
+    plyIndex === plies.length - 1 &&
+    !boardAnimUci
+      ? userKingBadge(selectedGame?.result)
+      : null;
 
   const holdTimers = useRef<{
     delay: ReturnType<typeof setTimeout> | null;
@@ -430,14 +619,17 @@ export function GamesScreen() {
     if (holdTimers.current.interval) clearInterval(holdTimers.current.interval);
     holdTimers.current.delay = null;
     holdTimers.current.interval = null;
+    skipAnimateRef.current = false;
   }, []);
 
   const startHoldNav = useCallback(
     (step: () => void) => {
       stopHoldNav();
       navHaptic();
+      skipAnimateRef.current = false;
       step();
       holdTimers.current.delay = setTimeout(() => {
+        skipAnimateRef.current = true;
         holdTimers.current.interval = setInterval(step, 85);
       }, 380);
     },
@@ -446,29 +638,61 @@ export function GamesScreen() {
 
   useEffect(() => () => stopHoldNav(), [stopHoldNav]);
 
+  const jumpPly = useCallback((i: number) => {
+    setBoardAnimUci(null);
+    setPlyIndex(i);
+  }, []);
+
   const prevPly = useCallback(() => {
-    setPlyIndex((i) => {
-      if (i <= -1) {
-        stopHoldNav();
-        return -1;
-      }
-      const next = i - 1;
-      if (next <= -1) stopHoldNav();
-      return next;
-    });
+    const i = plyIndexRef.current;
+    if (i <= -1) {
+      stopHoldNav();
+      return;
+    }
+    setBoardAnimUci(null);
+    const next = i - 1;
+    if (next <= -1) stopHoldNav();
+    setPlyIndex(next);
   }, [stopHoldNav]);
+
   const nextPly = useCallback(() => {
-    setPlyIndex((i) => {
-      const max = Math.max(plies.length - 1, 0);
-      if (i >= max) {
-        stopHoldNav();
-        return i;
-      }
-      const next = i + 1;
-      if (next >= max) stopHoldNav();
-      return next;
-    });
-  }, [plies.length, stopHoldNav]);
+    const i = plyIndexRef.current;
+    const list = pliesRef.current;
+    const max = Math.max(list.length - 1, 0);
+    if (i >= max) {
+      stopHoldNav();
+      return;
+    }
+    const next = i + 1;
+    const uci = list[next]?.uci;
+    if (!skipAnimateRef.current && uci) setBoardAnimUci(uci);
+    else setBoardAnimUci(null);
+    if (next >= max) stopHoldNav();
+    setPlyIndex(next);
+  }, [stopHoldNav]);
+
+  const clearBoardAnim = useCallback(() => {
+    setBoardAnimUci(null);
+  }, []);
+
+  const engineArrowUci = useMemo(() => {
+    if (!analysis || !currentPly) return null;
+    const userColor =
+      selectedGame?.user_color === "black" ? "black" : "white";
+    if (currentPly.side !== userColor) return null;
+    if (!currentPly.mark || !COACH_THEORY_LEAVE_MARKS.has(currentPly.mark))
+      return null;
+    if (!currentPly.note?.trim()) return null;
+    const bestSan =
+      currentPly.bestSan ||
+      currentPly.bestPvSan[0] ||
+      currentPly.lines[0]?.san ||
+      "";
+    const bestUci = sanToUci(currentPly.fenBefore, bestSan);
+    if (bestUci.length < 4) return null;
+    if (sameMove(currentPly.fenBefore, currentPly.uci, bestUci)) return null;
+    return bestUci;
+  }, [analysis, currentPly, selectedGame?.user_color]);
 
   const gameSections = useMemo(() => {
     const byDay = new Map<string, StudyGame[]>();
@@ -485,18 +709,43 @@ export function GamesScreen() {
     }));
   }, [games]);
 
+  const accuracyCounts = useMemo(() => {
+    if (!analysis?.plies?.length) {
+      return { user: {}, opp: {} };
+    }
+    const userColor =
+      selectedGame?.user_color === "black" ? "black" : "white";
+    return countCoachMarksBySide(analysis.plies, userColor);
+  }, [analysis, selectedGame?.user_color]);
+
+  const accuracyScores = useMemo(() => {
+    if (!analysis?.plies?.length) {
+      return { user: null as number | null, opp: null as number | null };
+    }
+    const userColor =
+      selectedGame?.user_color === "black" ? "black" : "white";
+    const oppColor = userColor === "white" ? "black" : "white";
+    return {
+      user: sideAccuracyPct(analysis.plies, userColor),
+      opp: sideAccuracyPct(analysis.plies, oppColor),
+    };
+  }, [analysis, selectedGame?.user_color]);
+
   if (selectedGame) {
     return (
       <FadeFromBlank contentKey={`game-${selectedGame.id}`}>
-        <ScrollView
-          style={styles.screen}
-          contentContainerStyle={styles.content}
-          keyboardShouldPersistTaps="handled"
-        >
+        <View style={styles.screen}>
           <Pressable onPress={closeGame} style={styles.backRow} hitSlop={8}>
             <Ionicons name="arrow-back" size={18} color={colors.cream} />
             <Text style={styles.backLabel}>Games</Text>
           </Pressable>
+          <View style={styles.gameBody}>
+            <ScrollView
+              style={styles.gameScroll}
+              contentContainerStyle={styles.content}
+              keyboardShouldPersistTaps="handled"
+              scrollEnabled={!showAccuracyOverlay}
+            >
 
           <View style={styles.analysisHeader}>
             <OpponentAvatar
@@ -529,6 +778,19 @@ export function GamesScreen() {
             ) : null;
           })()}
 
+          {openingGame ? (
+            <View style={styles.openingGameRow}>
+              <ActivityIndicator color={colors.red} />
+              <Text style={styles.progressText}>Loading game…</Text>
+            </View>
+          ) : null}
+
+          {!openingGame && !plies.length ? (
+            <Text style={styles.errorText}>
+              No moves/PGN stored for this game. Pull to refresh the Games list.
+            </Text>
+          ) : null}
+
           {analysis ? (
             <View style={styles.evalBlock}>
               <View style={styles.evalSummary}>
@@ -539,7 +801,7 @@ export function GamesScreen() {
                 </Text>
               </View>
               <View style={styles.evalBarTrack}>
-                <View style={[styles.evalBarFill, { width: `${whiteShare}%` }]} />
+                <Animated.View style={[styles.evalBarFill, { width: barWidth }]} />
               </View>
               <View style={styles.linesBox}>
                 {[0, 1, 2].map((i) => {
@@ -575,10 +837,21 @@ export function GamesScreen() {
               orientation={orientation}
               interactive={false}
               highlightUci={highlightUci}
-              markUci={currentMark && highlightUci ? highlightUci : null}
+              animateUci={boardAnimUci}
+              onAnimateEnd={clearBoardAnim}
+              arrowUci={boardAnimUci ? null : engineArrowUci}
+              markUci={
+                currentMark && markedPly?.uci ? markedPly.uci : null
+              }
               markSource={
                 currentMark ? COACH_MARK_SOURCES[currentMark] : null
               }
+              markKey={
+                currentMark && markedPly?.uci
+                  ? `${plyIndex}:${currentMark}:${markedPly.uci}`
+                  : null
+              }
+              kingBadge={kingBadge}
             />
           </EdgeCard>
 
@@ -619,7 +892,7 @@ export function GamesScreen() {
                       : "Engine loading…"
                 }
                 onPress={() => void runAnalyze()}
-                disabled={!engineReady || analyzing || !plies.length}
+                disabled={!engineReady || analyzing || openingGame || !plies.length}
               />
             </View>
           ) : null}
@@ -638,6 +911,9 @@ export function GamesScreen() {
                   : "Book ideas"}
               </Text>
               <Text style={styles.noteBody}>{currentNote}</Text>
+              {currentNoteRefs ? (
+                <Text style={styles.noteRefs}>{currentNoteRefs}</Text>
+              ) : null}
             </EdgeCard>
           ) : null}
 
@@ -645,16 +921,15 @@ export function GamesScreen() {
           <View style={styles.movesWrap}>
             {plies.map((p, i) => {
               const active = i === plyIndex;
-              const noted = Boolean(p.note);
+              const noted = Boolean(p.note?.trim());
               return (
                 <Pressable
                   key={`${p.ply}-${p.san}`}
-                  onPress={() => setPlyIndex(i)}
+                  onPress={() => jumpPly(i)}
                   style={[
                     styles.moveChip,
                     active && styles.moveChipActive,
                     noted && styles.moveChipNoted,
-                    p.mark === "book" && styles.moveChipBook,
                   ]}
                 >
                   <Text
@@ -683,11 +958,112 @@ export function GamesScreen() {
                 userColor={
                   selectedGame.user_color === "black" ? "black" : "white"
                 }
-                onSelectPly={setPlyIndex}
+                onSelectPly={jumpPly}
               />
             </View>
           ) : null}
-        </ScrollView>
+            </ScrollView>
+            {showAccuracyOverlay && analysis ? (
+              <View
+                style={styles.accuracyOverlay}
+                pointerEvents="auto"
+              >
+                <View style={styles.accuracyCard}>
+                  <View style={styles.accuracyBody}>
+                  <View style={styles.accuracyHero}>
+                    <View style={styles.accuracyHeroSide}>
+                      <OpponentAvatar
+                        platform={queryFilters.platform}
+                        username={queryFilters.username}
+                        size={48}
+                      />
+                      <Text style={styles.accuracyHeroName} numberOfLines={1}>
+                        {formatOpponentName(
+                          queryFilters.username,
+                          selectedGame.user_rating
+                        )}
+                      </Text>
+                      <Text style={styles.accuracyHeroPct}>
+                        {accuracyScores.user == null
+                          ? "—"
+                          : `${accuracyScores.user.toFixed(1)}%`}
+                      </Text>
+                    </View>
+                    <Text style={styles.accuracyHeroScore}>
+                      {overlayMatchScore(selectedGame.result)}
+                    </Text>
+                    <View style={styles.accuracyHeroSide}>
+                      <OpponentAvatar
+                        platform={queryFilters.platform}
+                        username={selectedGame.opponent_name}
+                        size={48}
+                      />
+                      <Text style={styles.accuracyHeroName} numberOfLines={1}>
+                        {formatOpponentName(
+                          selectedGame.opponent_name,
+                          selectedGame.opp_rating
+                        )}
+                      </Text>
+                      <Text style={styles.accuracyHeroPct}>
+                        {accuracyScores.opp == null
+                          ? "—"
+                          : `${accuracyScores.opp.toFixed(1)}%`}
+                      </Text>
+                    </View>
+                  </View>
+                  <View style={styles.accuracyTable}>
+                    {COACH_MARK_ORDER.map((mark) => {
+                      const color = COACH_MARK_COLORS[mark];
+                      const you = accuracyCounts.user[mark] || 0;
+                      const opp = accuracyCounts.opp[mark] || 0;
+                      return (
+                        <View key={mark} style={styles.accuracyRow}>
+                          <Text
+                            style={[
+                              styles.accuracyNum,
+                              { color: you ? color : colors.textDisabled },
+                            ]}
+                          >
+                            {you}
+                          </Text>
+                          <View style={styles.accuracyMid}>
+                            <View style={styles.accuracyMidInner}>
+                              <Image
+                                source={COACH_MARK_SOURCES[mark]}
+                                fadeDuration={0}
+                                resizeMode="contain"
+                                style={styles.accuracyGif}
+                              />
+                              <Text
+                                style={[styles.accuracyName, { color }]}
+                                numberOfLines={1}
+                              >
+                                {COACH_MARK_LABELS[mark]}
+                              </Text>
+                            </View>
+                          </View>
+                          <Text
+                            style={[
+                              styles.accuracyNum,
+                              { color: opp ? color : colors.textDisabled },
+                            ]}
+                          >
+                            {opp}
+                          </Text>
+                        </View>
+                      );
+                    })}
+                  </View>
+                  </View>
+                  <BrutalButton
+                    label="Continue"
+                    onPress={() => setShowAccuracyOverlay(false)}
+                  />
+                </View>
+              </View>
+            ) : null}
+          </View>
+        </View>
       </FadeFromBlank>
     );
   }
@@ -792,6 +1168,102 @@ export function GamesScreen() {
 
 const styles = StyleSheet.create({
   screen: { flex: 1, backgroundColor: colors.bg },
+  gameBody: { flex: 1 },
+  gameScroll: { flex: 1 },
+  accuracyOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: withAlpha(colors.bg, 0.88),
+    justifyContent: "flex-start",
+    paddingHorizontal: spacing.md,
+    paddingBottom: 120,
+  },
+  accuracyCard: {
+    width: "100%",
+    flex: 1,
+    backgroundColor: colors.surfaceRaised,
+    borderRadius: radius.md,
+    padding: spacing.lg,
+    gap: spacing.lg,
+    borderWidth: StyleSheet.hairlineWidth,
+    borderColor: colors.rim,
+  },
+  accuracyBody: {
+    flex: 1,
+    gap: spacing.lg,
+    minHeight: 0,
+  },
+  accuracyHero: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  accuracyHeroSide: {
+    flex: 1,
+    alignItems: "center",
+    gap: 4,
+    minWidth: 0,
+  },
+  accuracyHeroName: {
+    fontFamily: font.sansMedium,
+    fontSize: 12,
+    color: colors.cream,
+    textAlign: "center",
+    width: "100%",
+  },
+  accuracyHeroPct: {
+    fontFamily: font.sansBold,
+    fontSize: 22,
+    color: colors.cream,
+  },
+  accuracyHeroScore: {
+    fontFamily: font.sansBold,
+    fontSize: 18,
+    color: colors.text,
+    textAlign: "center",
+    minWidth: 72,
+  },
+  accuracyTable: {
+    flex: 1,
+    justifyContent: "space-between",
+  },
+  accuracyRow: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  accuracyNum: {
+    width: 40,
+    textAlign: "center",
+    fontFamily: font.sansBold,
+    fontSize: 16,
+    fontVariant: ["tabular-nums"],
+  },
+  accuracyMid: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 28,
+    minWidth: 0,
+  },
+  accuracyMidInner: {
+    width: 148,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+  },
+  accuracyGif: {
+    width: 28,
+    height: 28,
+    borderRadius: 14,
+  },
+  accuracyName: {
+    flex: 1,
+    fontFamily: font.sansMedium,
+    fontSize: 14,
+    textAlign: "left",
+  },
   content: {
     paddingHorizontal: spacing.md,
     paddingBottom: 120,
@@ -825,6 +1297,8 @@ const styles = StyleSheet.create({
     alignItems: "center",
     gap: 6,
     marginBottom: 4,
+    paddingHorizontal: spacing.md,
+    paddingTop: spacing.sm,
   },
   backLabel: {
     fontFamily: font.sansMedium,
@@ -898,6 +1372,12 @@ const styles = StyleSheet.create({
     textAlign: "center",
   },
   analyzeRow: { alignItems: "center", marginTop: spacing.xs },
+  openingGameRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    marginTop: 8,
+  },
   progressText: {
     fontFamily: font.sans,
     fontSize: type.caption.fontSize,
@@ -933,6 +1413,13 @@ const styles = StyleSheet.create({
     color: colors.textSoft,
     flexShrink: 0,
   },
+  noteRefs: {
+    fontFamily: font.sans,
+    fontSize: type.caption.fontSize,
+    lineHeight: 16,
+    color: colors.textMuted,
+    marginTop: 2,
+  },
   movesHeader: {
     fontFamily: font.sansMedium,
     fontSize: type.bodySmall.fontSize,
@@ -953,7 +1440,6 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surfaceRaised,
   },
   moveChipNoted: { borderColor: "rgba(237,231,211,0.35)" },
-  moveChipBook: { borderColor: "rgba(237,231,211,0.45)" },
   moveChipText: {
     fontFamily: font.mono,
     fontSize: type.caption.fontSize,

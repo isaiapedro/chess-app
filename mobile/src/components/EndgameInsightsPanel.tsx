@@ -17,18 +17,21 @@ import {
   type BaselineMetricHit,
   type BaselineStore,
 } from "../data/baselines";
+import { peerImpactColor } from "../data/metricPolarity";
 import {
   THEORETICAL_KEYS,
   type TheoreticalKey,
   type TheoreticalOutcome,
 } from "../engine/endgamePhase";
-import { Ionicons } from "@expo/vector-icons";
+import { Info, X } from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
   | { kind: "fixed"; max: number }
-  | { kind: "benchmark"; fallback: number };
+  | { kind: "benchmark"; fallback: number }
+  | { kind: "signed"; fallback: number };
 
 type MetricDef = {
   name: string;
@@ -43,10 +46,10 @@ type MetricDef = {
 const BLUNDER_METRIC: MetricDef = {
   name: "Blunder Rate on Endgames",
   key: "endgame_blunder_avg",
-  unit: "/game",
+  unit: "per game",
   summary: "Average blunders per endgame.",
   detail:
-    "In the endgame phase (≤7 non-king non-pawn pieces), a blunder is a move that drops win probability by more than 15pp. Reported as the mean blunder count per game that reached an endgame.",
+    "In the endgame phase (≤7 non-king non-pawn pieces), a blunder is a move that drops win probability by 20pp or more. Reported as the mean blunder count per game that reached an endgame.",
   format: (v) => v.toFixed(1),
   scale: { kind: "benchmark", fallback: 2 },
 };
@@ -55,17 +58,17 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
   {
     name: "King Centralization",
     key: "endgame_king_centralization",
-    unit: "",
+    unit: "score",
     summary: "How close your king sits to the center.",
     detail:
       "Score max(0, 4 − Chebyshev distance) from your king to the nearest of d4/e4/d5/e5. Sampled every 3 endgame plies, then averaged. Higher means a more central king.",
     format: (v) => v.toFixed(2),
-    scale: { kind: "fixed", max: 4 },
+    scale: { kind: "benchmark", fallback: 4 },
   },
   {
     name: "King Distance",
     key: "endgame_king_distance",
-    unit: "",
+    unit: "moves",
     summary: "King moves to fight enemy pawns.",
     detail:
       "Minimum Chebyshev king-moves to any enemy pawn, or to the promotion square of a clear passer. Sampled every 3 endgame plies with king centralization. Lower means your king is closer to stopping enemy pawns.",
@@ -75,17 +78,17 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
   {
     name: "Pawn Difference",
     key: "endgame_pawn_diff",
-    unit: "",
+    unit: "pawns",
     summary: "Net pawn captures for you after the endgame starts.",
     detail:
       "Starts at 0 when the endgame begins (≤7 non-pawn pieces). Each time you capture an enemy pawn: +1. Each time the opponent captures one of yours: −1. Promotions do not change the counter. Reported value is the final total for the game (not a mean of positions).",
     format: (v) => (v >= 0 ? `+${v.toFixed(0)}` : v.toFixed(0)),
-    scale: { kind: "benchmark", fallback: 2 },
+    scale: { kind: "signed", fallback: 2 },
   },
   {
     name: "Beneficial Trades",
     key: "endgame_beneficial_trade_pct",
-    unit: "%",
+    unit: "% trades",
     summary: "Piece trades that raise winning chances.",
     detail:
       "Among endgame piece trades (one exchange = two pieces off; minor/major captures completed within three plies). Pawn may finish a trade only if a rook/queen is involved; minor-for-minor finished by a pawn does not count. Share where your win probability or eval improves across the trade.",
@@ -95,7 +98,7 @@ const PRACTICAL_AFTER_SAVED: MetricDef[] = [
   {
     name: "Simplification Trades",
     key: "endgame_simplification_trade_pct",
-    unit: "%",
+    unit: "% trades",
     summary: "Trading down while already winning.",
     detail:
       "Among endgame trades that start with win probability ≥ 0.7, the share where you give a higher-value piece for a lower-value one and the WP drop stays below the blunder threshold (0.2). Separate from winning-material trades (net material gain including pawns).",
@@ -108,7 +111,7 @@ const MATE_METRICS: MetricDef[] = [
   {
     name: "Conversion Rate",
     key: "endgame_mate_conversion_pct",
-    unit: "%",
+    unit: "% mates",
     summary: "Mate evaluations that become real mates.",
     detail:
       "A mate episode starts when the engine eval is mate for you in the endgame. It converts only if every later sample stays mate-for-you until you deliver checkmate. Reported as converted episodes ÷ mate episodes.",
@@ -118,7 +121,7 @@ const MATE_METRICS: MetricDef[] = [
   {
     name: "Stalemate",
     key: "endgame_stalemate_pct",
-    unit: "%",
+    unit: "% games",
     summary: "Winning positions that end in accidental stalemate.",
     detail:
       "Share of endgame games that finish in stalemate when the position immediately before the final move had your win probability ≥ 0.7.",
@@ -128,7 +131,7 @@ const MATE_METRICS: MetricDef[] = [
   {
     name: "Mate Tempo",
     key: "endgame_mate_avg_seconds",
-    unit: "s",
+    unit: "sec/move",
     summary: "Think time during mate sequences.",
     detail:
       "Average seconds per move on your turns while a mate-for-you episode is active (from PGN clock tags).",
@@ -158,14 +161,21 @@ function projectBenchmarkMax(
   hit: BaselineMetricHit | null,
   fallback: number
 ): number {
-  const parts = [fallback];
   if (hit?.mean != null && Number.isFinite(hit.mean) && Math.abs(hit.mean) > 0) {
-    parts.push(Math.abs(hit.mean) * 1.6);
+    return Math.abs(hit.mean) * 2;
   }
-  if (hit?.p90 != null && Number.isFinite(hit.p90) && Math.abs(hit.p90) > 0) {
-    parts.push(Math.abs(hit.p90) * 1.25);
-  } else if (hit?.p75 != null && Number.isFinite(hit.p75) && Math.abs(hit.p75) > 0) {
-    parts.push(Math.abs(hit.p75) * 1.45);
+  return fallback;
+}
+
+function projectSignedHalf(
+  hit: BaselineMetricHit | null,
+  fallback: number
+): number {
+  const parts = [fallback];
+  for (const raw of [hit?.p10, hit?.p90, hit?.p75, hit?.p25, hit?.mean]) {
+    if (raw == null || !Number.isFinite(raw)) continue;
+    const abs = Math.abs(raw);
+    if (abs > 0) parts.push(abs * 1.35);
   }
   return Math.max(...parts);
 }
@@ -175,6 +185,7 @@ function resolveScaleMax(
   hit: BaselineMetricHit | null
 ): number {
   if (scale.kind === "fixed") return scale.max;
+  if (scale.kind === "signed") return projectSignedHalf(hit, scale.fallback);
   return projectBenchmarkMax(hit, scale.fallback);
 }
 
@@ -182,12 +193,49 @@ function MetricBulletGraph({
   value,
   peerMean,
   scaleMax,
+  signed = false,
+  fillColor,
 }: {
   value: number | null | undefined;
   peerMean: number | null | undefined;
   scaleMax: number;
+  signed?: boolean;
+  fillColor: string;
 }) {
   if (value == null || !Number.isFinite(value) || !(scaleMax > 0)) return null;
+
+  if (signed) {
+    const half = scaleMax;
+    const toPct = (n: number) =>
+      Math.max(0, Math.min(100, ((n + half) / (2 * half)) * 100));
+    const zeroPct = 50;
+    const valuePct = toPct(value);
+    const left = Math.min(zeroPct, valuePct);
+    const width = Math.abs(valuePct - zeroPct);
+    const peerPct =
+      peerMean != null && Number.isFinite(peerMean) ? toPct(peerMean) : null;
+    return (
+      <View style={styles.bulletWrap}>
+        <View style={styles.bulletTrack}>
+          <View style={[styles.bulletZero, { left: `${zeroPct}%` }]} />
+          <View
+            style={[
+              styles.bulletFill,
+              {
+                left: `${left}%`,
+                width: `${width}%`,
+                backgroundColor: fillColor,
+              },
+            ]}
+          />
+          {peerPct != null ? (
+            <View style={[styles.bulletPeer, { left: `${peerPct}%` }]} />
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+
   const fillPct = Math.max(0, (Math.abs(value) / scaleMax) * 100);
   const peerPct =
     peerMean != null && Number.isFinite(peerMean)
@@ -199,7 +247,10 @@ function MetricBulletGraph({
         <View
           style={[
             styles.bulletFill,
-            { width: `${Math.min(fillPct, 100)}%` },
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: fillColor,
+            },
           ]}
         />
         {peerPct != null ? (
@@ -209,36 +260,6 @@ function MetricBulletGraph({
               { left: `${Math.min(peerPct, 100)}%` },
             ]}
           />
-        ) : null}
-      </View>
-    </View>
-  );
-}
-
-function TheoreticalOutcomeBar({
-  winPct,
-  drawPct,
-  peerWin,
-}: {
-  winPct: number;
-  drawPct: number;
-  peerWin: number | null;
-}) {
-  const winW = Math.max(0, Math.min(100, winPct));
-  const drawW = Math.max(0, Math.min(100 - winW, drawPct));
-  const peerPct =
-    peerWin != null && Number.isFinite(peerWin)
-      ? Math.max(0, Math.min(100, peerWin))
-      : null;
-  return (
-    <View style={styles.bulletWrap}>
-      <View style={styles.bulletTrack}>
-        <View style={[styles.stackWin, { width: `${winW}%` }]} />
-        <View
-          style={[styles.stackDraw, { left: `${winW}%`, width: `${drawW}%` }]}
-        />
-        {peerPct != null ? (
-          <View style={[styles.bulletPeer, { left: `${peerPct}%` }]} />
         ) : null}
       </View>
     </View>
@@ -265,7 +286,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Ionicons name="close" size={20} color={colors.textMuted} />
+              <AppIcon icon={X} size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -292,6 +313,7 @@ function MetricBanner({
   baselines,
   peerBand,
   peerSpeed,
+  peerMeanOverride,
   onHelp,
 }: {
   name: string;
@@ -303,16 +325,31 @@ function MetricBanner({
   baselines: BaselineStore | null;
   peerBand: string | null;
   peerSpeed: string | null;
+  peerMeanOverride?: number | null;
   onHelp?: () => void;
 }) {
   const hit =
     baselineKey && peerBand && peerSpeed
       ? lookupBaseline(baselines, baselineKey, peerBand, peerSpeed)
       : null;
-  const scaleMax = resolveScaleMax(scale, hit);
-  const deltaLabel = peerDeltaLabel(userNum, hit?.mean, unit);
-  const deltaPositive =
-    userNum != null && hit?.mean != null && userNum >= hit.mean;
+  const peerMean =
+    peerMeanOverride !== undefined ? peerMeanOverride : (hit?.mean ?? null);
+  const scaleMax = resolveScaleMax(
+    scale,
+    peerMeanOverride !== undefined
+      ? peerMeanOverride != null && Number.isFinite(peerMeanOverride)
+        ? ({ mean: peerMeanOverride } as BaselineMetricHit)
+        : null
+      : hit
+  );
+  const deltaLabel = peerDeltaLabel(userNum, peerMean, unit);
+  const signed = scale.kind === "signed";
+  const impactColor = peerImpactColor(
+    userNum,
+    peerMean,
+    baselineKey,
+    signed ? scaleMax * 2 : scaleMax
+  );
   return (
     <EdgeCard style={styles.card}>
       <View style={styles.cardRow}>
@@ -324,20 +361,17 @@ function MetricBanner({
               {unit ? <Text style={styles.unit}> {unit}</Text> : null}
             </Text>
             {deltaLabel ? (
-              <Text
-                style={[
-                  styles.peerDelta,
-                  { color: deltaPositive ? result.win : result.loss },
-                ]}
-              >
+              <Text style={[styles.peerDelta, { color: impactColor }]}>
                 {deltaLabel}
               </Text>
             ) : null}
           </View>
           <MetricBulletGraph
             value={userNum}
-            peerMean={hit?.mean}
+            peerMean={peerMean}
             scaleMax={scaleMax}
+            signed={signed}
+            fillColor={impactColor}
           />
         </View>
         {onHelp ? (
@@ -348,15 +382,59 @@ function MetricBanner({
             accessibilityLabel={`About ${name}`}
             style={styles.helpButton}
           >
-            <Ionicons
-                      name="information-circle-outline"
-                      size={20}
-                      color={colors.textDim}
-                    />
+            <AppIcon icon={Info} size={20} color={colors.textDim} />
           </Pressable>
         ) : null}
       </View>
     </EdgeCard>
+  );
+}
+
+function sumPeerMeans(
+  baselines: BaselineStore | null,
+  peerBand: string | null,
+  peerSpeed: string | null,
+  winKey: string,
+  drawKey: string
+): number | null {
+  if (!peerBand || !peerSpeed) return null;
+  const winHit = lookupBaseline(baselines, winKey, peerBand, peerSpeed);
+  const drawHit = lookupBaseline(baselines, drawKey, peerBand, peerSpeed);
+  const win = winHit?.mean;
+  const draw = drawHit?.mean;
+  const hasWin = win != null && Number.isFinite(win);
+  const hasDraw = draw != null && Number.isFinite(draw);
+  if (!hasWin && !hasDraw) return null;
+  return (hasWin ? (win as number) : 0) + (hasDraw ? (draw as number) : 0);
+}
+
+function TheoreticalOutcomeBar({
+  winPct,
+  drawPct,
+  peerSaved,
+}: {
+  winPct: number;
+  drawPct: number;
+  peerSaved: number | null;
+}) {
+  const winW = Math.max(0, Math.min(100, winPct));
+  const drawW = Math.max(0, Math.min(100 - winW, drawPct));
+  const peerPct =
+    peerSaved != null && Number.isFinite(peerSaved)
+      ? Math.max(0, Math.min(100, peerSaved))
+      : null;
+  return (
+    <View style={styles.bulletWrap}>
+      <View style={styles.bulletTrack}>
+        <View style={[styles.stackWin, { width: `${winW}%` }]} />
+        <View
+          style={[styles.stackDraw, { left: `${winW}%`, width: `${drawW}%` }]}
+        />
+        {peerPct != null ? (
+          <View style={[styles.bulletPeer, { left: `${peerPct}%` }]} />
+        ) : null}
+      </View>
+    </View>
   );
 }
 
@@ -375,36 +453,39 @@ function TheoreticalCard({
   peerBand: string | null;
   peerSpeed: string | null;
 }) {
-  const hit =
-    peerBand && peerSpeed
-      ? lookupBaseline(baselines, baselineKey, peerBand, peerSpeed)
-      : null;
-  const deltaLabel = peerDeltaLabel(outcome.win_rate_pct, hit?.mean, "%");
-  const deltaPositive =
-    hit?.mean != null && outcome.win_rate_pct >= hit.mean;
+  const drawKey = baselineKey.replace("_win_rate_pct", "_draw_rate_pct");
+  const peerSaved = sumPeerMeans(
+    baselines,
+    peerBand,
+    peerSpeed,
+    baselineKey,
+    drawKey
+  );
+  const userSaved = outcome.win_rate_pct + outcome.draw_rate_pct;
+  const deltaLabel = peerDeltaLabel(userSaved, peerSaved, "% games");
+  const impactColor = peerImpactColor(userSaved, peerSaved, baselineKey, 100);
   return (
     <EdgeCard style={styles.card}>
       <Text style={styles.name}>{label}</Text>
       <View style={styles.valueRow}>
-        <Text style={styles.familyMeta}>
-          {outcome.games} games · {fmt(outcome.win_rate_pct)}% W ·{" "}
-          {fmt(outcome.draw_rate_pct)}% D
+        <Text style={styles.value}>
+          {fmt(userSaved)}
+          <Text style={styles.unit}> % saved</Text>
         </Text>
         {deltaLabel ? (
-          <Text
-            style={[
-              styles.peerDelta,
-              { color: deltaPositive ? result.win : result.loss },
-            ]}
-          >
+          <Text style={[styles.peerDelta, { color: impactColor }]}>
             {deltaLabel}
           </Text>
         ) : null}
       </View>
+      <Text style={styles.familyMeta}>
+        {outcome.games} games · {fmt(outcome.win_rate_pct)}% W ·{" "}
+        {fmt(outcome.draw_rate_pct)}% D
+      </Text>
       <TheoreticalOutcomeBar
         winPct={outcome.win_rate_pct}
         drawPct={outcome.draw_rate_pct}
-        peerWin={hit?.mean ?? null}
+        peerSaved={peerSaved}
       />
     </EdgeCard>
   );
@@ -520,6 +601,13 @@ export function EndgameInsightsPanel() {
       ? Math.round(((savedWins + savedDraws) / savedGames) * 1000) / 10
       : null;
   const showSaved = !!agg && savedGames > 0;
+  const savedPeerMean = sumPeerMeans(
+    baselines,
+    peerBand,
+    peerSpeed,
+    "endgame_theoretical_saved_win_pct",
+    "endgame_theoretical_saved_draw_pct"
+  );
 
   if (!agg && (gamesLoading || endgamePhaseLoading)) {
     return <Text style={styles.hint}>Loading endgame metrics…</Text>;
@@ -562,10 +650,11 @@ export function EndgameInsightsPanel() {
             <MetricBanner
               name="Theoretical Endgames Saved"
               value={savedRatePct.toFixed(1)}
-              unit="%"
+              unit="% games"
               userNum={savedRatePct}
               baselineKey="endgame_theoretical_saved_win_pct"
-              scale={{ kind: "fixed", max: 100 }}
+              scale={{ kind: "benchmark", fallback: 50 }}
+              peerMeanOverride={savedPeerMean}
               baselines={baselines}
               peerBand={peerBand}
               peerSpeed={peerSpeed}
@@ -575,7 +664,7 @@ export function EndgameInsightsPanel() {
                   summary:
                     "Share of weaker-side theoretical endings you won or drew.",
                   detail:
-                    "Covers Queen vs Pawn, Rook vs Pawn, Bishop + Pawn vs Knight, and Two Pawns + Opposite Bishops when you held the disadvantaged side (not shown in Theoretical). Drawish types kept for both sides are excluded. Value is (wins + draws) / total such games × 100.",
+                    "Covers Queen vs Pawn, Rook vs Pawn, Bishop + Pawn vs Knight, and Two Pawns + Opposite Bishops when you held the disadvantaged side (not shown in Theoretical). Drawish types kept for both sides are excluded. Value is (wins + draws) / total such games × 100. Peer marker uses peer win% + draw%.",
                 })
               }
             />
@@ -676,7 +765,7 @@ const styles = StyleSheet.create({
   familyMeta: {
     ...type.caption,
     color: colors.textDim,
-    marginBottom: spacing.sm,
+    marginTop: 2,
   },
   card: { marginBottom: spacing.sm },
   cardRow: {
@@ -733,7 +822,6 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     borderRadius: radius.pill,
-    backgroundColor: result.win,
   },
   stackWin: {
     position: "absolute",
@@ -748,7 +836,7 @@ const styles = StyleSheet.create({
     top: 0,
     bottom: 0,
     borderRadius: radius.pill,
-    backgroundColor: result.draw,
+    backgroundColor: colors.textDim,
   },
   bulletOverflow: {
     position: "absolute",
@@ -769,6 +857,14 @@ const styles = StyleSheet.create({
     backgroundColor: colors.cream,
     borderWidth: 1,
     borderColor: withAlpha("#000000", 0.35),
+  },
+  bulletZero: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: 1,
+    marginLeft: -0.5,
+    backgroundColor: withAlpha("#ffffff", 0.24),
   },
   helpBackdrop: {
     flex: 1,

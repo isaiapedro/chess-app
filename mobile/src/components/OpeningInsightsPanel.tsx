@@ -17,8 +17,10 @@ import {
   type BaselineMetricHit,
   type BaselineStore,
 } from "../data/baselines";
+import { peerImpactColor } from "../data/metricPolarity";
 import type { OpeningSideCard } from "../engine/openingPhase";
-import { Ionicons } from "@expo/vector-icons";
+import { Info, X } from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
@@ -40,7 +42,7 @@ const GENERAL_METRICS: MetricDef[] = [
   {
     name: "Opening Accuracy",
     key: "opening_accuracy_pct",
-    unit: "%",
+    unit: "score",
     summary: "Move quality in the opening from eval win-probability swings.",
     detail:
       "For each of your moves in the opening phase we convert engine evals to win probability before and after the move, then score Accuracy% = 103.1668 × exp(-0.04354 × (win%Before − win%After)) − 3.1669 (clamped 0–100). The reported value is the mean across scored moves. Needs games with evaluations.",
@@ -50,17 +52,17 @@ const GENERAL_METRICS: MetricDef[] = [
   {
     name: "Development Speed",
     key: "opening_minors_developed_by_10",
-    unit: "",
+    unit: "per game",
     summary: "Knights and bishops that left home by move 10 (0–4).",
     detail:
       "Tracks your four minor starting squares (b1/g1/c1/f1 or b8/g8/c8/f8). A piece counts once it leaves its home square, even if it is later traded off the board. Snapshot after fullmove 10. Maximum is 4.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 4 },
+    scale: { kind: "benchmark", fallback: 4 },
   },
   {
     name: "Center Control",
     key: "opening_center_control_pct",
-    unit: "%",
+    unit: "% squares",
     summary: "Share of d4/e4/d5/e5 you occupy or attack.",
     detail:
       "Each opening position scores the four central squares independently. A square counts only if you occupy it, or it is empty and you attack it (attacking an enemy piece on a center square does not count). Controlling all four = 100%, two = 50%. Reported value is the mean of those per-position percentages across the opening phase.",
@@ -70,7 +72,7 @@ const GENERAL_METRICS: MetricDef[] = [
   {
     name: "King Safety",
     key: "opening_castle_fullmove",
-    unit: "",
+    unit: "fullmove",
     summary: "Average fullmove when you castled (castled games only).",
     detail:
       "Absolute castling fullmove with no cap. Games where you never castled are excluded from this mean. Lower usually means you tucked the king away earlier.",
@@ -80,27 +82,27 @@ const GENERAL_METRICS: MetricDef[] = [
   {
     name: "Uncastled Games",
     key: "opening_uncastled_rate_pct",
-    unit: "%",
+    unit: "% games",
     summary: "Share of games where you never castled.",
     detail:
       "Percentage of analyzed games with no castling move by you. Complements King Safety, which only averages castled games.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 20 },
   },
   {
     name: "Tempo Balance",
     key: "opening_tempo_waste_rate_pct",
-    unit: "%",
+    unit: "% moves",
     summary: "Share of non-pawn opening moves (incl. castle) that re-move a piece before development finishes.",
     detail:
       "Counts every non-pawn move you make in the opening phase (minors, majors, king moves, and castling all count as tempo moves), up through the phase end (castling move when you castle, otherwise the opening cutoff). A re-move is leaving a square that piece already moved from while fewer than 4 of your minors have ever left home. TempoWaste% = re-moves ÷ all those non-pawn opening moves × 100. Lower means cleaner development.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 25 },
   },
   {
     name: "Pawn Moves",
     key: "opening_pawn_moves_avg",
-    unit: "/game",
+    unit: "per game",
     summary: "Average pawn moves you made during the opening phase.",
     detail:
       "Counts every pawn move you make while still in the opening (through castling fullmove if you castle, otherwise the opening cutoff). Averaged across games.",
@@ -119,50 +121,50 @@ const OPENING_CARD_METRICS: Array<{
   {
     name: "Win Rate",
     key: "win_rate",
-    unit: "%",
+    unit: "% wins",
     scale: { kind: "fixed", max: 100 },
     baselineKey: "win_rate",
   },
   {
     name: "Opening Accuracy",
     key: "opening_accuracy_pct",
-    unit: "%",
+    unit: "score",
     scale: { kind: "fixed", max: 100 },
     baselineKey: "opening_accuracy_pct",
   },
   {
     name: "Development Speed",
     key: "opening_minors_developed_by_10",
-    unit: "",
-    scale: { kind: "fixed", max: 4 },
+    unit: "per game",
+    scale: { kind: "benchmark", fallback: 4 },
     baselineKey: "opening_minors_developed_by_10",
   },
   {
     name: "Center Control",
     key: "opening_center_control_pct",
-    unit: "%",
+    unit: "% squares",
     scale: { kind: "fixed", max: 100 },
     baselineKey: "opening_center_control_pct",
   },
   {
     name: "King Safety",
     key: "opening_castle_fullmove",
-    unit: "",
+    unit: "fullmove",
     scale: { kind: "benchmark", fallback: 12 },
     baselineKey: "opening_castle_fullmove",
   },
   {
     name: "Uncastled Games",
     key: "opening_uncastled_rate_pct",
-    unit: "%",
-    scale: { kind: "fixed", max: 100 },
+    unit: "% games",
+    scale: { kind: "benchmark", fallback: 20 },
     baselineKey: "opening_uncastled_rate_pct",
   },
   {
     name: "Tempo Balance",
     key: "opening_tempo_waste_rate_pct",
-    unit: "%",
-    scale: { kind: "fixed", max: 100 },
+    unit: "% moves",
+    scale: { kind: "benchmark", fallback: 25 },
     baselineKey: "opening_tempo_waste_rate_pct",
   },
 ];
@@ -214,16 +216,10 @@ function projectBenchmarkMax(
   hit: BaselineMetricHit | null,
   fallback: number
 ): number {
-  const parts = [fallback];
-  if (hit?.mean != null && Number.isFinite(hit.mean) && hit.mean > 0) {
-    parts.push(hit.mean * 1.6);
+  if (hit?.mean != null && Number.isFinite(hit.mean) && Math.abs(hit.mean) > 0) {
+    return Math.abs(hit.mean) * 2;
   }
-  if (hit?.p90 != null && Number.isFinite(hit.p90) && hit.p90 > 0) {
-    parts.push(hit.p90 * 1.25);
-  } else if (hit?.p75 != null && Number.isFinite(hit.p75) && hit.p75 > 0) {
-    parts.push(hit.p75 * 1.45);
-  }
-  return Math.max(...parts);
+  return fallback;
 }
 
 function resolveScaleMax(
@@ -238,10 +234,12 @@ function MetricBulletGraph({
   value,
   peerMean,
   scaleMax,
+  fillColor,
 }: {
   value: number | null | undefined;
   peerMean: number | null | undefined;
   scaleMax: number;
+  fillColor: string;
 }) {
   if (value == null || !Number.isFinite(value) || !(scaleMax > 0)) return null;
   const fillPct = Math.max(0, (value / scaleMax) * 100);
@@ -255,7 +253,10 @@ function MetricBulletGraph({
         <View
           style={[
             styles.bulletFill,
-            { width: `${Math.min(fillPct, 100)}%` },
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: fillColor,
+            },
           ]}
         />
         {fillPct > 100 ? <View style={styles.bulletOverflow} /> : null}
@@ -292,7 +293,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Ionicons name="close" size={20} color={colors.textMuted} />
+              <AppIcon icon={X} size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -338,8 +339,12 @@ function MetricBanner({
       : null;
   const scaleMax = resolveScaleMax(scale, hit);
   const deltaLabel = peerDeltaLabel(userNum, hit?.mean, unit);
-  const deltaPositive =
-    userNum != null && hit?.mean != null && userNum >= hit.mean;
+  const impactColor = peerImpactColor(
+    userNum,
+    hit?.mean,
+    baselineKey,
+    scaleMax
+  );
   return (
     <EdgeCard style={styles.card}>
       <View style={styles.cardRow}>
@@ -351,12 +356,7 @@ function MetricBanner({
               {unit ? <Text style={styles.unit}> {unit}</Text> : null}
             </Text>
             {deltaLabel ? (
-              <Text
-                style={[
-                  styles.peerDelta,
-                  { color: deltaPositive ? result.win : result.loss },
-                ]}
-              >
+              <Text style={[styles.peerDelta, { color: impactColor }]}>
                 {deltaLabel}
               </Text>
             ) : null}
@@ -365,6 +365,7 @@ function MetricBanner({
             value={userNum}
             peerMean={hit?.mean}
             scaleMax={scaleMax}
+            fillColor={impactColor}
           />
         </View>
         {onHelp ? (
@@ -375,11 +376,7 @@ function MetricBanner({
             accessibilityLabel={`About ${name}`}
             style={styles.helpButton}
           >
-            <Ionicons
-                      name="information-circle-outline"
-                      size={20}
-                      color={colors.textDim}
-                    />
+            <AppIcon icon={Info} size={20} color={colors.textDim} />
           </Pressable>
         ) : null}
       </View>
@@ -655,7 +652,6 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     borderRadius: radius.pill,
-    backgroundColor: result.win,
   },
   stackWin: {
     position: "absolute",

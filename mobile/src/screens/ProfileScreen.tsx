@@ -1,14 +1,24 @@
 import React, { useState } from "react";
 import {
   ActivityIndicator,
-  InteractionManager,
+  Image,
   ScrollView,
   StyleSheet,
   Text,
   TextInput,
   View,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import {
+  Bell,
+  CircleAlert,
+  CircleCheck,
+  HardDrive,
+  Heart,
+  LogOut,
+  MessageCircle,
+  Shield,
+  User,
+} from "lucide-react-native";
 import {
   BrutalButton,
   Caption,
@@ -21,17 +31,16 @@ import {
 import { FadeFromBlank } from "../components/LoadingSkeletons";
 import { useAuth } from "../context/AuthContext";
 import { useFilters } from "../context/FilterContext";
-import { resetBackgroundWork } from "../engine/backgroundWork";
-import { cancelActiveGlobalScan } from "../engine/globalAnalysis";
-import { resetPrefetchMemory } from "../engine/studyPrefetch";
-import { clearAppCache } from "../storage/cache";
-import { resetBaselineMemoryCache } from "../data/baselines";
+import { AppIcon } from "../icons";
 import type { Platform } from "../api/types";
 import { colors, font, radius, result, spacing, type } from "../theme";
+import { AccountScreen } from "./AccountScreen";
+import { FeedbackScreen } from "./FeedbackScreen";
+import { NotificationsScreen } from "./NotificationsScreen";
+import { StorageScreen } from "./StorageScreen";
 
-// Not wired to a backend yet — surfaced as explicit placeholders.
-const BUG_REPORT_PLACEHOLDER = "Bug report destination not configured yet.";
 const DONATE_PLACEHOLDER = "Donation link not configured yet.";
+const PRIVACY_PLACEHOLDER = "Privacy & safety settings not configured yet.";
 
 export function ProfileScreen() {
   const auth = useAuth();
@@ -40,36 +49,12 @@ export function ProfileScreen() {
   const [chessUsername, setChessUsername] = useState("");
   const [chessEmail, setChessEmail] = useState("");
   const [busy, setBusy] = useState(false);
-  const [clearing, setClearing] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
   const [failed, setFailed] = useState(false);
-
-  const onClearCache = async () => {
-    if (clearing) return;
-    setClearing(true);
-    setStatus(null);
-    setFailed(false);
-    try {
-      cancelActiveGlobalScan();
-      resetPrefetchMemory();
-      resetBackgroundWork();
-      resetBaselineMemoryCache();
-      const removed = await clearAppCache();
-      setStatus(
-        removed
-          ? `Cleared ${removed} cached ${removed === 1 ? "entry" : "entries"}.`
-          : "Nothing cached."
-      );
-      InteractionManager.runAfterInteractions(() => {
-        refresh();
-      });
-    } catch (e) {
-      setFailed(true);
-      setStatus(e instanceof Error ? e.message : "Failed to clear cache");
-    } finally {
-      setClearing(false);
-    }
-  };
+  const [showAccount, setShowAccount] = useState(false);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [showStorage, setShowStorage] = useState(false);
+  const [showFeedback, setShowFeedback] = useState(false);
 
   const onChesscomLogin = async () => {
     if (busy) return;
@@ -125,6 +110,33 @@ export function ProfileScreen() {
   const platformLabel =
     auth.platform === "lichess" ? "Lichess" : "Chess.com";
 
+  if (showAccount) {
+    return (
+      <AccountScreen
+        onBack={() => setShowAccount(false)}
+        onDeleted={() => {
+          setShowAccount(false);
+          setStatus(null);
+          setFailed(false);
+        }}
+      />
+    );
+  }
+
+  if (showNotifications) {
+    return (
+      <NotificationsScreen onBack={() => setShowNotifications(false)} />
+    );
+  }
+
+  if (showStorage) {
+    return <StorageScreen onBack={() => setShowStorage(false)} />;
+  }
+
+  if (showFeedback) {
+    return <FeedbackScreen onBack={() => setShowFeedback(false)} />;
+  }
+
   return (
     <FadeFromBlank
       contentKey={`profile:${auth.isLoggedIn ? auth.username || "in" : "out"}`}
@@ -141,9 +153,17 @@ export function ProfileScreen() {
       {auth.isLoggedIn ? (
         <View style={styles.identity}>
           <View style={styles.avatar}>
-            <Text style={styles.avatarInitial}>
-              {(auth.username || "?").slice(0, 1).toUpperCase()}
-            </Text>
+            {auth.avatarUrl ? (
+              <Image
+                source={{ uri: auth.avatarUrl }}
+                style={styles.avatarImage}
+                accessibilityLabel={`${auth.username} avatar`}
+              />
+            ) : (
+              <Text style={styles.avatarInitial}>
+                {(auth.username || "?").slice(0, 1).toUpperCase()}
+              </Text>
+            )}
           </View>
           <View style={styles.identityText}>
             <Text style={styles.identityName} numberOfLines={1}>
@@ -151,7 +171,6 @@ export function ProfileScreen() {
             </Text>
             <Text style={styles.identityMeta} numberOfLines={1}>
               {platformLabel}
-              {auth.email ? ` · ${auth.email}` : ""}
             </Text>
           </View>
         </View>
@@ -222,51 +241,63 @@ export function ProfileScreen() {
       )}
 
       <View style={styles.section}>
-        <SectionLabel>Settings</SectionLabel>
-        <SettingsRow
-          label={clearing ? "Clearing cache…" : "Clear cached data"}
-          icon="trash-outline"
-          onPress={() => void onClearCache()}
-          showChevron={false}
-        />
-        <Divider />
-        <SettingsRow
-          label="Report a bug"
-          icon="bug-outline"
-          value="Placeholder"
-          onPress={() => {
-            setFailed(false);
-            setStatus(BUG_REPORT_PLACEHOLDER);
-          }}
-        />
-        <Divider />
         <SettingsRow
           label="Donate"
-          icon="heart-outline"
+          icon={Heart}
           value="Placeholder"
           onPress={() => {
             setFailed(false);
             setStatus(DONATE_PLACEHOLDER);
           }}
         />
-        {auth.isLoggedIn ? (
-          <>
-            <Divider />
-            <SettingsRow
-              label={busy ? "Signing out…" : "Log out"}
-              icon="log-out-outline"
-              tone={colors.red}
-              onPress={() => void onLogout()}
-              showChevron={false}
-            />
-          </>
-        ) : null}
+      </View>
+
+      <View style={styles.section}>
+        <SectionLabel>Settings</SectionLabel>
+        <SettingsRow
+          label="Account"
+          icon={User}
+          onPress={() => setShowAccount(true)}
+        />
+        <Divider />
+        <SettingsRow
+          label="Notifications"
+          icon={Bell}
+          onPress={() => setShowNotifications(true)}
+        />
+        <Divider />
+        <SettingsRow
+          label="Storage"
+          icon={HardDrive}
+          onPress={() => setShowStorage(true)}
+        />
+        <Divider />
+        <SettingsRow
+          label="Privacy & safety"
+          icon={Shield}
+          value="Placeholder"
+          onPress={() => {
+            setFailed(false);
+            setStatus(PRIVACY_PLACEHOLDER);
+          }}
+        />
+      </View>
+
+      <View style={styles.section}>
+        <SectionLabel>About</SectionLabel>
+        <SettingsRow label="Version" value="1.0.0" showChevron={false} />
+        <Divider />
+        <SettingsRow
+          label="Feedback"
+          icon={MessageCircle}
+          onPress={() => setShowFeedback(true)}
+        />
       </View>
 
       {status ? (
         <View style={styles.statusRow}>
-          <Ionicons
-            name={failed ? "alert-circle-outline" : "checkmark-circle-outline"}
+          <AppIcon
+            icon={failed ? CircleAlert : CircleCheck}
             size={16}
             color={failed ? result.loss : colors.sage}
           />
@@ -281,12 +312,17 @@ export function ProfileScreen() {
         </View>
       ) : null}
 
-      <View style={styles.section}>
-        <SectionLabel>About</SectionLabel>
-        <SettingsRow label="Version" value="Placeholder" showChevron={false} />
-        <Divider />
-        <SettingsRow label="Terms & privacy" value="Placeholder" />
-      </View>
+      {auth.isLoggedIn ? (
+        <View style={styles.section}>
+          <SettingsRow
+            label={busy ? "Signing out…" : "Log out"}
+            icon={LogOut}
+            tone={colors.red}
+            onPress={() => void onLogout()}
+            showChevron={false}
+          />
+        </View>
+      ) : null}
     </ScrollView>
     </FadeFromBlank>
   );
@@ -320,6 +356,13 @@ const styles = StyleSheet.create({
     backgroundColor: colors.mutedAlt,
     alignItems: "center",
     justifyContent: "center",
+    overflow: "hidden",
+    borderWidth: 0.5,
+    borderColor: "rgba(255,255,255,0.55)",
+  },
+  avatarImage: {
+    width: 64,
+    height: 64,
   },
   avatarInitial: {
     ...type.title,

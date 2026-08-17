@@ -96,6 +96,8 @@ import {
 export type PositionEval = {
   cpWhite: number;
   bestUci: string | null;
+  /** Top MultiPV lines (uci + STM cp). Needed for important-move gap. */
+  multipv?: Array<{ uci: string; cpWhite: number; pv?: string[] }>;
 };
 
 export type GlobalGameRecord = {
@@ -403,6 +405,7 @@ type CoachCachePly = {
   evalAfterCp: number | null;
   bestSan: string | null;
   mark: string | null;
+  lines?: Array<{ san: string; cpWhite: number; pvSan?: string[] }>;
 };
 
 /** Prefer Games-tab coach analysis when vault has no scan for this game yet. */
@@ -444,9 +447,23 @@ async function recordFromCoachCache(
     const beforeKey = fenKey(ply.fenBefore);
     if (ply.evalBeforeCp != null) {
       const bestUci = ply.bestSan ? sanToUci(ply.fenBefore, ply.bestSan) : "";
+      const multipv =
+        ply.lines && ply.lines.length >= 2
+          ? ply.lines
+              .slice(0, 3)
+              .map((line) => {
+                const uci = sanToUci(ply.fenBefore, line.san) || "";
+                return {
+                  uci,
+                  cpWhite: stmFromWhite(ply.fenBefore, line.cpWhite),
+                };
+              })
+              .filter((row) => row.uci)
+          : undefined;
       positions[beforeKey] = {
         cpWhite: stmFromWhite(ply.fenBefore, ply.evalBeforeCp),
         bestUci: bestUci || null,
+        multipv: multipv && multipv.length >= 2 ? multipv : undefined,
       };
     }
     if (ply.evalAfterCp != null) {
@@ -740,7 +757,19 @@ async function scanOneGame(
     }
     const raw = await evaluate(fen, SCAN_DEPTH, GLOBAL_MULTIPV, 0);
     const bestUci = raw.bestUci ? canonicalUci(fen, raw.bestUci) : null;
-    const stored = { cpWhite: raw.cpWhite, bestUci };
+    const multipv = (raw.multipv || [])
+      .slice(0, Math.max(1, GLOBAL_MULTIPV))
+      .map((row) => ({
+        uci: row.uci ? canonicalUci(fen, row.uci) || row.uci : row.uci,
+        cpWhite: row.cpWhite,
+        pv: row.pv,
+      }))
+      .filter((row) => row.uci);
+    const stored = {
+      cpWhite: raw.cpWhite,
+      bestUci,
+      multipv: multipv.length >= 2 ? multipv : undefined,
+    };
     positions[key] = stored;
     return {
       stored,

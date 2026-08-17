@@ -135,12 +135,8 @@ export function middlegameAttackSnaps(
   const ratio =
     attackers <= 0 ? 0 : Math.round((attackers / Math.max(1, defenders)) * 100) / 100;
 
-  const oppInCentre =
-    oppK &&
-    CENTRAL_FILES.has(squareFile(oppK)) &&
-    CENTRAL_RANKS.has(squareRank(oppK))
-      ? 1
-      : 0;
+  const oppFile = oppK ? squareFile(oppK) : -1;
+  const oppInCentre = oppFile === 3 || oppFile === 4 ? 1 : 0;
   const oppUncastled = oppK && !kingCastled(board, opp) ? 1 : 0;
   const holes = shieldHoles(board, opp);
   const openToward =

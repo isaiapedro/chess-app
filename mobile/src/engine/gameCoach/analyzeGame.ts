@@ -11,7 +11,6 @@ import { applyUciMove, fenKey, sanToUci, uciFromMove } from "../chessMoves";
 import { formatEval, toWhiteCp } from "../analyzeMistakes";
 import { applyForcedMateWhiteCp, bestStmCp } from "../forcedMate";
 import type { StudyGame } from "../analyzeMistakes";
-import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
 import {
   analyzeEvalBucketMetrics,
   mergeEndgameHeuristicWithBucket,
@@ -35,6 +34,7 @@ import {
 } from "./coachMarkClassify";
 import { mergeMultiPvGapLines, rankLinesByStm } from "./tacticSharpness";
 import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
+import { openingNamesMatch, variationEndPlyFromMap } from "../openingLines";
 import { shouldDropNoiseCoachMoment } from "./coachMomentNoise";
 import { formatOpeningLabel } from "./ecoLabels";
 import {
@@ -46,6 +46,7 @@ import {
   type CoachMetricMoment,
 } from "./gameMetricsLookup";
 import { expandCoachThemes, classifyUserError, shouldComposeNote, acceptKeyNote } from "./noteCompose";
+import { isCorruptPackNote } from "./derivedPolish";
 import { composeGameSummaryNote } from "./gameSummary";
 import {
   buildCommentRefs,
@@ -55,10 +56,8 @@ import { assessPositionPov } from "./positionPov";
 import type { VectorRetrieveFn } from "./retrieve";
 import {
   collectGameKeys,
-  collectGameKeysByPhase,
   PHASE_NOTE_LIMITS,
   type KeyTip,
-  type PhaseGameKeys,
   type PhaseName,
 } from "./keyRetrieve";
 import {
@@ -117,9 +116,6 @@ import { phaseForCoachMoment } from "./phaseSplits";
 import { loadBaselineStore } from "../../data/baselines";
 import type { Platform } from "../../api/types";
 import type { OpeningGameRow } from "../openingPhase";
-
-const MAX_PRO_THEORY_PLIES = 40;
-const BOOK_MIN_LOCAL_PCT = 2;
 
 function normalizeUserColor(raw?: string | null): "white" | "black" {
   const v = String(raw || "white").trim().toLowerCase();
@@ -201,6 +197,185 @@ export type AnalyzeProgress = {
   status: string;
 };
 
+const MAX_PRO_THEORY_PLIES = 40;
+const BOOK_MIN_LOCAL_PCT = 2;
+
+function explorerMoveGames(m: {
+  white?: number;
+  draws?: number;
+  black?: number;
+}): number {
+  return (m.white || 0) + (m.draws || 0) + (m.black || 0);
+}
+
+function explorerMoveShare(
+  moves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  uci: string,
+  san: string
+): { games: number; pct: number; rank: number | null } {
+  const normSan = san.replace(/[+#?!]+$/g, "");
+  const total = moves.reduce((s, m) => s + explorerMoveGames(m), 0);
+  if (total <= 0) return { games: 0, pct: 0, rank: null };
+  const ranked = [...moves].sort(
+    (a, b) =>
+      explorerMoveGames(b) - explorerMoveGames(a) ||
+      String(a.san || "").localeCompare(String(b.san || ""))
+  );
+  const idx = ranked.findIndex(
+    (m) =>
+      m.uci === uci ||
+      (m.san || "").replace(/[+#?!]+$/g, "") === normSan
+  );
+  if (idx < 0) return { games: 0, pct: 0, rank: null };
+  const games = explorerMoveGames(ranked[idx]);
+  return {
+    games,
+    pct: (games / total) * 100,
+    rank: idx + 1,
+  };
+}
+
+function moveStillInBook(
+  lichessMoves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  mastersMoves: Array<{
+    uci?: string;
+    san?: string;
+    white: number;
+    draws: number;
+    black: number;
+  }>,
+  uci: string,
+  san: string
+): boolean {
+  const li = explorerMoveShare(lichessMoves, uci, san);
+  const ma = explorerMoveShare(mastersMoves, uci, san);
+  const best = li.pct >= ma.pct ? li : ma;
+  if (best.games <= 0) return false;
+  if (best.pct + 1e-9 < BOOK_MIN_LOCAL_PCT) return false;
+  return true;
+}
+
+function evalSignCrosses(beforeCp: number, afterCp: number): boolean {
+  const eps = 25;
+  if (Math.abs(beforeCp) < eps || Math.abs(afterCp) < eps) return false;
+  return Math.sign(beforeCp) !== Math.sign(afterCp);
+}
+
+async function professionalTheoryEndPly(
+  skeleton: Array<{ ply: number; fenBefore: string; uci: string; san: string }>,
+  fetchExplorer: GameCoachExplorerFn,
+  openingName?: string | null,
+  signal?: { cancelled: boolean },
+  onProgress?: (status: string) => void
+): Promise<{
+  namedEndPly: number | null;
+  freqEndPly: number | null;
+  available: boolean;
+}> {
+  let namedEndPly: number | null = null;
+  let freqEndPly: number | null = null;
+  let explorerNamed = false;
+  let freqAlive = true;
+  const limit = Math.min(skeleton.length, MAX_PRO_THEORY_PLIES);
+  const gameOpeningName = String(openingName || "");
+  try {
+    for (let i = 0; i < limit; i += 1) {
+      if (signal?.cancelled) break;
+      const sk = skeleton[i];
+      onProgress?.(`Opening theory · move ${Math.ceil(sk.ply / 2)}`);
+      const [lichess, masters] = await Promise.all([
+        fetchExplorer(sk.fenBefore, "lichess"),
+        fetchExplorer(sk.fenBefore, "masters"),
+      ]);
+
+      if (gameOpeningName && !explorerNamed) {
+        const explorerOpeningName =
+          lichess.opening?.name || masters.opening?.name || null;
+        if (openingNamesMatch(explorerOpeningName, gameOpeningName)) {
+          namedEndPly = i > 0 ? i : null;
+          explorerNamed = true;
+        }
+      }
+
+      if (freqAlive) {
+        const known = moveStillInBook(
+          lichess.moves || [],
+          masters.moves || [],
+          sk.uci,
+          sk.san
+        );
+        if (!known) {
+          freqAlive = false;
+        } else {
+          freqEndPly = sk.ply;
+        }
+      }
+
+      if (explorerNamed && !freqAlive) break;
+    }
+    return {
+      namedEndPly,
+      freqEndPly,
+      available: true,
+    };
+  } catch {
+    return { namedEndPly: null, freqEndPly: null, available: false };
+  }
+}
+
+function resolveBookEndPly(args: {
+  mapEndPly: number | null;
+  namedEndPly: number | null;
+  freqEndPly: number | null;
+  proAvailable: boolean;
+}): number | null {
+  if (args.mapEndPly != null) return args.mapEndPly;
+  if (args.namedEndPly != null) return args.namedEndPly;
+  if (args.proAvailable && args.freqEndPly != null) return args.freqEndPly;
+  return null;
+}
+
+function trimBookEndByWinProb(
+  plies: GameCoachPly[],
+  theoryEndPly: number | null,
+  userIsWhite: boolean
+): number | null {
+  if (theoryEndPly == null || theoryEndPly <= 0) return null;
+  let end = theoryEndPly;
+  for (const p of plies) {
+    if (p.ply > theoryEndPly) break;
+    if (p.evalBeforeCp == null || p.evalAfterCp == null) continue;
+
+    const beforeUser = userIsWhite ? p.evalBeforeCp : -p.evalBeforeCp;
+    const afterUser = userIsWhite ? p.evalAfterCp : -p.evalAfterCp;
+    if (evalSignCrosses(beforeUser, afterUser)) {
+      end = p.ply - 1;
+      break;
+    }
+
+    const wpBefore = userWinProbability(p.evalBeforeCp, userIsWhite);
+    const wpAfter = userWinProbability(p.evalAfterCp, userIsWhite);
+    const absDelta = Math.abs(wpAfter - wpBefore);
+    if (absDelta + 1e-9 >= WP_INACCURACY_DROP) {
+      end = p.ply - 1;
+      break;
+    }
+  }
+  return end > 0 ? end : null;
+}
+
 function phaseForPly(
   ply: number,
   pieceCount: number,
@@ -225,16 +400,19 @@ function studyGameFromOptions(args: {
   userRating?: number | null;
   speed?: string | null;
   timeControl?: string | null;
+  result?: string | null;
+  createdAt?: string | null;
+  opponentName?: string | null;
 }): StudyGame {
   return {
     id: args.gameId,
-    created_at: new Date().toISOString(),
+    created_at: args.createdAt || new Date().toISOString(),
     speed: args.speed || "blitz",
     user_color: args.userColor,
-    result: "Unknown",
+    result: args.result || "",
     opening_name: args.opening != null ? args.opening : undefined,
     opening_eco: args.eco != null ? args.eco : undefined,
-    opponent_name: "Opponent",
+    opponent_name: args.opponentName || undefined,
     pgn_str: args.pgn || "",
     moves_str: args.moves || "",
     time_control: args.timeControl != null ? args.timeControl : undefined,
@@ -316,210 +494,6 @@ function sansAfterIndex(
     if (san) out.push(san);
   }
   return out;
-}
-
-function explorerMoveGames(m: {
-  white?: number;
-  draws?: number;
-  black?: number;
-}): number {
-  return (m.white || 0) + (m.draws || 0) + (m.black || 0);
-}
-
-function explorerContainsMove(
-  moves: Array<{
-    uci?: string;
-    san?: string;
-    white: number;
-    draws: number;
-    black: number;
-  }>,
-  uci: string,
-  san: string
-): boolean {
-  const normSan = san.replace(/[+#?!]+$/g, "");
-  const hit =
-    moves.find((m) => m.uci === uci) ||
-    moves.find((m) => (m.san || "").replace(/[+#?!]+$/g, "") === normSan);
-  return Boolean(hit && explorerMoveGames(hit) > 0);
-}
-
-function explorerMoveShare(
-  moves: Array<{
-    uci?: string;
-    san?: string;
-    white: number;
-    draws: number;
-    black: number;
-  }>,
-  uci: string,
-  san: string
-): { games: number; pct: number; rank: number | null } {
-  const normSan = san.replace(/[+#?!]+$/g, "");
-  const total = moves.reduce((s, m) => s + explorerMoveGames(m), 0);
-  if (total <= 0) return { games: 0, pct: 0, rank: null };
-  const ranked = [...moves].sort(
-    (a, b) =>
-      explorerMoveGames(b) - explorerMoveGames(a) ||
-      String(a.san || "").localeCompare(String(b.san || ""))
-  );
-  const idx = ranked.findIndex(
-    (m) =>
-      m.uci === uci ||
-      (m.san || "").replace(/[+#?!]+$/g, "") === normSan
-  );
-  if (idx < 0) return { games: 0, pct: 0, rank: null };
-  const games = explorerMoveGames(ranked[idx]);
-  return {
-    games,
-    pct: (games / total) * 100,
-    rank: idx + 1,
-  };
-}
-
-function moveStillInBook(
-  lichessMoves: Array<{
-    uci?: string;
-    san?: string;
-    white: number;
-    draws: number;
-    black: number;
-  }>,
-  mastersMoves: Array<{
-    uci?: string;
-    san?: string;
-    white: number;
-    draws: number;
-    black: number;
-  }>,
-  uci: string,
-  san: string
-): boolean {
-  const li = explorerMoveShare(lichessMoves, uci, san);
-  const ma = explorerMoveShare(mastersMoves, uci, san);
-  const best = li.pct >= ma.pct ? li : ma;
-  if (best.games <= 0) return false;
-  if (best.pct + 1e-9 < BOOK_MIN_LOCAL_PCT) return false;
-  return true;
-}
-
-function evalSignCrosses(beforeCp: number, afterCp: number): boolean {
-  const eps = 25;
-  if (Math.abs(beforeCp) < eps || Math.abs(afterCp) < eps) return false;
-  return Math.sign(beforeCp) !== Math.sign(afterCp);
-}
-
-/**
- * Opening-puzzle theory end (1-based ply), matching analyzeOpenings:
- * map variation leaf, else explorer named-opening leaf, else frequency book.
- */
-async function professionalTheoryEndPly(
-  skeleton: Array<{ ply: number; fenBefore: string; uci: string; san: string }>,
-  fetchExplorer: GameCoachExplorerFn,
-  openingName?: string | null,
-  signal?: { cancelled: boolean },
-  onProgress?: (status: string) => void
-): Promise<{
-  namedEndPly: number | null;
-  freqEndPly: number | null;
-  available: boolean;
-}> {
-  let namedEndPly: number | null = null;
-  let freqEndPly: number | null = null;
-  let explorerNamed = false;
-  let freqAlive = true;
-  const limit = Math.min(skeleton.length, MAX_PRO_THEORY_PLIES);
-  const gameOpeningName = String(openingName || "");
-  try {
-    for (let i = 0; i < limit; i += 1) {
-      if (signal?.cancelled) break;
-      const sk = skeleton[i];
-      onProgress?.(`Opening theory · move ${Math.ceil(sk.ply / 2)}`);
-      const [lichess, masters] = await Promise.all([
-        fetchExplorer(sk.fenBefore, "lichess"),
-        fetchExplorer(sk.fenBefore, "masters"),
-      ]);
-
-      if (gameOpeningName && !explorerNamed) {
-        const explorerOpeningName =
-          lichess.opening?.name || masters.opening?.name || null;
-        if (openingNamesMatch(explorerOpeningName, gameOpeningName)) {
-          // fenBefore already named leaf → last book move was previous ply
-          // (same as analyzeOpenings compoundStartPly = 0-based i → 1-based end = i)
-          namedEndPly = i > 0 ? i : null;
-          explorerNamed = true;
-        }
-      }
-
-      if (freqAlive) {
-        const known = moveStillInBook(
-          lichess.moves || [],
-          masters.moves || [],
-          sk.uci,
-          sk.san
-        );
-        if (!known) {
-          freqAlive = false;
-        } else {
-          freqEndPly = sk.ply;
-        }
-      }
-
-      if (explorerNamed && !freqAlive) break;
-    }
-    return {
-      namedEndPly,
-      freqEndPly,
-      available: true,
-    };
-  } catch {
-    return { namedEndPly: null, freqEndPly: null, available: false };
-  }
-}
-
-function resolveBookEndPly(args: {
-  mapEndPly: number | null;
-  namedEndPly: number | null;
-  freqEndPly: number | null;
-  proAvailable: boolean;
-}): number | null {
-  // Same priority as opening puzzles: named map/line first, then explorer name.
-  if (args.mapEndPly != null) return args.mapEndPly;
-  if (args.namedEndPly != null) return args.namedEndPly;
-  if (args.proAvailable && args.freqEndPly != null) return args.freqEndPly;
-  return null;
-}
-
-/**
- * Book stays quiet: no +/- eval flip, no WP swing into the 5–10pp+ band.
- */
-function trimBookEndByWinProb(
-  plies: GameCoachPly[],
-  theoryEndPly: number | null,
-  userIsWhite: boolean
-): number | null {
-  if (theoryEndPly == null || theoryEndPly <= 0) return null;
-  let end = theoryEndPly;
-  for (const p of plies) {
-    if (p.ply > theoryEndPly) break;
-    if (p.evalBeforeCp == null || p.evalAfterCp == null) continue;
-
-    const beforeUser = userIsWhite ? p.evalBeforeCp : -p.evalBeforeCp;
-    const afterUser = userIsWhite ? p.evalAfterCp : -p.evalAfterCp;
-    if (evalSignCrosses(beforeUser, afterUser)) {
-      end = p.ply - 1;
-      break;
-    }
-
-    const wpBefore = userWinProbability(p.evalBeforeCp, userIsWhite);
-    const wpAfter = userWinProbability(p.evalAfterCp, userIsWhite);
-    const absDelta = Math.abs(wpAfter - wpBefore);
-    if (absDelta + 1e-9 >= WP_INACCURACY_DROP) {
-      end = p.ply - 1;
-      break;
-    }
-  }
-  return end > 0 ? end : null;
 }
 
 export function linesFromEval(
@@ -842,6 +816,9 @@ export async function analyzeSelectedGame(options: {
   userRating?: number | null;
   speed?: string | null;
   timeControl?: string | null;
+  result?: string | null;
+  createdAt?: string | null;
+  opponentName?: string | null;
   metrics?: CoachGameMetrics | null;
   evaluate: EvalFn;
   depth?: number;
@@ -909,6 +886,9 @@ export async function analyzeSelectedGame(options: {
     userRating: options.userRating,
     speed: options.speed,
     timeControl: options.timeControl,
+    result: options.result,
+    createdAt: options.createdAt,
+    opponentName: options.opponentName,
   });
   const heuristicRows = await analyzeHeuristicGame(studyGame, {
     signal: options.signal,
@@ -1066,7 +1046,6 @@ export async function analyzeSelectedGame(options: {
   let namedEndPly: number | null = null;
   let freqEndPly: number | null = null;
   let proAvailable = false;
-  // Local opening map already decides book end — skip Lichess/masters explorer walk.
   if (options.fetchExplorer && skeleton.length && mapEndPly == null) {
     options.onProgress?.({
       ply: 0,
@@ -1218,7 +1197,7 @@ export async function analyzeSelectedGame(options: {
               lines,
               fenBefore: sk.fenBefore,
               playedSan: sk.san,
-              missedOpportunity,
+              missedOpportunity: isUserPly ? missedOpportunity : false,
             })
           : null;
 
@@ -1785,22 +1764,32 @@ export async function analyzeSelectedGame(options: {
           evalMetrics.endgameEval
         )
       : heuristicRows.endgame;
+  const vaultProduct = buildVaultProductFromPlies({
+    gameId: options.gameId,
+    pgn: options.pgn,
+    moves: options.moves,
+    eco: options.eco,
+    opening: options.opening,
+    userColor: options.userColor,
+    plies,
+    positions: { ...sharedPositions, ...collectedPositions },
+  });
   const liveMoments = { ...metrics.momentsByPly };
-  if (openingMerged && mergedMg && mergedEg) {
+  if (openingMerged && heuristicRows.middlegame && mergedEg) {
     metrics = buildCoachGameMetrics({
       record: {
         evalsWhiteCp: evalsCp,
-        openingCandidates: vaultRecord?.openingCandidates,
-        mistakeCandidates: vaultRecord?.mistakeCandidates,
+        openingCandidates: vaultProduct.openingCandidates,
+        mistakeCandidates: vaultProduct.mistakeCandidates,
         opening_accuracy_pct: evalMetrics.opening_accuracy_pct,
         opening_accuracy_moves: evalMetrics.opening_accuracy_moves,
         middlegameEval: evalMetrics.middlegameEval,
-        endgameEval: evalMetrics.endgameEval,
+        endgameEval: null,
         style: evalMetrics.style,
       },
       heuristics: {
         opening: openingMerged,
-        middlegame: mergedMg,
+        middlegame: heuristicRows.middlegame,
         endgame: mergedEg,
       },
       userColor,
@@ -1812,7 +1801,7 @@ export async function analyzeSelectedGame(options: {
       momentsByPly: metrics.momentsByPly,
       opening: openingMerged,
       userColor,
-      badAccuracyMoves: vaultRecord?.openingCandidates?.length ?? null,
+      badAccuracyMoves: vaultProduct.openingCandidates.length,
       peer: peerCtx,
       openingName:
         formatOpeningLabel(options.eco, options.opening) ||
@@ -1869,14 +1858,6 @@ export async function analyzeSelectedGame(options: {
   });
   const coachPack = await loadCoachPack();
   const packByKey = getCoachPackByKey();
-  const phaseKeys: PhaseGameKeys = collectGameKeysByPhase({
-    entries: coachPack.entries,
-    byKey: packByKey,
-    eco: options.eco,
-    opening: options.opening,
-    themesByPhase: metrics.themesByPhase,
-    globalThemes: metrics.globalThemes,
-  });
   const gameKeys = collectGameKeys({
     entries: coachPack.entries,
     byKey: packByKey,
@@ -1885,19 +1866,6 @@ export async function analyzeSelectedGame(options: {
     themesByPhase: metrics.themesByPhase,
     globalThemes: metrics.globalThemes,
   });
-  if (openingKeyId) {
-    const hit =
-      packByKey?.get(openingKeyId) ||
-      coachPack.entries.find((e) => (e.keyId || e.id) === openingKeyId);
-    if (hit) {
-      phaseKeys.opening = [
-        hit,
-        ...phaseKeys.opening.filter(
-          (e) => (e.keyId || e.id) !== openingKeyId
-        ),
-      ];
-    }
-  }
 
   const pawnStormTracker = new PawnStormTracker(4);
   for (let i = 0; i < plies.length; i += 1) {
@@ -1920,6 +1888,9 @@ export async function analyzeSelectedGame(options: {
     }
     const pieceCount = ply.fenAfter.split(" ")[0].replace(/\d/g, "").length;
     const moment = metrics.momentsByPly[ply.ply] || null;
+    if (moment && i === plies.length - 1) {
+      moment.inputs = { ...(moment.inputs || {}), game_over: true };
+    }
     const phase = phaseForPly(
       ply.ply,
       pieceCount,
@@ -2051,7 +2022,7 @@ export async function analyzeSelectedGame(options: {
     }
 
     const tip = pickMetricTip({
-      entries: phaseKeys[phase],
+      entries: coachPack.entries,
       byKey: packByKey,
       metrics,
       phase,
@@ -2110,16 +2081,22 @@ export async function analyzeSelectedGame(options: {
       }
     }
     const tipHasSquares = /\b[a-h][1-8]\b/i.test(tip.text || "");
-    const note = acceptKeyNote(tip.text, usedTips, {
-      themes,
-      fenBefore: tipHasSquares ? ply.fenBefore : undefined,
-      san: tipHasSquares ? ply.san : undefined,
-      bestSan: tipHasSquares ? ply.bestSan : undefined,
-      bestPvSan: tipHasSquares ? ply.bestPvSan : undefined,
-      userColor,
-      phase,
-      noteId: tip.noteId,
-    });
+    const alwaysAttach =
+      noteRequest != null && requestAlwaysAttaches(noteRequest.kind);
+    const rawNote = (tip.text || "").replace(/\s+/g, " ").trim();
+    if (!rawNote || isCorruptPackNote(rawNote)) continue;
+    const note = alwaysAttach
+      ? rawNote
+      : acceptKeyNote(rawNote, usedTips, {
+          themes,
+          fenBefore: tipHasSquares ? ply.fenBefore : undefined,
+          san: tipHasSquares ? ply.san : undefined,
+          bestSan: tipHasSquares ? ply.bestSan : undefined,
+          bestPvSan: tipHasSquares ? ply.bestPvSan : undefined,
+          userColor,
+          phase,
+          noteId: tip.noteId,
+        });
     if (!note) continue;
     tip.text = note;
     ply.note = note;
@@ -2218,26 +2195,16 @@ export async function analyzeSelectedGame(options: {
       /* heuristics store write optional */
     }
     try {
-      const product = buildVaultProductFromPlies({
-        gameId: options.gameId,
-        pgn: options.pgn,
-        moves: options.moves,
-        eco: options.eco,
-        opening: options.opening,
-        userColor: options.userColor,
-        plies,
-        positions: { ...sharedPositions, ...collectedPositions },
-      });
       await upsertSharedGameEvals(filters, options.gameId, {
-        positions: product.positions,
-        evalsWhiteCp: product.evalsWhiteCp,
-        mistakeCandidates: product.mistakeCandidates,
-        openingCandidates: product.openingCandidates,
-        opening_accuracy_pct: product.opening_accuracy_pct,
-        opening_accuracy_moves: product.opening_accuracy_moves,
-        endgameEval: product.endgameEval ?? evalMetrics.endgameEval,
-        middlegameEval: product.middlegameEval ?? evalMetrics.middlegameEval,
-        style: product.style ?? evalMetrics.style,
+        positions: vaultProduct.positions,
+        evalsWhiteCp: vaultProduct.evalsWhiteCp,
+        mistakeCandidates: vaultProduct.mistakeCandidates,
+        openingCandidates: vaultProduct.openingCandidates,
+        opening_accuracy_pct: vaultProduct.opening_accuracy_pct,
+        opening_accuracy_moves: vaultProduct.opening_accuracy_moves,
+        endgameEval: vaultProduct.endgameEval ?? evalMetrics.endgameEval,
+        middlegameEval: vaultProduct.middlegameEval ?? evalMetrics.middlegameEval,
+        style: vaultProduct.style ?? evalMetrics.style,
         preferExistingMeta: false,
       });
     } catch {
@@ -2250,9 +2217,31 @@ export async function analyzeSelectedGame(options: {
     openingLabel,
     analyzedAt: Date.now(),
     depth,
-    plies,
+    plies: stampAccuracyMarks(plies),
     notesCount: plies.filter((p) => p.note).length,
   };
+}
+
+export function stampAccuracyMarks(plies: GameCoachPly[]): GameCoachPly[] {
+  let changed = false;
+  const next = plies.map((ply) => {
+    if (ply.mark != null) return ply;
+    if (ply.evalBeforeCp == null || ply.evalAfterCp == null) return ply;
+    const playedBest = Boolean(ply.bestSan && ply.bestSan === ply.san);
+    const mark = classifyCoachMark({
+      side: ply.side,
+      evalBeforeCp: ply.evalBeforeCp,
+      evalAfterCp: ply.evalAfterCp,
+      playedBest,
+      lines: ply.lines,
+      fenBefore: ply.fenBefore,
+      playedSan: ply.san,
+    });
+    if (!mark) return ply;
+    changed = true;
+    return { ...ply, mark };
+  });
+  return changed ? next : plies;
 }
 
 export function buildReplayPlies(pgnOrMoves: string): GameCoachPly[] {

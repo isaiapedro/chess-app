@@ -3,6 +3,10 @@ import type { CoachGameMetrics } from "./gameMetricsLookup";
 import { type KeyTip, type PhaseName } from "./keyRetrieve";
 import type { DerivedCoachEntry } from "./derivedCoachPack";
 import { cleanBookProse } from "./derivedPolish";
+import {
+  buildEvalSwingIndex,
+  formatEvalSwingSummary,
+} from "./evalSwingIndex";
 
 type SummaryPly = {
   side: "white" | "black";
@@ -13,22 +17,9 @@ type SummaryPly = {
   ply?: number;
   fenAfter?: string;
   deltaCp?: number;
+  evalBeforeCp?: number;
+  evalAfterCp?: number;
 };
-
-const GOOD_MARKS = new Set<CoachMark>([
-  "best",
-  "important",
-  "excellent",
-  "good",
-  "brilliant",
-]);
-
-const BAD_MARKS = new Set<CoachMark>([
-  "blunder",
-  "mistake",
-  "missed",
-  "inaccuracy",
-]);
 
 function tipPhase(tip: KeyTip): PhaseName {
   const p = (tip.phase || "").toLowerCase();
@@ -39,14 +30,32 @@ function tipPhase(tip: KeyTip): PhaseName {
   return "middlegame";
 }
 
-function tipLesson(tip: KeyTip | null | undefined, max = 140): string {
+function firstHumanSentence(raw: string, max = 160): string {
+  const t = (raw || "").replace(/\s+/g, " ").trim();
+  if (!t) return "";
+  const m = t.match(/^[^.!?]+[.!?]?/);
+  const s = (m ? m[0] : t).trim();
+  if (s.length <= max) return s;
+  return `${s.slice(0, max - 1).replace(/\s+\S*$/, "")}.`;
+}
+
+function tipLesson(tip: KeyTip | null | undefined, max = 160): string {
   if (!tip) return "";
-  const fromCompact = cleanBookProse(
-    tip.compactDefinition || tip.noteCompact || "",
+  const fromText = firstHumanSentence(cleanBookProse(tip.text || "", max) || tip.text || "", max);
+  if (fromText) return fromText;
+  return firstHumanSentence(
+    cleanBookProse(tip.compactDefinition || tip.noteCompact || "", max),
     max
   );
-  const fromText = cleanBookProse(tip.text || "", max);
-  return fromCompact || fromText;
+}
+
+function plyNoteAt(
+  plies: SummaryPly[],
+  ply: number | undefined
+): string {
+  if (ply == null) return "";
+  const hit = plies.find((p) => p.ply === ply && p.note);
+  return firstHumanSentence(hit?.note || "", 160);
 }
 
 function sortedTips(tips: KeyTip[]): KeyTip[] {
@@ -65,21 +74,6 @@ function uniqueTips(tips: KeyTip[]): KeyTip[] {
     out.push(t);
   }
   return out;
-}
-
-function formatThemeList(themes: string[], max = 4): string {
-  const cleaned = themes
-    .map((t) =>
-      t.includes(".")
-        ? t.split(".").slice(1).join(".").replace(/_/g, " ")
-        : t.replace(/_/g, " ")
-    )
-    .filter((t) => t.length >= 3)
-    .slice(0, max);
-  if (!cleaned.length) return "";
-  if (cleaned.length === 1) return cleaned[0]!;
-  if (cleaned.length === 2) return `${cleaned[0]} and ${cleaned[1]}`;
-  return `${cleaned.slice(0, -1).join(", ")}, and ${cleaned[cleaned.length - 1]}`;
 }
 
 function structuralMoments(
@@ -143,101 +137,68 @@ export function composeGameSummaryNote(args: {
   const label = (args.openingLabel || "").trim();
   const userPlies = args.plies.filter((p) => p.side === args.userColor);
 
-  // —— Early game ——
-  const openThemes = metrics?.themesByPhase.opening || [];
+  const openMom = structuralMoments(metrics).find(
+    (m) =>
+      m.structuralKind === "opening_name" ||
+      m.structuralKind === "opening_aggregate"
+  );
   const openTip =
     sortedTips(byPhase.opening)[0] ||
     (args.openingPackKey
       ? tips.find((t) => t.keyId === args.openingPackKey) || null
       : null);
-  const openLesson = tipLesson(openTip, 130);
-  const openThemeStr = formatThemeList(openThemes, 3);
-  const openStructural = structuralMoments(metrics).filter(
-    (m) =>
-      m.structuralKind === "opening_name" ||
-      m.structuralKind === "opening_aggregate"
-  );
-  const earlyBad = userPlies.filter(
-    (p) =>
-      p.mark &&
-      BAD_MARKS.has(p.mark) &&
-      (p.ply == null ||
-        (metrics?.phaseBounds?.middlegameStartPly0 != null
-          ? p.ply - 1 < metrics.phaseBounds.middlegameStartPly0
-          : (p.ply || 0) <= 20))
-  ).length;
+  const openLesson =
+    plyNoteAt(args.plies, openMom?.ply) || tipLesson(openTip, 160);
   {
-    let body = label || "Early game";
-    if (openThemeStr) body += ` — metrics flagged ${openThemeStr}`;
-    if (openStructural.length) {
-      body += `. Checkpoints at moves 5/10 locked the opening plan`;
-    }
-    if (earlyBad) {
-      body += `. ${earlyBad} early inaccuracy${earlyBad === 1 ? "" : "ies"} need review`;
-    }
-    if (openLesson) body += `. ${openLesson}`;
-    else if (!openThemeStr) {
-      body +=
-        ". Develop minors, claim a centre share, and castle before the middlegame plan starts.";
-    }
-    parts.push(`Early game: ${body}`);
+    const name = label || "the opening";
+    const body = openLesson
+      ? `${name}. ${openLesson}`
+      : `${name}. Develop, castle, and fight for the typical plan of this opening.`;
+    parts.push(`Early game: ${firstHumanSentence(body, 200)}`);
   }
 
-  // —— Middlegame ——
-  const midThemes = formatThemeList(metrics?.themesByPhase.middlegame || [], 4);
-  const midTip = sortedTips(byPhase.middlegame)[0] || null;
-  const midLesson = tipLesson(midTip, 120);
   const mgAgg = structuralMoments(metrics).find(
     (m) => m.structuralKind === "middlegame_aggregate"
   );
-  const liveStruct = structuralMoments(metrics).filter(
-    (m) => m.structuralKind === "decisive_pawn_break"
-  );
-  const midBad = userPlies.filter(
-    (p) => p.mark && BAD_MARKS.has(p.mark)
-  ).length;
-  const midGood = userPlies.filter(
-    (p) => p.mark && GOOD_MARKS.has(p.mark) && (p.mark === "brilliant" || p.mark === "important")
-  ).length;
+  const midTip = sortedTips(byPhase.middlegame)[0] || null;
+  const midLesson =
+    plyNoteAt(args.plies, mgAgg?.ply) || tipLesson(midTip, 160);
   {
-    let body = midThemes
-      ? `Metrics highlight ${midThemes}`
-      : "Plans, pawn levers, and king safety decided the phase";
-    if (mgAgg) body += ". Middlegame aggregate checkpoint closed the phase";
-    if (liveStruct.length) {
-      body += `. ${liveStruct.length} live pivot${liveStruct.length === 1 ? "" : "s"} (pawn break)`;
-    }
-    if (midBad || midGood) {
-      body += `. Accuracy: ${midGood} praise mark${midGood === 1 ? "" : "s"}, ${midBad} costly mark${midBad === 1 ? "" : "s"}`;
-    }
-    if (midLesson) body += `. ${midLesson}`;
-    else if (metrics?.weaknesses?.[0]) body += `. ${metrics.weaknesses[0]}`;
-    parts.push(`Middlegame: ${body}`);
+    const body = midLesson
+      ? midLesson
+      : "The middlegame turned on pawn levers, king safety, and whether you converted the edge.";
+    parts.push(`Middlegame: ${firstHumanSentence(body, 200)}`);
   }
 
-  // —— Late game ——
   const late = reachedEndgame(metrics, args.plies);
   if (late) {
-    const endThemes = formatThemeList(metrics?.themesByPhase.endgame || [], 3);
-    const endTip = sortedTips(byPhase.endgame)[0] || null;
-    const endLesson = tipLesson(endTip, 120);
     const egAdv = structuralMoments(metrics).find(
       (m) => m.structuralKind === "endgame_advantage"
     );
-    let body = endThemes
-      ? `Technique themes: ${endThemes}`
-      : "King activity, trades, and conversion paths take over";
-    if (egAdv?.inputs?.best_line_wp != null) {
-      body += `. Advantage checkpoint (~${egAdv.inputs.best_line_wp} WP)`;
-    } else if (egAdv) {
-      body += ". Endgame advantage checkpoint fired";
-    }
-    if (endLesson) body += `. ${endLesson}`;
-    parts.push(`Late game: ${body}`);
+    const endTip = sortedTips(byPhase.endgame)[0] || null;
+    const endLesson =
+      plyNoteAt(args.plies, egAdv?.ply) || tipLesson(endTip, 160);
+    const last = userPlies[userPlies.length - 1];
+    const mated = /#/.test(String(last?.note || "")) || last?.mark === "best";
+    const body = endLesson
+      ? endLesson
+      : mated
+        ? "You finished the game by delivering mate."
+        : "The ending asked for clean conversion without giving counterplay.";
+    parts.push(`Late game: ${firstHumanSentence(body, 200)}`);
   } else {
     parts.push(
-      "Late game: the game never fully entered a technical ending — treat the last phase as a converted middlegame."
+      "Late game: the game never fully entered a technical ending."
     );
+  }
+
+  const swingIndex = buildEvalSwingIndex({
+    plies: args.plies,
+    userColor: args.userColor,
+  });
+  const swingProse = formatEvalSwingSummary(swingIndex);
+  if (swingProse) {
+    parts.push(swingProse);
   }
 
   return parts.join("\n\n");

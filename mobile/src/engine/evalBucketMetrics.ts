@@ -52,33 +52,28 @@ export function analyzeEvalBucketMetrics(
 }
 
 export function mergeEndgameHeuristicWithBucket(
-  heuristic: {
-    reached_endgame: boolean;
-    endgame_start_ply: number | null;
-    king_centralization: number | null;
-    king_distance: number | null;
-    pawn_diff: number | null;
-    theoretical: Partial<Record<TheoreticalKey, true>>;
-    theoretical_saved: boolean;
-    result: string;
-  },
+  heuristic: EndgameGameRow,
   bucket: EndgameEvalBucket | null | undefined
 ): EndgameGameRow {
   return {
+    ...heuristic,
     reached_endgame: heuristic.reached_endgame,
     endgame_start_ply: heuristic.endgame_start_ply,
-    blunders: bucket?.blunders ?? 0,
+    blunders: bucket?.blunders ?? heuristic.blunders ?? 0,
     king_centralization: heuristic.king_centralization,
     king_distance: heuristic.king_distance,
     pawn_diff: heuristic.pawn_diff,
-    piece_trades: bucket?.piece_trades ?? 0,
-    beneficial_trades: bucket?.beneficial_trades ?? 0,
-    winning_trades: bucket?.winning_trades ?? 0,
-    simplification_trades: bucket?.simplification_trades ?? 0,
-    mate_episodes: bucket?.mate_episodes ?? 0,
-    mate_converted: bucket?.mate_converted ?? 0,
-    accidental_stalemate: bucket?.accidental_stalemate ?? false,
-    mate_move_times: bucket?.mate_move_times ?? [],
+    piece_trades: bucket?.piece_trades ?? heuristic.piece_trades ?? 0,
+    beneficial_trades:
+      bucket?.beneficial_trades ?? heuristic.beneficial_trades ?? 0,
+    winning_trades: bucket?.winning_trades ?? heuristic.winning_trades ?? 0,
+    simplification_trades:
+      bucket?.simplification_trades ?? heuristic.simplification_trades ?? 0,
+    mate_episodes: bucket?.mate_episodes ?? heuristic.mate_episodes ?? 0,
+    mate_converted: bucket?.mate_converted ?? heuristic.mate_converted ?? 0,
+    accidental_stalemate:
+      bucket?.accidental_stalemate ?? heuristic.accidental_stalemate ?? false,
+    mate_move_times: bucket?.mate_move_times ?? heuristic.mate_move_times ?? [],
     theoretical: heuristic.theoretical,
     theoretical_saved: heuristic.theoretical_saved,
     result: heuristic.result,

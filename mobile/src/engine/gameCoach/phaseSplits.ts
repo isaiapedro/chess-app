@@ -10,6 +10,58 @@ export type PhaseSplits = {
   endgameStartPlyIndex: number | null;
 };
 
+export type CoachPhaseName = "opening" | "middlegame" | "endgame";
+
+export type CoachPhaseBounds = {
+  middlegameStartPly0: number | null;
+  endgameStartPly0: number | null;
+};
+
+/**
+ * Board phase from heuristic bounds (0-based) vs display ply (1-based).
+ * Falls back to piece-count heuristics when bounds missing.
+ */
+export function phaseForPlyBounds(
+  ply1: number,
+  pieceCount: number,
+  bounds?: CoachPhaseBounds | null
+): CoachPhaseName {
+  const eg0 = bounds?.endgameStartPly0;
+  const mg0 = bounds?.middlegameStartPly0;
+  if (eg0 != null && ply1 - 1 >= eg0) return "endgame";
+  if (mg0 != null && ply1 - 1 >= mg0) return "middlegame";
+  if (mg0 != null && ply1 - 1 < mg0) return "opening";
+  if (ply1 <= 16 && pieceCount >= 28) return "opening";
+  if (pieceCount <= 12) return "endgame";
+  return "middlegame";
+}
+
+/**
+ * Coach tip/plan phase: structural checkpoints keep their phase even when
+ * placed on a phase-boundary ply (e.g. middlegame_aggregate @ endgame start).
+ */
+export function phaseForCoachMoment(args: {
+  ply1: number;
+  pieceCount?: number;
+  bounds?: CoachPhaseBounds | null;
+  structuralKind?: string | null;
+}): CoachPhaseName {
+  const sk = args.structuralKind;
+  if (sk === "opening_name" || sk === "opening_aggregate") return "opening";
+  if (
+    sk === "middlegame_aggregate" ||
+    sk === "decisive_pawn_break"
+  ) {
+    return "middlegame";
+  }
+  if (sk === "endgame_advantage") return "endgame";
+  return phaseForPlyBounds(
+    args.ply1,
+    args.pieceCount ?? 32,
+    args.bounds
+  );
+}
+
 /**
  * Same phase cuts as middlegame/opening/endgame metrics:
  * - Opening ends at openingPhaseEndFullmove(user castle) → MG starts at that × 2 plies

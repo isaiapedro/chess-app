@@ -156,7 +156,50 @@ Platform API responses are normalized into a common game record before any metri
 
 ### 2.6 Annotation script dump
 
-`scripts/annotate_metrics_pgn.ts` writes `Heuristic*` / `Eval*` headers into sample PGNs for parity checking between TS and Python.
+`scripts/annotate_metrics_pgn.ts` (via `annotate_metrics_pgn.mjs`) writes sample PGNs + JSON for parity checking and coach note debugging.
+
+**Outputs**
+
+| File | Contents |
+|------|----------|
+| `samples/metrics_all.pgn` | Full headers + per-ply comments |
+| `samples/metrics_all.json` | Structured dump of every metric row, candidates, coach themes, weight rules |
+| `samples/metrics_heuristics_only.pgn` / `metrics_with_eval.pgn` | Optional split (`WRITE_SPLIT!=0`) |
+
+**POV:** `USER_COLOR` env, else `Link username=`, else White/Black name match (`pedro`, …). Wrong POV flips every metric.
+
+**Headers**
+
+| Prefix | Source |
+|--------|--------|
+| `Opening_*` / `Middlegame_*` / `Endgame_*` | Full merged per-game rows (heuristics + eval fields) |
+| `Style_*` | Full `StyleGameRow` |
+| `EvalMG_*` / `EvalEG_*` | Raw eval buckets |
+| `OpeningCandidates*` / `MistakeCandidates*` | Vault-style moments (drop≥100cp, error marks, ply gates, priority sort, best SAN) |
+| `Coach*` | Themes, moments, strengths/weaknesses, attach/select/weight rules |
+
+**Move comments (user plies)**
+
+- `metricΔ[+h.field=… Δs.field:prev→next …]` — inserts/changes this ply (`h` heuristic, `s` style, `e` eval, `c` candidate/coach); full list in `timeline` / `timelineByPly` of `metrics_all.json`
+- `phase` / `mark` / `wpDrop` / `deltaCp` / `best=`
+- `noteRequest=kind=… playedΔ[…] engineLine=… engineΔ[…]` — request kind + metric payloads (`coachNoteRequest.ts`); bad/praise/structural moments; bad moves include played Δ and 4-move engine-line Δ; `opponent_mistake` prefers engine Δ; `decisive_pawn_break` includes opening + played Δ; praise = brilliant|important|excellent|best
+- `moment=structural:decisive_pawn_break|opponent_mistake|…` or praise via `inputs{praise_mark=…}`
+- `candidate=opening|mistake:pri=…:drop=…:best=…` when ply is a vault candidate
+- `noteAttach=yes|no(reason|…)` — `explainAttachMetricTip` (request-driven when `noteRequest` present)
+- `noteCalc #1:key=score(parts…) …` — full additive weight breakdown
+- `notePick selected=… score=… rule=…`
+- `noteAlt` / `noteSkip` — runners-up / structure-once skips
+
+Coach-only heuristic fields (timeline `h.*`, **not** Insights metrics tab): `*_pawn_breaks`, `*_defended_pawns`, `*_unblocking_bishop_{light,dark}`, `*_checks`, `*_blocking_checks`, MG/EG `*_pawn_moves`, `*_king_attackers_*`, MG/EG `*_seventh_rank_infiltration` (R+Q), MG/EG `*_open_file_utilization` (R+Q on open/semi-open for the side), EG `endgame_opposition` (Chebyshev ≤3, K+P only).
+
+**Timeline sources**
+
+| Prefix | When emitted |
+|--------|----------------|
+| `+h.` / `Δh.` | Castle, minors, tempo waste, pawn moves, center/space/attackers samples, IQP/doubled/backward first hit, phase bounds, theoretical endings |
+| `+s.` / `Δs.` | Style counters: sacrifice, flank, trades, threats, escapes, blunders, disadvantage, endgame advantage, MG/EG error buckets |
+| `+e.` / `Δe.` | Coach mark set; deltaCp ≥ 40 |
+| `+c.` | Opening/mistake candidate or coach moment inserted |
 
 ---
 

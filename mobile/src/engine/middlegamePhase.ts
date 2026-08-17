@@ -1,6 +1,7 @@
 import { Chess, type Color, type PieceSymbol, type Square } from "chess.js";
 import type { StudyGame } from "./analyzeMistakes";
 import {
+  HEURISTICS_STRUCTURE_PERSIST_PLIES,
   HEURISTICS_DOUBLED_PERSIST_PLIES,
   HEURISTICS_MG_ATTACKERS_EVERY,
   HEURISTICS_MG_ISLANDS_EVERY,
@@ -82,6 +83,22 @@ export type MiddlegameGameRow = {
   had_doubled_pawns: boolean;
   had_backward_pawns: boolean;
   middlegame_pawn_islands_avg: number | null;
+  /** Coach-only — not on Insights metrics tab. */
+  middlegame_pawn_moves?: number;
+  middlegame_pawn_breaks?: number;
+  middlegame_defended_pawns?: number;
+  middlegame_unblocking_bishop_light?: number;
+  middlegame_unblocking_bishop_dark?: number;
+  middlegame_checks?: number;
+  middlegame_blocking_checks?: number;
+  middlegame_king_attackers_rises?: number;
+  /** Attackers on opponent king zone (same formula as own). Shown on Insights. */
+  middlegame_opp_king_attackers_score?: number | null;
+  middlegame_opp_king_attackers_rises?: number;
+  /** Coach-only: R/Q infiltrate 7th (W) / 2nd (B). */
+  middlegame_seventh_rank_infiltration?: number;
+  /** Coach-only: R/Q on open or semi-open file for the side. */
+  middlegame_open_file_utilization?: number;
   result: string;
 };
 
@@ -97,6 +114,7 @@ export type MiddlegameMetricsAggregate = {
   middlegame_missed_tactic_pct: number | null;
   middlegame_allowed_tactic_pct: number | null;
   middlegame_king_attackers_score: number | null;
+  middlegame_opp_king_attackers_score: number | null;
   middlegame_pawn_shield_pct: number | null;
   middlegame_open_file_proximity_pct: number | null;
   middlegame_safe_moves_pct: number | null;
@@ -136,21 +154,98 @@ export function kingZoneSquares(king: Square): Square[] {
   return out;
 }
 
+const SLIDER_TYPES = new Set<PieceSymbol>(["b", "r", "q"]);
+
+function squaresBetweenOnRay(a: Square, b: Square): Square[] | null {
+  const af = squareFile(a);
+  const ar = squareRank(a);
+  const bf = squareFile(b);
+  const br = squareRank(b);
+  const df = bf - af;
+  const dr = br - ar;
+  if (df === 0 && dr === 0) return null;
+  const stepF = df === 0 ? 0 : df > 0 ? 1 : -1;
+  const stepR = dr === 0 ? 0 : dr > 0 ? 1 : -1;
+  if (df !== 0 && dr !== 0 && Math.abs(df) !== Math.abs(dr)) return null;
+  if (df !== 0 && dr === 0 && stepF === 0) return null;
+  const dist = Math.max(Math.abs(df), Math.abs(dr));
+  if (dist < 2) return [];
+  const out: Square[] = [];
+  for (let i = 1; i < dist; i += 1) {
+    const s = sq(af + stepF * i, ar + stepR * i);
+    if (!s) return null;
+    out.push(s);
+  }
+  return out;
+}
+
+function sliderCanAimKing(
+  pieceType: PieceSymbol,
+  from: Square,
+  king: Square
+): boolean {
+  const df = Math.abs(squareFile(from) - squareFile(king));
+  const dr = Math.abs(squareRank(from) - squareRank(king));
+  if (pieceType === "b") return df === dr && df > 0;
+  if (pieceType === "r") return (df === 0) !== (dr === 0);
+  if (pieceType === "q") return df === dr || df === 0 || dr === 0;
+  return false;
+}
+
+/**
+ * Opponent piece still pressures the king when a friendly unit blocks the ray
+ * (interposed check). Direct attackers already counted via attackers().
+ */
+function xrayPressuresKing(
+  board: Chess,
+  from: Square,
+  king: Square,
+  defender: Color
+): boolean {
+  const piece = board.get(from);
+  if (!piece || !SLIDER_TYPES.has(piece.type)) return false;
+  if (!sliderCanAimKing(piece.type, from, king)) return false;
+  const between = squaresBetweenOnRay(from, king);
+  if (!between || between.length === 0) return false;
+  let friendlyBlockers = 0;
+  for (const s of between) {
+    const p = board.get(s);
+    if (!p) continue;
+    if (p.color !== defender) return false;
+    friendlyBlockers += 1;
+  }
+  return friendlyBlockers >= 1;
+}
+
 export function kingAttackersScore(board: Chess, userColor: Color): number {
   const king = kingSquare(board, userColor);
   if (!king) return 0;
   const opp = swapColor(userColor);
   const seen = new Set<string>();
   let weight = 0;
+
+  const addAtk = (atk: Square) => {
+    if (seen.has(atk)) return;
+    const piece = board.get(atk);
+    if (!piece || piece.color !== opp || piece.type === "k") return;
+    seen.add(atk);
+    weight += PIECE_POWER[piece.type] || 0;
+  };
+
+  // Direct pressure on king + zone.
+  for (const atk of board.attackers(king, opp)) addAtk(atk);
   for (const zoneSq of kingZoneSquares(king)) {
-    for (const atk of board.attackers(zoneSq, opp)) {
-      if (seen.has(atk)) continue;
-      seen.add(atk);
-      const piece = board.get(atk);
-      if (!piece || piece.type === "k") continue;
-      weight += PIECE_POWER[piece.type] || 0;
+    for (const atk of board.attackers(zoneSq, opp)) addAtk(atk);
+  }
+
+  // X-ray through friendly blockers (blocked checks still count).
+  for (const pt of ["q", "r", "b"] as PieceSymbol[]) {
+    for (const from of board.findPiece({ type: pt, color: opp })) {
+      if (seen.has(from)) continue;
+      if (xrayPressuresKing(board, from, king, userColor)) addAtk(from);
     }
   }
+
   return weight * weight;
 }
 
@@ -798,12 +893,10 @@ export function stickyPawnFlags(
   const snap = snapshotPawnStructure(board, userColor);
   const doubledNow = hasDoubledPawnsFromSnap(snap);
   return {
-    iqp: current.iqp || hasIsolatedQueenPawnFromSnap(snap),
+    iqp: hasIsolatedQueenPawnFromSnap(snap),
     doubled: current.doubled,
     doubledNow,
-    backward:
-      current.backward ||
-      hasBackwardPawnFromSnap(board, userColor, snap),
+    backward: hasBackwardPawnFromSnap(board, userColor, snap),
   };
 }
 
@@ -893,6 +986,7 @@ function emptyRow(result: string): MiddlegameGameRow {
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
     middlegame_king_attackers_score: null,
+    middlegame_opp_king_attackers_score: null,
     middlegame_pawn_shield_pct: null,
     middlegame_open_file_proximity_pct: null,
     middlegame_safe_moves_pct: null,
@@ -935,6 +1029,7 @@ export function analyzeMiddlegameGame(
   let endgameStartPly: number | null = null;
 
   const attackerScores: number[] = [];
+  const oppAttackerScores: number[] = [];
   const safeMoveScores: number[] = [];
   const spaceScores: number[] = [];
   const outpostSeen = new Set<string>();
@@ -949,8 +1044,9 @@ export function analyzeMiddlegameGame(
   let hadIqp = false;
   let hadDoubled = false;
   let hadBackward = false;
-  let doubledNow = false;
+  let iqpStreak = 0;
   let doubledStreak = 0;
+  let backwardStreak = 0;
   let seenMg = false;
   let mgStart: number | null = null;
   let mgEnd: number | null = null;
@@ -1054,21 +1150,28 @@ export function analyzeMiddlegameGame(
     );
 
     if (mgSampleIdx % HEURISTICS_MG_SAMPLE_EVERY === 0) {
-      if (hasIsolatedQueenPawn(board, color)) hadIqp = true;
-      if (hasBackwardPawn(board, color)) hadBackward = true;
-      doubledNow = hasDoubledPawns(board, color);
       collectOutpostSquares(board, color, outpostSeen);
-    } else if (pawnStructureChanged(move)) {
-      if (!hadIqp && hasIsolatedQueenPawn(board, color)) hadIqp = true;
-      if (!hadBackward && hasBackwardPawn(board, color)) hadBackward = true;
-      doubledNow = hasDoubledPawns(board, color);
     }
 
-    if (doubledNow) {
+    if (hasIsolatedQueenPawn(board, color)) {
+      iqpStreak += 1;
+      if (iqpStreak >= HEURISTICS_STRUCTURE_PERSIST_PLIES) hadIqp = true;
+    } else {
+      iqpStreak = 0;
+    }
+    if (hasDoubledPawns(board, color)) {
       doubledStreak += 1;
       if (doubledStreak >= HEURISTICS_DOUBLED_PERSIST_PLIES) hadDoubled = true;
     } else {
       doubledStreak = 0;
+    }
+    if (hasBackwardPawn(board, color)) {
+      backwardStreak += 1;
+      if (backwardStreak >= HEURISTICS_STRUCTURE_PERSIST_PLIES) {
+        hadBackward = true;
+      }
+    } else {
+      backwardStreak = 0;
     }
 
     if (mgSampleIdx % HEURISTICS_MG_ISLANDS_EVERY === 0) {
@@ -1078,6 +1181,7 @@ export function analyzeMiddlegameGame(
 
     if (mgSampleIdx % HEURISTICS_MG_ATTACKERS_EVERY === 0) {
       attackerScores.push(kingAttackersPct(board, color));
+      oppAttackerScores.push(kingAttackersPct(board, swapColor(color)));
     }
     if (mgSampleIdx % HEURISTICS_MG_SPACE_EVERY === 0) {
       spaceScores.push(spaceAdvantagePct(board, color));
@@ -1121,7 +1225,7 @@ export function analyzeMiddlegameGame(
       const found =
         (wpBefore != null &&
           wpAfter != null &&
-          wpDropPp(wpBefore, wpAfter) >= 7.5) ||
+          wpDropPp(wpBefore, wpAfter) >= 10) ||
         move.isCapture();
       if (found) allowedFound += 1;
       pendingAllowed = false;
@@ -1167,6 +1271,7 @@ export function analyzeMiddlegameGame(
       ? Math.round((allowedFound / allowedChances) * 1000) / 10
       : null,
     middlegame_king_attackers_score: mean(attackerScores, 1),
+    middlegame_opp_king_attackers_score: mean(oppAttackerScores, 1),
     middlegame_pawn_shield_pct: pawnShieldIntactPct(shieldTracker),
     middlegame_open_file_proximity_pct: openFileTrackerPct(openFileTracker),
     middlegame_safe_moves_pct: mean(safeMoveScores, 1),
@@ -1199,6 +1304,7 @@ export function aggregateMiddlegameMetrics(
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
     middlegame_king_attackers_score: null,
+    middlegame_opp_king_attackers_score: null,
     middlegame_pawn_shield_pct: null,
     middlegame_open_file_proximity_pct: null,
     middlegame_safe_moves_pct: null,
@@ -1255,6 +1361,12 @@ export function aggregateMiddlegameMetrics(
     middlegame_king_attackers_score: mean(
       mg
         .map((r) => r.middlegame_king_attackers_score)
+        .filter((v): v is number => v != null),
+      1
+    ),
+    middlegame_opp_king_attackers_score: mean(
+      mg
+        .map((r) => r.middlegame_opp_king_attackers_score)
         .filter((v): v is number => v != null),
       1
     ),
@@ -1343,6 +1455,7 @@ export function heuristicMiddlegameFromPass(input: {
   startPly: number | null;
   endPly: number | null;
   attackerScores: number[];
+  oppAttackerScores?: number[];
   shieldPct: number | null;
   openFilePct: number | null;
   safeMoveScores: number[];
@@ -1353,6 +1466,17 @@ export function heuristicMiddlegameFromPass(input: {
   hadDoubled: boolean;
   hadBackward: boolean;
   result: string;
+  pawnMoves?: number;
+  pawnBreaks?: number;
+  defendedPawns?: number;
+  unblockingBishopLight?: number;
+  unblockingBishopDark?: number;
+  checks?: number;
+  blockingChecks?: number;
+  kingAttackersRises?: number;
+  oppKingAttackersRises?: number;
+  seventhRankInfiltration?: number;
+  openFileUtilization?: number;
 }): MiddlegameGameRow {
   if (!input.reached) return emptyRow(input.result);
   return {
@@ -1368,6 +1492,10 @@ export function heuristicMiddlegameFromPass(input: {
     middlegame_missed_tactic_pct: null,
     middlegame_allowed_tactic_pct: null,
     middlegame_king_attackers_score: mean(input.attackerScores, 1),
+    middlegame_opp_king_attackers_score: mean(
+      input.oppAttackerScores || [],
+      1
+    ),
     middlegame_pawn_shield_pct: input.shieldPct,
     middlegame_open_file_proximity_pct: input.openFilePct,
     middlegame_safe_moves_pct: mean(input.safeMoveScores, 1),
@@ -1377,6 +1505,18 @@ export function heuristicMiddlegameFromPass(input: {
     had_doubled_pawns: input.hadDoubled,
     had_backward_pawns: input.hadBackward,
     middlegame_pawn_islands_avg: input.islandAvg,
+    middlegame_pawn_moves: input.pawnMoves ?? 0,
+    middlegame_pawn_breaks: input.pawnBreaks ?? 0,
+    middlegame_defended_pawns: input.defendedPawns ?? 0,
+    middlegame_unblocking_bishop_light: input.unblockingBishopLight ?? 0,
+    middlegame_unblocking_bishop_dark: input.unblockingBishopDark ?? 0,
+    middlegame_checks: input.checks ?? 0,
+    middlegame_blocking_checks: input.blockingChecks ?? 0,
+    middlegame_king_attackers_rises: input.kingAttackersRises ?? 0,
+    middlegame_opp_king_attackers_rises: input.oppKingAttackersRises ?? 0,
+    middlegame_seventh_rank_infiltration:
+      input.seventhRankInfiltration ?? 0,
+    middlegame_open_file_utilization: input.openFileUtilization ?? 0,
     result: input.result,
   };
 }

@@ -148,7 +148,7 @@ def calculate_headline_stats(df: pd.DataFrame) -> dict:
 
     current_win_streak = 0
     for res in newest_first["result_norm"]:
-        if res == "Win":
+        if res in ("Win", "Draw"):
             current_win_streak += 1
             continue
         break

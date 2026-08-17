@@ -51,9 +51,14 @@ assert(aspectSrc.includes("polarity"), "good/bad/neutral polarities");
 assert(aspectSrc.includes("toneVerdictLead"), "dynamic verdict first phrase");
 assert(aspectSrc.includes("frameAsCorrectIdea"), "correct-answer framing");
 assert(aspectSrc.includes('voice?: AspectVoice'), "played vs correct voice");
+assert(!aspectSrc.includes("predicament"), "no predicament in live verdicts");
+assert(!aspectSrc.includes('bits.join("; ")'), "no semicolon glue");
+assert(aspectSrc.includes("Better is"), "book framing Better is");
+assert(aspectSrc.includes("bookJoin"), "period-separated book join");
 assert(src.includes("toneVerdictLead"), "moment tip uses verdict lead");
 assert(src.includes('voice: "correct"'), "engine/pack marked correct not played");
-assert(src.includes("engineGapState"), "engine vs played not used as played story");
+assert(src.includes("huntIsPlayedContinuation"), "opp hunt is not engine alternative");
+assert(!src.includes("takes your trapped"), "self-trap hunt not framed as correct idea");
 assert(!src.includes("playedMetricDelta?.length\n      ? args.playedMetricDelta\n      : args.engineVsPlayedMetricDelta"), "no engine-gap fallback as played");
 
 function stripNumericNoise(s) {
@@ -79,21 +84,21 @@ function frameAsCorrectIdea(raw) {
     .replace(/^better was\s+/i, "");
   const low = t.charAt(0).toLowerCase() + t.slice(1);
   if (/^(to\s+|open|attack|connect)/i.test(low)) {
-    return `the correct move is to ${low.replace(/^to\s+/i, "")}`;
+    return `Better is to ${low.replace(/^to\s+/i, "")}`;
   }
-  return `the correct idea is ${low}`;
+  return `Better is ${low}`;
 }
 assert(
   frameAsCorrectIdea("pieces working together on open lines").startsWith(
-    "the correct idea is"
+    "Better is"
   ),
-  "noun phrase → correct idea"
+  "noun phrase → Better is"
 );
 assert(
   frameAsCorrectIdea("open lines and attack on the queenside").startsWith(
-    "the correct move is to"
+    "Better is to"
   ),
-  "action → correct move"
+  "action → Better is to"
 );
 
 console.log("test-moment-judgment-tip: ok");

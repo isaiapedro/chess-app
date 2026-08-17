@@ -8,20 +8,22 @@ import {
 } from "react-native";
 import { LineChart, PieChart } from "react-native-chart-kit";
 import { Text as SvgText } from "react-native-svg";
-import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
+import { colors, font, radius, spacing, type, withAlpha } from "../theme";
 import type { HourlyPoint, MonthlyPoint, Period, RatingPoint } from "../api/types";
 import type { RatingCurve } from "../api/selectors";
 
 const MONTH_INITIALS = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
 const X_LABELS_HEIGHT_PCT = 0.75;
 
+const RATING_LINE = "rgb(48, 222, 112)";
+
 const chartConfig = {
   backgroundGradientFrom: colors.surface,
   backgroundGradientTo: colors.surface,
-  color: (opacity = 1) => `rgba(52, 199, 89, ${opacity})`,
+  color: (opacity = 1) => `rgba(48, 222, 112, ${opacity})`,
   labelColor: (opacity = 1) => `rgba(160, 160, 160, ${opacity})`,
   decimalPlaces: 0,
-  strokeWidth: 2.5,
+  strokeWidth: 3,
   propsForDots: {
     r: "0",
   },
@@ -33,10 +35,10 @@ const chartConfig = {
     stroke: "rgba(255,255,255,0.05)",
     strokeDasharray: "",
   },
-  fillShadowGradientFrom: result.win,
-  fillShadowGradientFromOpacity: 0.22,
+  fillShadowGradientFrom: RATING_LINE,
+  fillShadowGradientFromOpacity: 0.42,
   fillShadowGradientTo: colors.surface,
-  fillShadowGradientToOpacity: 0,
+  fillShadowGradientToOpacity: 0.02,
 };
 
 function useEntranceAnimation() {

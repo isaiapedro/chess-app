@@ -5,6 +5,7 @@ import { HEURISTICS_EG_KING_EVERY } from "./analysisConfig";
 import {
   userWinProbability,
   classifyEvalDrop,
+  isMateScore,
   WP_BLUNDER_DROP,
   WP_ENDGAME_ADVANTAGE,
 } from "./winProb";
@@ -85,6 +86,27 @@ export type EndgameGameRow = {
   mate_move_times: number[];
   theoretical: Partial<Record<TheoreticalKey, true>>;
   theoretical_saved: boolean;
+  /** Coach-only — not on Insights metrics tab. */
+  endgame_pawn_moves?: number;
+  endgame_pawn_breaks?: number;
+  endgame_defended_pawns?: number;
+  endgame_unblocking_bishop_light?: number;
+  endgame_unblocking_bishop_dark?: number;
+  endgame_checks?: number;
+  endgame_blocking_checks?: number;
+  endgame_king_attackers_score?: number | null;
+  endgame_king_attackers_rises?: number;
+  endgame_opp_king_attackers_score?: number | null;
+  endgame_opp_king_attackers_rises?: number;
+  /** R/Q infiltrate 7th (White) / 2nd (Black) from user color. */
+  endgame_seventh_rank_infiltration?: number;
+  /** R/Q occupies an open or semi-open file for the side. */
+  endgame_open_file_utilization?: number;
+  /**
+   * Entered Chebyshev ≤3 between kings in a K+P ending (no Q/R/B/N;
+   * pawns OK). Edge-triggered per user move.
+   */
+  endgame_opposition?: number;
   result: string;
 };
 
@@ -393,6 +415,10 @@ function interceptDistance(
   return chebyshev(king, target);
 }
 
+/**
+ * Chebyshev (or intercept) distance from our king to the enemy pawn
+ * closest to promotion — not the geographically nearest pawn.
+ */
 export function kingDistanceToEnemyPawns(
   board: Chess,
   color: Color
@@ -402,14 +428,21 @@ export function kingDistanceToEnemyPawns(
   const enemy = swapColor(color);
   const pawns = board.findPiece({ type: "p", color: enemy });
   if (!pawns.length) return null;
-  let best = Infinity;
+  let closestToPromo: Square | null = null;
+  let bestProgress = Infinity;
   for (const pawn of pawns) {
-    best = Math.min(best, chebyshev(king, pawn));
-    if (isEnemyPasser(board, pawn, enemy)) {
-      best = Math.min(best, interceptDistance(king, pawn, enemy));
+    const progress =
+      enemy === "w" ? 7 - squareRank(pawn) : squareRank(pawn);
+    if (progress < bestProgress) {
+      bestProgress = progress;
+      closestToPromo = pawn;
     }
   }
-  return best === Infinity ? null : best;
+  if (!closestToPromo) return null;
+  if (isEnemyPasser(board, closestToPromo, enemy)) {
+    return interceptDistance(king, closestToPromo, enemy);
+  }
+  return chebyshev(king, closestToPromo);
 }
 
 export function pawnDiffDeltaForCapture(
@@ -422,7 +455,7 @@ export function pawnDiffDeltaForCapture(
 
 function isMateForUser(cpWhite: number, userIsWhite: boolean): boolean {
   const userCp = userIsWhite ? cpWhite : -cpWhite;
-  return userCp >= MATE_CP_THRESHOLD;
+  return isMateScore(userCp) && userCp > 0;
 }
 
 function emptyRow(result: string): EndgameGameRow {

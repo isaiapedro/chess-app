@@ -39,6 +39,10 @@ export type FactorItem = {
   condition: string;
   win_rate: number;
   diff: number;
+  displayValue?: string;
+  unit?: string;
+  peerMean?: number | null;
+  peerDisplayValue?: string | null;
 };
 
 export type FactorsPayload = {
@@ -59,6 +63,10 @@ export type RecapResponse = {
     total_games?: number;
     total_moves?: number;
     total_hours?: number;
+    /** TimeControl-based seconds (base + 40*inc), matches activity baselines. */
+    activity_est_seconds?: number;
+    games_by_speed?: Record<string, number>;
+    activity_est_seconds_by_speed?: Record<string, number>;
     max_win_streak?: number;
     max_unbeaten_streak?: number;
     current_win_streak?: number;

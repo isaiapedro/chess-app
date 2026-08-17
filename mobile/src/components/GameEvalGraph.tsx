@@ -165,9 +165,9 @@ export function GameEvalGraph({
               x2={mgX}
               y2={bottomY}
               stroke={colors.cream}
-              strokeWidth={1.75}
-              strokeDasharray="5 3"
-              opacity={0.72}
+              strokeWidth={1}
+              strokeDasharray="3 3"
+              opacity={0.7}
             />
           ) : null}
           {egX != null ? (
@@ -177,9 +177,9 @@ export function GameEvalGraph({
               x2={egX}
               y2={bottomY}
               stroke={colors.cream}
-              strokeWidth={1.75}
-              strokeDasharray="5 3"
-              opacity={0.72}
+              strokeWidth={1}
+              strokeDasharray="3 3"
+              opacity={0.7}
             />
           ) : null}
 
@@ -197,9 +197,8 @@ export function GameEvalGraph({
               x2={cursor.x}
               y2={bottomY}
               stroke={colors.cream}
-              strokeWidth={1}
-              strokeDasharray="3 3"
-              opacity={0.7}
+              strokeWidth={1.75}
+              opacity={0.72}
             />
           ) : null}
 

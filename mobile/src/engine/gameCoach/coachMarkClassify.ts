@@ -3,9 +3,15 @@ import {
   STYLE_PIECE_VALUE,
   sacrificeOfferAfterMove,
 } from "../styleMetrics";
-import { userWinProbability, wpDropPp, type EvalDropKind } from "../winProb";
+import {
+  userWinProbability,
+  wpDropPp,
+  WP_INACCURACY_DROP,
+  type EvalDropKind,
+} from "../winProb";
 import { hungMateAfterPlayedMove } from "../forcedMate";
 import { IMPORTANT_PV_GAP, multipvWpGap } from "./tacticSharpness";
+import { moveAccuracyPct } from "../openingPhase";
 
 export type CoachMark =
   | "book"
@@ -64,6 +70,72 @@ export function isCoachMistakeOrWorse(mark: CoachMark | null): boolean {
   return mark === "mistake" || mark === "blunder" || mark === "missed";
 }
 
+export const COACH_MARK_ORDER: CoachMark[] = [
+  "brilliant",
+  "important",
+  "best",
+  "excellent",
+  "good",
+  "book",
+  "inaccuracy",
+  "mistake",
+  "missed",
+  "blunder",
+];
+
+export function countCoachMarks(
+  plies: Array<{ mark?: CoachMark | null }>
+): Partial<Record<CoachMark, number>> {
+  const counts: Partial<Record<CoachMark, number>> = {};
+  for (const ply of plies) {
+    const mark = ply.mark;
+    if (!mark) continue;
+    counts[mark] = (counts[mark] || 0) + 1;
+  }
+  return counts;
+}
+
+export function countCoachMarksBySide(
+  plies: Array<{ mark?: CoachMark | null; side?: string }>,
+  userColor: "white" | "black"
+): {
+  user: Partial<Record<CoachMark, number>>;
+  opp: Partial<Record<CoachMark, number>>;
+} {
+  const user: Partial<Record<CoachMark, number>> = {};
+  const opp: Partial<Record<CoachMark, number>> = {};
+  for (const ply of plies) {
+    const mark = ply.mark;
+    if (!mark) continue;
+    const bucket = ply.side === userColor ? user : opp;
+    bucket[mark] = (bucket[mark] || 0) + 1;
+  }
+  return { user, opp };
+}
+
+export function sideAccuracyPct(
+  plies: Array<{
+    side?: string;
+    evalBeforeCp?: number | null;
+    evalAfterCp?: number | null;
+  }>,
+  side: "white" | "black"
+): number | null {
+  const samples: number[] = [];
+  const moverIsWhite = side === "white";
+  for (const ply of plies) {
+    if (ply.side !== side) continue;
+    if (ply.evalBeforeCp == null || ply.evalAfterCp == null) continue;
+    const wpBefore = userWinProbability(ply.evalBeforeCp, moverIsWhite);
+    const wpAfter = userWinProbability(ply.evalAfterCp, moverIsWhite);
+    samples.push(moveAccuracyPct(wpBefore * 100, wpAfter * 100));
+  }
+  if (!samples.length) return null;
+  return (
+    Math.round((samples.reduce((a, b) => a + b, 0) / samples.length) * 10) / 10
+  );
+}
+
 function importantFromLines(
   lines: CoachEngineLine[] | undefined,
   playedBest: boolean,
@@ -110,7 +182,6 @@ function brilliantSacrifice(args: {
   fenBefore: string;
   playedSan: string;
   side: "white" | "black";
-  playedBest: boolean;
   wpDrop: number;
   wpBefore: number;
   wpAfter: number;
@@ -123,7 +194,7 @@ function brilliantSacrifice(args: {
   ) {
     return false;
   }
-  if (!(args.playedBest || args.wpDrop < 0.02)) return false;
+  if (args.wpDrop >= WP_INACCURACY_DROP) return false;
   try {
     const board = new Chess(args.fenBefore);
     const color: Color = args.side === "white" ? "w" : "b";
@@ -158,7 +229,6 @@ export function classifyCoachMark(args: {
         fenBefore: args.fenBefore,
         playedSan: args.playedSan,
         side: args.side,
-        playedBest: true,
         wpDrop,
         wpBefore,
         wpAfter,
@@ -210,7 +280,6 @@ export function classifyCoachMark(args: {
       fenBefore: args.fenBefore,
       playedSan: args.playedSan,
       side: args.side,
-      playedBest: false,
       wpDrop,
       wpBefore,
       wpAfter,

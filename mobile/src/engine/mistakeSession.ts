@@ -81,7 +81,7 @@ export async function saveMistakesSession(
 ): Promise<void> {
   await writeCache(studyMistakesSessionCacheKey(filters), {
     sessionId: payload.sessionId,
-    moments: payload.moments.slice(0, TARGET_MISTAKE_MOMENTS),
+    moments: payload.moments,
     completedKeys: [...new Set(payload.completedKeys)],
   } satisfies MistakesSessionPayload);
 }
@@ -112,6 +112,24 @@ export function mergeSessionMoments(
     if (kept.length + additions.length >= limit) break;
   }
   return [...kept, ...additions].slice(0, limit);
+}
+
+export function appendMistakeMoments(
+  sessionMoments: MistakeItem[],
+  incoming: MistakeItem[],
+  excludeKeys: Set<string>,
+  maxNew = TARGET_MISTAKE_MOMENTS
+): MistakeItem[] {
+  const seen = new Set(sessionMoments.map((item) => candidateKey(item)));
+  const additions: MistakeItem[] = [];
+  for (const item of incoming) {
+    const key = candidateKey(item);
+    if (seen.has(key) || excludeKeys.has(key)) continue;
+    seen.add(key);
+    additions.push(item);
+    if (additions.length >= maxNew) break;
+  }
+  return [...sessionMoments, ...additions];
 }
 
 export function capMistakeMoments(

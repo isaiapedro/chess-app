@@ -420,6 +420,7 @@ function explainUserMissed(args: {
   evalBeforeWhite?: number | null;
   evalAfterWhite?: number | null;
   opponentReplySan?: string | null;
+  lines?: { cpWhite: number }[] | null;
 }): string {
   const line = lineHint(args.bestSan, args.bestPvSan);
   const tact = detectTacticalFact({
@@ -433,6 +434,7 @@ function explainUserMissed(args: {
     evalBeforeWhite: args.evalBeforeWhite,
     evalAfterWhite: args.evalAfterWhite,
     opponentReplySan: args.opponentReplySan,
+    lines: args.lines,
   });
   const tactBit = tacticalJudgment(tact, args.playedSan, line, "miss", args.usedTips);
   if (tactBit) return tactBit;
@@ -582,14 +584,47 @@ function tacticalJudgment(
   }
   if (tact.kind === "missed_tactic") {
     const hit = tact.captureSan || line;
+    const motifBit =
+      tact.motif === "pin"
+        ? "a pin"
+        : tact.motif === "skewer"
+          ? "a skewer"
+          : tact.motif === "fork"
+            ? "a fork"
+            : tact.motif === "hang"
+              ? "a hanging piece"
+              : null;
     if (mode === "opp") {
       return hit
         ? `Their ${playedSan} misses ${hit}.`
         : `Their ${playedSan} misses a forcing tactic.`;
     }
+    if (motifBit) {
+      return hit
+        ? `${playedSan} misses ${motifBit} (${hit}).`
+        : `${playedSan} misses ${motifBit}.`;
+    }
     return hit
       ? `${playedSan} misses the forcing line ${hit}.`
       : `${playedSan} misses a forcing tactic that was there.`;
+  }
+  if (tact.kind === "trapped_piece") {
+    const piece = tact.pieceLabel || "piece";
+    const sq = tact.trapSquare ? ` on ${tact.trapSquare}` : "";
+    if (tact.selfInflicted) {
+      if (mode === "opp") {
+        return `${playedSan} traps their ${piece}${sq} — it cannot run.`;
+      }
+      return `${playedSan} traps your ${piece}${sq} — it cannot run.`;
+    }
+    if (mode === "opp") {
+      return line
+        ? `Their ${playedSan} misses a trapped ${piece}${sq}; ${line}.`
+        : `Their ${playedSan} misses a trapped ${piece}${sq}.`;
+    }
+    return line
+      ? `${playedSan} misses a trapped ${piece}${sq}; ${line}.`
+      : `${playedSan} misses a trapped ${piece}${sq}.`;
   }
   if (tact.kind === "missed_mate") {
     const hit = tact.captureSan || line;
@@ -989,6 +1024,7 @@ function explainUserMistake(args: {
   evalBeforeWhite?: number | null;
   evalAfterWhite?: number | null;
   opponentReplySan?: string | null;
+  lines?: { cpWhite: number }[] | null;
 }): string {
   const line = lineHint(args.bestSan, args.bestPvSan);
   const tact = detectTacticalFact({
@@ -1002,6 +1038,7 @@ function explainUserMistake(args: {
     evalBeforeWhite: args.evalBeforeWhite,
     evalAfterWhite: args.evalAfterWhite,
     opponentReplySan: args.opponentReplySan,
+    lines: args.lines,
   });
   const tactBit = tacticalJudgment(
     tact,
@@ -1133,6 +1170,7 @@ function explainOpponentMistake(args: {
   evalBeforeWhite?: number | null;
   evalAfterWhite?: number | null;
   opponentReplySan?: string | null;
+  lines?: { cpWhite: number }[] | null;
 }): string {
   const line = lineHint(args.opponentBestSan, args.bestPvSan);
   const tact = detectTacticalFact({
@@ -1146,6 +1184,7 @@ function explainOpponentMistake(args: {
     evalBeforeWhite: args.evalBeforeWhite,
     evalAfterWhite: args.evalAfterWhite,
     opponentReplySan: args.opponentReplySan,
+    lines: args.lines,
   });
   const tactBit = tacticalJudgment(tact, args.san, line, "opp", args.usedTips);
   if (tactBit) return tactBit;
@@ -1333,6 +1372,7 @@ export function shouldComposeNote(args: {
 }): boolean {
   if (args.perspective === "user") {
     if (args.moment) return true;
+    if (args.mark === "brilliant") return true;
     if (args.mark === "inaccuracy") return false;
     if (
       args.mark === "blunder" ||
@@ -1464,6 +1504,7 @@ export function composeCoachNote(args: {
   evalBeforeWhite?: number | null;
   evalAfterWhite?: number | null;
   opponentReplySan?: string | null;
+  lines?: { cpWhite: number }[] | null;
 }): string {
   const perspective: NotePerspective =
     args.side === args.userColor ? "user" : "opponent";
@@ -1538,6 +1579,7 @@ export function composeCoachNote(args: {
       evalBeforeWhite: args.evalBeforeWhite,
       evalAfterWhite: args.evalAfterWhite,
       opponentReplySan: args.opponentReplySan,
+      lines: args.lines,
     });
     if (judgment) {
       const out = finalizeNote(judgment, args.usedTips, openingCap, {
@@ -1625,6 +1667,7 @@ export function composeCoachNote(args: {
       evalBeforeWhite: args.evalBeforeWhite,
       evalAfterWhite: args.evalAfterWhite,
       opponentReplySan: args.opponentReplySan,
+      lines: args.lines,
     });
   } else if (errorKind === "mistake" || moment) {
     judgment = explainUserMistake({
@@ -1642,6 +1685,7 @@ export function composeCoachNote(args: {
       evalBeforeWhite: args.evalBeforeWhite,
       evalAfterWhite: args.evalAfterWhite,
       opponentReplySan: args.opponentReplySan,
+      lines: args.lines,
     });
   }
 

@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  InteractionManager,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -319,7 +320,7 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     setGuessUci(null);
     setSequencePv([]);
     setSequencePlaying(false);
-  }, [current?.game_id, current?.ply, current?.fen]);
+  }, [idx, current?.game_id, current?.ply, current?.fen]);
 
   useEffect(() => {
     return () => {
@@ -1048,7 +1049,8 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       scanningMore ||
       scanExhausted ||
       pendingReady ||
-      pendingBatchRef.current
+      pendingBatchRef.current ||
+      backgroundScanningRef.current
     ) {
       return;
     }
@@ -1068,7 +1070,19 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
     const key = `${color}:${selectedOpening.key}:batch:${visibleBatchStartRef.current}`;
     if (secondPagePrefetchKeyRef.current === key) return;
     secondPagePrefetchKeyRef.current = key;
-    void continueScanOpenings(true);
+    const task = InteractionManager.runAfterInteractions(() => {
+      if (
+        cancelRef.current.cancelled ||
+        backgroundScanningRef.current ||
+        pendingBatchRef.current
+      ) {
+        return;
+      }
+      void continueScanOpenings(true);
+    });
+    return () => {
+      task.cancel?.();
+    };
   }, [
     active,
     phase,
@@ -1636,13 +1650,15 @@ export function OpeningPrepSection({ active = false }: Props = {}) {
       <PageLoadingTransition
         active={phase === "analyze" || scanningMore}
         contentKey={
-          showScanMore
-            ? "scan-more"
-            : allDone
-              ? "all-done"
-              : !current
-                ? "empty"
-                : `batch:${visibleBatchStartRef.current}:${moments.length}`
+          phase === "analyze" || scanningMore
+            ? `${selectedOpening?.key || "opening"}:${scanningMore ? "scan" : "init"}`
+            : showScanMore
+              ? "scan-more"
+              : allDone
+                ? "all-done"
+                : !current
+                  ? "empty"
+                  : `quiz:${visibleBatchStartRef.current}:${moments.length}`
         }
         loader={
           <View style={styles.center}>

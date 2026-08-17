@@ -139,7 +139,7 @@ function buildHeadline(games: NormalizedGame[]) {
   }
   let currentWinStreak = 0;
   for (const g of newest) {
-    if (g.result === "Win") currentWinStreak += 1;
+    if (g.result === "Win" || g.result === "Draw") currentWinStreak += 1;
     else break;
   }
 

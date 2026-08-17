@@ -19,7 +19,10 @@ function kingWing(
   const k = board.findPiece({ type: "k", color })[0];
   if (!k) return { kingside: false, queenside: false };
   const file = k.charCodeAt(0) - 97;
-  return { kingside: file >= 5, queenside: file <= 2 };
+  const rank = Number(k[1]) - 1;
+  const home = color === "w" ? 0 : 7;
+  if (rank !== home) return { kingside: false, queenside: false };
+  return { kingside: file === 6, queenside: file === 2 };
 }
 
 function oppositeSideCastling(board: Chess): boolean {
@@ -68,6 +71,13 @@ export function goodVsBadBishopSnap(board: Chess, color: Color): number {
   if (openness >= 6 && sameColorPawns <= 2) return 1;
   if (openness <= 4 && sameColorPawns >= 3) return -1;
   return 0;
+}
+
+export function pawnStormTempoDelta(board: Chess, color: Color): number {
+  return (
+    queensideAdvanceScore(board, color) -
+    kingsideAdvanceScore(board, swapColor(color))
+  );
 }
 
 /**

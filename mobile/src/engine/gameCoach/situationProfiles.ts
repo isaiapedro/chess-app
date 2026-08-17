@@ -13,8 +13,10 @@ import {
   classifyRookEndingShape,
   goodVsBadBishopSnap,
   knightVsBishopSnap,
+  pawnStormTempoDelta,
   pawnStormTempoSnap,
 } from "./tier3Metrics";
+import { fileOpennessForSide } from "../phaseTacticalMetrics";
 
 const FILES = "abcdefgh";
 
@@ -80,6 +82,8 @@ export const SITUATION_PROFILES: Record<
       "open_file_utilization",
       "king_attackers_pct",
       "opp_king_attackers_pct",
+      "opp_king_uncastled",
+      "king_center_file_exposure",
     ],
     lockBoost: 12,
   },
@@ -112,6 +116,7 @@ export const SITUATION_PROFILES: Record<
     ],
     metricHints: [
       "closed_center",
+      "center_fluidity_index",
       "pawn_breaks",
       "center_advance",
       "open_file_utilization",
@@ -262,6 +267,7 @@ export const SITUATION_PROFILES: Record<
     ],
     metricHints: [
       "pawn_storm_tempo",
+      "pawn_storm_tempo_delta",
       "kingside_advance",
       "queenside_advance",
       "kingside_advance_opponent",
@@ -354,6 +360,9 @@ export type CastlingWingSnaps = {
   knight_vs_bishop: number;
   good_vs_bad_bishop: number;
   pawn_storm_tempo: number;
+  center_fluidity_index: number;
+  pawn_storm_tempo_delta: number;
+  king_center_file_exposure: number;
 };
 
 function kingSquare(board: Chess, color: Color): Square | null {
@@ -385,12 +394,15 @@ export function isOppositeSideCastling(board: Chess): boolean {
   const wCastle = w.kingside || w.queenside;
   const bCastle = b.kingside || b.queenside;
   if (!wCastle || !bCastle) return false;
-  if (w.kingside && b.queenside) return true;
-  if (w.queenside && b.kingside) return true;
   const wk = kingSquare(board, "w");
   const bk = kingSquare(board, "b");
   if (!wk || !bk) return false;
-  return Math.abs(squareFile(wk) - squareFile(bk)) >= 3;
+  const wf = squareFile(wk);
+  const bf = squareFile(bk);
+  if (wf === 3 || wf === 4 || bf === 3 || bf === 4) return false;
+  if (w.kingside && b.queenside) return true;
+  if (w.queenside && b.kingside) return true;
+  return Math.abs(wf - bf) >= 3;
 }
 
 function fileHasPawn(board: Chess, file: number, color: Color): boolean {
@@ -403,51 +415,94 @@ function fileHasPawn(board: Chess, file: number, color: Color): boolean {
   return false;
 }
 
-function centralLockedPair(board: Chess): boolean {
-  const pairs: Array<[Square, Square]> = [
-    ["e5", "d5"],
-    ["e5", "e6"],
-    ["d5", "d6"],
-    ["d5", "e6"],
-    ["e4", "d5"],
-    ["e4", "e5"],
-    ["d4", "d5"],
-    ["d4", "e5"],
-  ];
-  for (const [a, b] of pairs) {
-    const pa = board.get(a);
-    const pb = board.get(b);
-    if (
-      pa?.type === "p" &&
-      pb?.type === "p" &&
-      pa.color !== pb.color &&
-      Math.abs(squareFile(a) - squareFile(b)) <= 1 &&
-      Math.abs(squareRank(a) - squareRank(b)) <= 1
-    ) {
-      return true;
+function headToHeadOnFile(board: Chess, file: number): boolean {
+  const whiteRanks: number[] = [];
+  const blackRanks: number[] = [];
+  for (let rank = 0; rank < 8; rank += 1) {
+    const s = sq(file, rank);
+    if (!s) continue;
+    const p = board.get(s);
+    if (!p || p.type !== "p") continue;
+    if (p.color === "w") whiteRanks.push(rank);
+    else blackRanks.push(rank);
+  }
+  for (const wr of whiteRanks) {
+    for (const br of blackRanks) {
+      if (Math.abs(wr - br) === 1) return true;
     }
   }
   return false;
 }
 
-/**
- * Closed / locked centre: both sides have d+e pawns, or classic locked pairs,
- * and neither d nor e file is fully open.
- */
+function pawnFileCanLever(board: Chess, color: Color, file: number): boolean {
+  const forward = color === "w" ? 1 : -1;
+  for (let rank = 0; rank < 8; rank += 1) {
+    const s = sq(file, rank);
+    if (!s) continue;
+    const p = board.get(s);
+    if (!p || p.type !== "p" || p.color !== color) continue;
+    const ahead = sq(file, rank + forward);
+    if (ahead && !board.get(ahead)) return true;
+    for (const df of [-1, 1]) {
+      const cap = sq(file + df, rank + forward);
+      if (!cap) continue;
+      const t = board.get(cap);
+      if (t && t.color !== color) return true;
+    }
+  }
+  return false;
+}
+
+export function centerFluidityIndex(board: Chess): number {
+  let score = 0;
+  for (const file of [3, 4]) {
+    const wHas = fileHasPawn(board, file, "w");
+    const bHas = fileHasPawn(board, file, "b");
+    if (!wHas && !bHas) {
+      score += 50;
+      continue;
+    }
+    const locked =
+      headToHeadOnFile(board, file) &&
+      !pawnFileCanLever(board, "w", file) &&
+      !pawnFileCanLever(board, "b", file);
+    if (locked) continue;
+    if (
+      pawnFileCanLever(board, "w", file) ||
+      pawnFileCanLever(board, "b", file)
+    ) {
+      score += 25;
+    }
+  }
+  return Math.max(0, Math.min(100, score));
+}
+
+export function kingCenterFileExposure(board: Chess, userColor: Color): number {
+  const opp = swapColor(userColor);
+  const k = kingSquare(board, opp);
+  if (!k) return 0;
+  const kf = squareFile(k);
+  const wing = castlingWingForColor(board, opp);
+  const inCentre = kf === 3 || kf === 4;
+  const uncastled = !wing.kingside && !wing.queenside;
+  if (!inCentre && !uncastled) return 0;
+  let score = 0;
+  for (const file of [3, 4]) {
+    const kind = fileOpennessForSide(board, file, userColor);
+    if (kind === "open") score += 2;
+    else if (kind === "semi") score += 1;
+    if (kf === file) score += 1;
+  }
+  return score;
+}
+
 export function isClosedCenter(board: Chess): boolean {
   const dOpen =
     !fileHasPawn(board, 3, "w") && !fileHasPawn(board, 3, "b");
   const eOpen =
     !fileHasPawn(board, 4, "w") && !fileHasPawn(board, 4, "b");
   if (dOpen || eOpen) return false;
-
-  const bothHaveDe =
-    fileHasPawn(board, 3, "w") &&
-    fileHasPawn(board, 3, "b") &&
-    fileHasPawn(board, 4, "w") &&
-    fileHasPawn(board, 4, "b");
-  if (bothHaveDe) return true;
-  return centralLockedPair(board);
+  return centerFluidityIndex(board) === 0;
 }
 
 /**
@@ -770,6 +825,9 @@ export function situationCastlingSnaps(
     knight_vs_bishop: knightVsBishopSnap(board, userColor),
     good_vs_bad_bishop: goodVsBadBishopSnap(board, userColor),
     pawn_storm_tempo: pawnStormTempoSnap(board, userColor),
+    center_fluidity_index: centerFluidityIndex(board),
+    pawn_storm_tempo_delta: pawnStormTempoDelta(board, userColor),
+    king_center_file_exposure: kingCenterFileExposure(board, userColor),
   };
 }
 
@@ -941,8 +999,7 @@ export function detectSituations(args: {
 
   const userIqp = hasIsolatedQueenPawn(board, color);
   const oppIqp = hasIsolatedQueenPawn(board, swapColor(color));
-  const hasIqp =
-    themes.has("iqp") || userIqp || oppIqp;
+  const hasIqp = themes.has("iqp") && (userIqp || oppIqp);
   if (phaseOk(SITUATION_PROFILES.iqp.phase, args.phase) && hasIqp) {
     let role: SituationRole | null = null;
     if (userIqp && !oppIqp) role = "iqp_owner";
@@ -1223,9 +1280,12 @@ export function formatSituationRolesShort(
 
 export const SITUATION_STICKY_CAP = 6;
 
+const LIVE_STRUCTURE_SITUATIONS = new Set(["iqp"]);
+
 /**
  * Merge live board detections with prior sticky situations.
- * Live overwrites same id (fresh confidence/role); unseen prior ids keep.
+ * Live overwrites same id (fresh confidence/role); unseen prior ids keep
+ * except IQP, which drops when the live scan has no isolani.
  * Never clears to [] once any situation was carried — new structures add/replace.
  */
 export function mergeStickySituations(
@@ -1235,12 +1295,17 @@ export function mergeStickySituations(
   const liveList = live || [];
   const prevList = prev || [];
   if (!liveList.length && !prevList.length) return [];
-  if (!liveList.length) return prevList.slice(0, SITUATION_STICKY_CAP);
+  if (!liveList.length) {
+    return prevList
+      .filter((s) => !LIVE_STRUCTURE_SITUATIONS.has(s.id))
+      .slice(0, SITUATION_STICKY_CAP);
+  }
 
   const liveIds = new Set(liveList.map((s) => s.id));
   const out: DetectedSituation[] = [...liveList];
   for (const s of prevList) {
     if (liveIds.has(s.id)) continue;
+    if (LIVE_STRUCTURE_SITUATIONS.has(s.id)) continue;
     out.push(s);
     if (out.length >= SITUATION_STICKY_CAP) break;
   }

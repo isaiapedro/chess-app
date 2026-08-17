@@ -553,6 +553,59 @@ export function buildAdvanceSnapshotSignals(
       });
     }
   }
+  if (
+    ownQ != null &&
+    ownQ >= ADVANCE_COMMIT_FLOOR &&
+    (ownK == null || ownQ >= ownK)
+  ) {
+    const impact = ownQ - (oppQ ?? 0);
+    if (
+      isSignificantOpeningImpact("queenside_advance", Math.max(impact, ownQ))
+    ) {
+      out.push({
+        metric: "queenside_advance",
+        peerDelta: null,
+        polarity: "higher_better",
+        judgment: "good",
+        impact: round1(Math.max(impact, ownQ)),
+        softKeys: ["positional.pawn_break"],
+      });
+    }
+  }
+  if (
+    ownK != null &&
+    ownK >= ADVANCE_COMMIT_FLOOR &&
+    ownK > (ownQ ?? 0)
+  ) {
+    const impact = ownK - (oppK ?? 0);
+    if (
+      isSignificantOpeningImpact("kingside_advance", Math.max(impact, ownK))
+    ) {
+      out.push({
+        metric: "kingside_advance",
+        peerDelta: null,
+        polarity: "higher_better",
+        judgment: "good",
+        impact: round1(Math.max(impact, ownK)),
+        softKeys: ["positional.pawn_break", "attack.initiative"],
+      });
+    }
+  }
+  const hanging =
+    inputs.hanging_pawns === true ||
+    inputs.hanging_pawns === 1 ||
+    inputs.hanging_pawns === "1" ||
+    (typeof inputs.structure === "string" && /hanging/.test(inputs.structure));
+  if (hanging) {
+    out.push({
+      metric: "hanging_pawns",
+      peerDelta: null,
+      polarity: "higher_better",
+      judgment: "good",
+      impact: 8,
+      softKeys: ["positional.pawn_break"],
+    });
+  }
 
   return out;
 }

@@ -1,5 +1,5 @@
 import { Chess, type Color, type Square } from "chess.js";
-import { HEURISTICS_DOUBLED_PERSIST_PLIES } from "../analysisConfig";
+import { HEURISTICS_STRUCTURE_PERSIST_PLIES } from "../analysisConfig";
 import { resolveEcoFamily } from "../ecoFamilies";
 import {
   hasDoubledPawns,
@@ -51,8 +51,6 @@ export const WINDOWED_STRUCTURE_THEMES = new Set([
   "scheveningen",
   "dragon_formation",
 ]);
-
-const STRUCTURE_WINDOW = 3;
 
 function filePawnCounts(board: Chess, file: number): { w: number; b: number } {
   let w = 0;
@@ -221,45 +219,68 @@ export function detectStructureThemes(fen: string): string[] {
 }
 
 /**
- * Windowed structure for notes: theme must survive the move (before∩after)
- * and show up across recent plies — not a one-frame snapshot.
+ * After a persist window confirms, the structure started at the first ply
+ * of that run — not only from the confirming ply onward.
+ */
+export function confirmedStructureThemesByPly(
+  scans: Array<{ fenAfter: string; fenBefore?: string }>
+): string[][] {
+  const persist = HEURISTICS_STRUCTURE_PERSIST_PLIES;
+  const tracked = new Set<string>([
+    ...PERSIST_STRUCTURE,
+    ...WINDOWED_STRUCTURE_THEMES,
+  ]);
+  const rawAfter = scans.map((s) => detectStructureThemes(s.fenAfter));
+  const confirmed: Array<Set<string>> = rawAfter.map(() => new Set());
+
+  const themeIds = new Set<string>();
+  for (const row of rawAfter) {
+    for (const t of row) themeIds.add(t);
+  }
+
+  for (const theme of themeIds) {
+    if (!tracked.has(theme)) {
+      for (let i = 0; i < rawAfter.length; i += 1) {
+        if (rawAfter[i].includes(theme)) confirmed[i].add(theme);
+      }
+      continue;
+    }
+    let runStart = -1;
+    const n = rawAfter.length;
+    for (let i = 0; i <= n; i += 1) {
+      const on = i < n && rawAfter[i].includes(theme);
+      if (on) {
+        if (runStart < 0) runStart = i;
+        continue;
+      }
+      if (runStart >= 0 && i - runStart >= persist) {
+        for (let j = runStart; j < i; j += 1) confirmed[j].add(theme);
+      }
+      runStart = -1;
+    }
+  }
+
+  return rawAfter.map((row, i) =>
+    row.filter((t) => !tracked.has(t) || confirmed[i].has(t))
+  );
+}
+
+/**
+ * Windowed structure for notes: theme must survive persist plies.
+ * Sequential update() reports the current ply only; use confirmedByPly()
+ * (or confirmedStructureThemesByPly) to backdate the birth ply once confirmed.
  */
 export class StructureThemeTracker {
-  private history: string[][] = [];
-  private streaks = new Map<string, number>();
+  private scans: Array<{ fenBefore: string; fenAfter: string }> = [];
 
   update(fenBefore: string, fenAfter: string): string[] {
-    const beforeRaw = detectStructureThemes(fenBefore);
-    const afterRaw = detectStructureThemes(fenAfter);
-    const beforeSet = new Set(beforeRaw);
-    const afterSet = new Set(afterRaw);
+    this.scans.push({ fenBefore, fenAfter });
+    const all = confirmedStructureThemesByPly(this.scans);
+    return all[all.length - 1] || [];
+  }
 
-    for (const theme of PERSIST_STRUCTURE) {
-      if (afterSet.has(theme)) {
-        this.streaks.set(theme, (this.streaks.get(theme) || 0) + 1);
-      } else {
-        this.streaks.set(theme, 0);
-      }
-    }
-
-    this.history.push(afterRaw);
-    if (this.history.length > 5) this.history.shift();
-
-    const window = this.history.slice(-STRUCTURE_WINDOW);
-    const needHits = window.length >= 2 ? 2 : 1;
-    const out: string[] = [];
-
-    for (const t of afterRaw) {
-      if (!beforeSet.has(t)) continue;
-      if (PERSIST_STRUCTURE.has(t)) {
-        const streak = this.streaks.get(t) || 0;
-        if (streak < HEURISTICS_DOUBLED_PERSIST_PLIES) continue;
-      }
-      const hits = window.filter((h) => h.includes(t)).length;
-      if (hits < needHits) continue;
-      out.push(t);
-    }
-    return out;
+  confirmedByPly(): string[][] {
+    return confirmedStructureThemesByPly(this.scans);
   }
 }
 
@@ -520,6 +541,19 @@ export function detectOpeningFamily(
   if (key.includes("english") || name.includes("english opening") || name === "english") {
     tags.push("opening_english");
   }
+  if (
+    key.includes("benko") ||
+    name.includes("benko") ||
+    name.includes("volga")
+  ) {
+    tags.push("opening_benko");
+  }
+  if (
+    key.includes("benoni") ||
+    name.includes("benoni")
+  ) {
+    tags.push("opening_benoni");
+  }
   if (name.includes("najdorf")) tags.push("opening_najdorf");
   if (name.includes("dragon")) tags.push("opening_dragon");
 
@@ -543,6 +577,8 @@ const OPENING_TAG_TO_PACK: Record<string, string> = {
   opening_scandinavian: "opening.scandinavian",
   opening_petroff: "opening.petroff",
   opening_english: "opening.english",
+  opening_benko: "opening.benko",
+  opening_benoni: "opening.benoni",
 };
 
 const ECO_FAMILY_TO_PACK: Record<string, string> = {
@@ -560,6 +596,8 @@ const ECO_FAMILY_TO_PACK: Record<string, string> = {
   "b-scandinavian": "opening.scandinavian",
   "c-petroff": "opening.petroff",
   "a-english": "opening.english",
+  "a-benko": "opening.benko",
+  "a-benoni": "opening.benoni",
 };
 
 /**

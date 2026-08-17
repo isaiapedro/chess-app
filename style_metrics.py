@@ -93,7 +93,8 @@ DRAWISH_CP = 40
 CRITICAL_SWING_CP = 150
 DISADVANTAGE_CP = 241
 BLUNDER_CP = 241
-HEURISTICS_DOUBLED_PERSIST_PLIES = 3
+HEURISTICS_STRUCTURE_PERSIST_PLIES = 4
+HEURISTICS_DOUBLED_PERSIST_PLIES = HEURISTICS_STRUCTURE_PERSIST_PLIES
 HEURISTICS_MG_SAMPLE_EVERY = 3
 HEURISTICS_MG_ISLANDS_EVERY = 5
 HEURISTICS_MG_SPACE_EVERY = 5
@@ -408,6 +409,8 @@ def analyze_peer_game_metrics(
     eg_pending_user_net = 0
     eg_pending_piece_seen = False
     mg_doubled_streak = 0
+    mg_iqp_streak = 0
+    mg_backward_streak = 0
 
     castle_fullmove = None
     phase_end = opening_phase_end_fullmove(None)
@@ -791,7 +794,7 @@ def analyze_peer_game_metrics(
                         opening_wp_from_cp(after_user) * 100.0,
                     )
                 )
-            if (full_move > phase_end and castle_fullmove is not None) or full_move > 40:
+            if full_move > phase_end:
                 opening_closed = True
 
         in_mg = in_middlegame_ply(ply_idx, phase_end, endgame_start_ply)
@@ -819,7 +822,11 @@ def analyze_peer_game_metrics(
             if mg_ply % HEURISTICS_MG_ISLANDS_EVERY == 0:
                 mg_islands.append(float(pawn_island_count(board, user_color)))
             if has_isolated_queen_pawn(board, user_color):
-                mg_had_iqp = True
+                mg_iqp_streak += 1
+                if mg_iqp_streak >= HEURISTICS_STRUCTURE_PERSIST_PLIES:
+                    mg_had_iqp = True
+            else:
+                mg_iqp_streak = 0
             if has_doubled_pawns(board, user_color):
                 mg_doubled_streak += 1
                 if mg_doubled_streak >= HEURISTICS_DOUBLED_PERSIST_PLIES:
@@ -827,7 +834,11 @@ def analyze_peer_game_metrics(
             else:
                 mg_doubled_streak = 0
             if has_backward_pawn(board, user_color):
-                mg_had_backward = True
+                mg_backward_streak += 1
+                if mg_backward_streak >= HEURISTICS_STRUCTURE_PERSIST_PLIES:
+                    mg_had_backward = True
+            else:
+                mg_backward_streak = 0
 
             if is_user and wp_before_eg is not None and wp_after_eg is not None:
                 mg_accuracy.append(

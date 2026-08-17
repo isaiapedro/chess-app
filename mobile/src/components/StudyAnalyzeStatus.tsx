@@ -11,7 +11,7 @@ import { AnalysisLoadingBars } from "./LoadingSkeletons";
 const WAITING_LINES = [
   "Buying the chess board…",
   "Warming up the coffee…",
-  "Unhooking the king…",
+  "Uncastleling the king…",
   "Never playing f6…",
   "Hiding the bongcloud…",
   "Dusting off the knights…",

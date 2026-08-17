@@ -60,6 +60,7 @@ def test_castle_and_uncastled() -> None:
     assert row is not None
     assert row["uncastled"] is True
     assert row["opening_castle_fullmove"] is None
+    assert row["phase_end_fullmove"] == 15.0
 
     agg = aggregate_opening_metrics([white, row])
     assert agg["castled_games"] == 1

@@ -17,7 +17,9 @@ import {
   type BaselineMetricHit,
   type BaselineStore,
 } from "../data/baselines";
-import { Ionicons } from "@expo/vector-icons";
+import { peerImpactColor } from "../data/metricPolarity";
+import { Info, X } from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
@@ -40,7 +42,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Accuracy in Middlegame",
     key: "middlegame_accuracy_pct",
-    unit: "%",
+    unit: "score",
     group: "tactics",
     summary: "Move quality in the middlegame from eval win-probability swings.",
     detail:
@@ -51,29 +53,29 @@ const METRICS: MetricDef[] = [
   {
     name: "Blunder Rate",
     key: "middlegame_blunder_avg",
-    unit: "/game",
+    unit: "per game",
     group: "tactics",
     summary: "Average blunders per middlegame.",
     detail:
-      "A middlegame blunder is a move that drops win probability by more than 15pp. Mean count per game that reached a middlegame.",
+      "A middlegame blunder is a move that drops win probability by 20pp or more. Mean count per game that reached a middlegame.",
     format: (v) => v.toFixed(2),
     scale: { kind: "benchmark", fallback: 2 },
   },
   {
     name: "Mistake Rate",
     key: "middlegame_mistake_avg",
-    unit: "/game",
+    unit: "per game",
     group: "tactics",
     summary: "Average mistakes per middlegame.",
     detail:
-      "A middlegame mistake drops win probability by 10–15pp (inclusive). Not counted as a blunder. Mean count per middlegame game.",
+      "A middlegame mistake drops win probability by 10–20pp (from 10pp up to but not including 20pp). Not counted as a blunder. Mean count per middlegame game.",
     format: (v) => v.toFixed(2),
     scale: { kind: "benchmark", fallback: 3 },
   },
   {
     name: "Inaccuracy Rate",
     key: "middlegame_inaccuracy_avg",
-    unit: "/game",
+    unit: "per game",
     group: "tactics",
     summary: "Average inaccuracies per middlegame.",
     detail:
@@ -84,51 +86,62 @@ const METRICS: MetricDef[] = [
   {
     name: "Missed Opportunities",
     key: "middlegame_missed_opportunity_pct",
-    unit: "%",
+    unit: "% chances",
     group: "tactics",
     summary: "Chances after an opponent blunder that you failed to convert.",
     detail:
-      "When the opponent blunders in the middlegame (your win probability jumps by more than 15pp), the next move is an opportunity. It counts as missed if your reply is a mistake or worse (≥10pp drop), or drops ≥10pp from the post-blunder peak. Percentage of such chances you miss.",
+      "When the opponent blunders in the middlegame (your win probability jumps by 20pp or more), the next move is an opportunity. It counts as missed if your reply is a mistake or worse (≥10pp drop), or drops ≥10pp from the post-blunder peak. Percentage of such chances you miss.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 35 },
   },
   {
     name: "Missed Tactic",
     key: "middlegame_missed_tactic_pct",
-    unit: "%",
+    unit: "% chances",
     group: "tactics",
     summary: "Missed opportunities where a material win was available.",
     detail:
       "Same opportunity window as Missed Opportunities, but only when a material-winning tactic was available on the board before your reply. Percentage of those tactic chances you miss. TacticsMade counts when you had a hanging/profitable capture (≥+2 material) and you took it.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 35 },
   },
   {
     name: "Allowed Tactics",
     key: "middlegame_allowed_tactic_pct",
-    unit: "%",
+    unit: "% chances",
     group: "tactics",
     summary: "How often opponents punish tactics you blunder into.",
     detail:
-      "A blunder (>15pp) that leaves a material tactic for the opponent is an allowed-tactic chance. Found if they capture or their reply worsens your position by half a blunder threshold. n/a means zero such chances.",
+      "A blunder (≥20pp) that leaves a material tactic for the opponent is an allowed-tactic chance. Found if they capture or their reply worsens your position by half a blunder threshold (10pp). n/a means zero such chances.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 35 },
   },
   {
     name: "Attackers in King Zone",
     key: "middlegame_king_attackers_score",
-    unit: "%",
+    unit: "score",
     group: "king",
     summary: "King-zone pressure as a share of maximum attacker power.",
     detail:
-      "Each sampled middlegame position: unique opponent pieces (not king) that attack any of the eight squares around your king. Power weights: P=1, N/B=3, R=5, Q=9. Sum those powers once per piece, square the sum (stacked pressure overweight), then scale to 0–100 against the theoretical max of one full army minus king (Q+2R+2B+2N = 31 → 31² = 961). Sampled every 3 middlegame plies and averaged. 0 = no zone pressure; 100 = every non-king piece hitting the zone.",
+      "Each sampled middlegame position: unique opponent pieces (not king) that attack any of the eight squares around your king. Power weights: P=1, N/B=3, R=5, Q=9. Sum those powers once per piece, square the sum (stacked pressure overweight), then scale to 0–100 against the theoretical max of one full army minus king (Q+2R+2B+2N = 31 → 31² = 961). Sampled every middlegame ply and averaged. 0 = no zone pressure; 100 = every non-king piece hitting the zone.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 30 },
+  },
+  {
+    name: "Attackers on Opponent King",
+    key: "middlegame_opp_king_attackers_score",
+    unit: "score",
+    group: "king",
+    summary: "Your pressure on the opponent king zone (same scale as own).",
+    detail:
+      "Same formula as Attackers in King Zone, measured around the opponent's king instead — unique pieces of yours (not king) attacking the eight squares around their king, squared power sum scaled 0–100. Higher means you are pressing their king. Sampled every middlegame ply and averaged.",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "benchmark", fallback: 30 },
   },
   {
     name: "Pawn Shield Integrity",
     key: "middlegame_pawn_shield_pct",
-    unit: "%",
+    unit: "% pawns",
     group: "king",
     summary: "Share of castled shield pawns that never moved or were taken.",
     detail:
@@ -139,18 +152,18 @@ const METRICS: MetricDef[] = [
   {
     name: "Open File Proximity",
     key: "middlegame_open_file_proximity_pct",
-    unit: "%",
+    unit: "score",
     group: "king",
     summary: "Peak exposure of your king to open or semi-open files.",
     detail:
       "Tracks pawn counts on the king file and adjacent files; if you castled, also the rook file (h or a). Uncastled kings never use the flank/rook file — only king file + neighbors. Semi-open = pawns of only one side; open = neither. Open = 100, semi = 70 (half weight on adjacent, 0.6 on rook file when castled). Sticky maximum during the middlegame.",
     format: (v) => v.toFixed(1),
-    scale: { kind: "fixed", max: 100 },
+    scale: { kind: "benchmark", fallback: 40 },
   },
   {
     name: "Safe Legal Moves",
     key: "middlegame_safe_moves_pct",
-    unit: "%",
+    unit: "% moves",
     group: "activity",
     summary: "Share of your legal moves landing off any enemy attack.",
     detail:
@@ -161,7 +174,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Outpost Control",
     key: "middlegame_outpost_control_avg",
-    unit: "",
+    unit: "per game",
     group: "activity",
     summary: "Distinct outpost squares your minors occupied.",
     detail:
@@ -172,7 +185,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Space Advantage",
     key: "middlegame_space_advantage_pct",
-    unit: "%",
+    unit: "% squares",
     group: "activity",
     summary: "Safe space on c–f files, ranks 3–5.",
     detail:
@@ -183,7 +196,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Isolated Queen Pawn",
     key: "middlegame_iqp_win_rate_pct",
-    unit: "%",
+    unit: "% wins",
     group: "pawns",
     summary: "Win rate in middlegames where you had an IQP.",
     detail:
@@ -194,7 +207,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Doubled Pawns",
     key: "middlegame_doubled_pawns_game_pct",
-    unit: "%",
+    unit: "% games",
     group: "pawns",
     summary: "Games with lasting doubled pawns in the middlegame.",
     detail:
@@ -205,7 +218,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Backward Pawns",
     key: "middlegame_backward_pawns_game_pct",
-    unit: "%",
+    unit: "% games",
     group: "pawns",
     summary: "Games with a backward pawn in the middlegame.",
     detail:
@@ -216,7 +229,7 @@ const METRICS: MetricDef[] = [
   {
     name: "Pawn Islands",
     key: "middlegame_pawn_islands_avg",
-    unit: "",
+    unit: "per game",
     group: "pawns",
     summary: "Average number of pawn islands in the middlegame.",
     detail:
@@ -244,16 +257,10 @@ function projectBenchmarkMax(
   hit: BaselineMetricHit | null,
   fallback: number
 ): number {
-  const parts = [fallback];
   if (hit?.mean != null && Number.isFinite(hit.mean) && Math.abs(hit.mean) > 0) {
-    parts.push(Math.abs(hit.mean) * 1.6);
+    return Math.abs(hit.mean) * 2;
   }
-  if (hit?.p90 != null && Number.isFinite(hit.p90) && Math.abs(hit.p90) > 0) {
-    parts.push(Math.abs(hit.p90) * 1.25);
-  } else if (hit?.p75 != null && Number.isFinite(hit.p75) && Math.abs(hit.p75) > 0) {
-    parts.push(Math.abs(hit.p75) * 1.45);
-  }
-  return Math.max(...parts);
+  return fallback;
 }
 
 function resolveScaleMax(
@@ -268,10 +275,12 @@ function MetricBulletGraph({
   value,
   peerMean,
   scaleMax,
+  fillColor,
 }: {
   value: number | null | undefined;
   peerMean: number | null | undefined;
   scaleMax: number;
+  fillColor: string;
 }) {
   if (value == null || !Number.isFinite(value) || !(scaleMax > 0)) return null;
   const fillPct = Math.max(0, (Math.abs(value) / scaleMax) * 100);
@@ -285,7 +294,10 @@ function MetricBulletGraph({
         <View
           style={[
             styles.bulletFill,
-            { width: `${Math.min(fillPct, 100)}%` },
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: fillColor,
+            },
           ]}
         />
         {peerPct != null ? (
@@ -321,7 +333,7 @@ function HelpModal({
               accessibilityRole="button"
               accessibilityLabel="Close"
             >
-              <Ionicons name="close" size={20} color={colors.textMuted} />
+              <AppIcon icon={X} size={20} color={colors.textMuted} />
             </Pressable>
           </View>
           <ScrollView
@@ -367,8 +379,12 @@ function MetricBanner({
       : null;
   const scaleMax = resolveScaleMax(scale, hit);
   const deltaLabel = peerDeltaLabel(userNum, hit?.mean, unit);
-  const deltaPositive =
-    userNum != null && hit?.mean != null && userNum >= hit.mean;
+  const impactColor = peerImpactColor(
+    userNum,
+    hit?.mean,
+    baselineKey,
+    scaleMax
+  );
   return (
     <EdgeCard style={styles.card}>
       <View style={styles.cardRow}>
@@ -380,12 +396,7 @@ function MetricBanner({
               {unit ? <Text style={styles.unit}> {unit}</Text> : null}
             </Text>
             {deltaLabel ? (
-              <Text
-                style={[
-                  styles.peerDelta,
-                  { color: deltaPositive ? result.win : result.loss },
-                ]}
-              >
+              <Text style={[styles.peerDelta, { color: impactColor }]}>
                 {deltaLabel}
               </Text>
             ) : null}
@@ -394,6 +405,7 @@ function MetricBanner({
             value={userNum}
             peerMean={hit?.mean}
             scaleMax={scaleMax}
+            fillColor={impactColor}
           />
         </View>
         {onHelp ? (
@@ -404,11 +416,7 @@ function MetricBanner({
             accessibilityLabel={`About ${name}`}
             style={styles.helpButton}
           >
-            <Ionicons
-                      name="information-circle-outline"
-                      size={20}
-                      color={colors.textDim}
-                    />
+            <AppIcon icon={Info} size={20} color={colors.textDim} />
           </Pressable>
         ) : null}
       </View>
@@ -469,6 +477,7 @@ export function MiddlegameInsightsPanel() {
       middlegame_missed_tactic_pct: agg.middlegame_missed_tactic_pct,
       middlegame_allowed_tactic_pct: agg.middlegame_allowed_tactic_pct,
       middlegame_king_attackers_score: agg.middlegame_king_attackers_score,
+      middlegame_opp_king_attackers_score: agg.middlegame_opp_king_attackers_score,
       middlegame_pawn_shield_pct: agg.middlegame_pawn_shield_pct,
       middlegame_open_file_proximity_pct: agg.middlegame_open_file_proximity_pct,
       middlegame_safe_moves_pct: agg.middlegame_safe_moves_pct,
@@ -644,7 +653,6 @@ const styles = StyleSheet.create({
     bottom: 0,
     left: 0,
     borderRadius: radius.pill,
-    backgroundColor: result.win,
   },
   stackWin: {
     position: "absolute",

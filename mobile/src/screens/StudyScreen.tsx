@@ -38,6 +38,7 @@ import {
 import {
   formatEval,
   displayCp,
+  evalBarWhiteShare,
   refineRecentMistakeCandidates,
   validateMoveLocal,
   type AnalyzeProgress,
@@ -45,8 +46,9 @@ import {
   type ThresholdPass,
 } from "../engine/analyzeMistakes";
 import { applyUciMove } from "../engine/chessMoves";
-import { consumeCandidates, candidateKey } from "../engine/candidateBucket";
+import { consumeCandidates, candidateKey, loadConsumedKeys } from "../engine/candidateBucket";
 import {
+  appendMistakeMoments,
   capMistakeMoments,
   filterUnsolvedMoments,
   loadMistakesSession,
@@ -234,7 +236,7 @@ export function StudyScreen() {
     setGuessUci(null);
     setSequencePv([]);
     setSequencePlaying(false);
-  }, [current?.game_id, current?.ply, current?.fen]);
+  }, [idx, current?.game_id, current?.ply, current?.fen]);
 
   const playContinuation = useCallback((startFen: string, pv: string[]) => {
     const token = ++playTokenRef.current;
@@ -313,13 +315,12 @@ export function StudyScreen() {
 
   const persistSessionMoments = useCallback(
     async (moments: MistakeItem[]) => {
-      const capped = capMistakeMoments(moments);
       await saveMistakesSession(queryFilters, {
         sessionId: mistakesSessionId(),
-        moments: capped,
+        moments,
         completedKeys: [...completedKeysRef.current],
       });
-      return capped;
+      return moments;
     },
     [queryFilters]
   );
@@ -348,7 +349,7 @@ export function StudyScreen() {
       if (cached) {
         await writeCache(mistakesCacheKey, {
           ...cached,
-          moments: capMistakeMoments(mistakesRef.current),
+          moments: mistakesRef.current,
           pendingCandidates: pendingCandidatesRef.current,
           deferredCandidates: deferredCandidatesRef.current,
         } satisfies MistakesCachePayload);
@@ -366,24 +367,31 @@ export function StudyScreen() {
       const resetIdx = options?.resetIdx ?? true;
       const replaceSession = options?.replaceSession ?? false;
       const solved = await loadSolvedMistakeKeys(queryFilters);
-      let moments = capMistakeMoments(cached.moments);
+      const consumed = await loadConsumedKeys(queryFilters);
+      const excludeKeys = new Set([...solved, ...consumed.mistake]);
+      let moments: MistakeItem[];
       if (!replaceSession) {
         const session = await loadMistakesSession(queryFilters);
         if (session?.moments.length) {
           completedKeysRef.current = new Set(session.completedKeys || []);
-          moments = mergeSessionMoments(
-            session.moments,
-            moments,
-            solved
-          );
+          moments = session.moments;
+          if (moments.length < TARGET_MISTAKE_MOMENTS) {
+            moments = mergeSessionMoments(
+              moments,
+              cached.moments,
+              excludeKeys
+            );
+          }
         } else {
-          moments = filterUnsolvedMoments(moments, solved);
-          moments = capMistakeMoments(moments);
+          moments = capMistakeMoments(
+            filterUnsolvedMoments(cached.moments, excludeKeys)
+          );
           completedKeysRef.current = new Set();
         }
       } else {
-        moments = filterUnsolvedMoments(moments, solved);
-        moments = capMistakeMoments(moments);
+        moments = capMistakeMoments(
+          filterUnsolvedMoments(cached.moments, excludeKeys)
+        );
         completedKeysRef.current = new Set();
       }
       sessionIdRef.current = mistakesSessionId();
@@ -396,11 +404,11 @@ export function StudyScreen() {
       scannedIdsRef.current = cached.scannedGameIds;
       pendingCandidatesRef.current = filterUnsolvedMoments(
         cached.pendingCandidates || [],
-        solved
+        new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
       );
       deferredCandidatesRef.current = filterUnsolvedMoments(
         cached.deferredCandidates || [],
-        solved
+        new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
       );
       setPendingCount(pendingCandidatesRef.current.length);
       setRemainingGames(cached.remaining);
@@ -431,20 +439,26 @@ export function StudyScreen() {
             games.map((game) => String(game.id))
           )
         );
-        setMistakes(capMistakeMoments(session.moments));
+        setMistakes(session.moments);
         setIdx(0);
         loadedCacheKeyRef.current = mistakesCacheKey;
         setMistakesError(null);
         if (cached) {
           const solvedKeys = await loadSolvedMistakeKeys(queryFilters);
+          const consumedKeys = await loadConsumedKeys(queryFilters);
+          const excludeKeys = new Set([
+            ...solvedKeys,
+            ...consumedKeys.mistake,
+            ...session.moments.map((item) => candidateKey(item)),
+          ]);
           scannedIdsRef.current = cached.scannedGameIds;
           pendingCandidatesRef.current = filterUnsolvedMoments(
             cached.pendingCandidates || [],
-            solvedKeys
+            excludeKeys
           );
           deferredCandidatesRef.current = filterUnsolvedMoments(
             cached.deferredCandidates || [],
-            solvedKeys
+            excludeKeys
           );
           setPendingCount(pendingCandidatesRef.current.length);
           setRemainingGames(cached.remaining);
@@ -637,22 +651,23 @@ export function StudyScreen() {
       };
       const applyBatch = async (
         batch: Awaited<ReturnType<typeof refineRecentMistakeCandidates>>,
-        candidates: MistakeItem[]
+        _candidates: MistakeItem[]
       ) => {
-        await consumeCandidates(queryFilters, "mistake", candidates);
         if (signal.cancelled) return;
         const solved = await loadSolvedMistakeKeys(queryFilters);
+        const consumed = await loadConsumedKeys(queryFilters);
+        const excludeKeys = new Set([...solved, ...consumed.mistake]);
         const moments = capMistakeMoments(
-          filterUnsolvedMoments(batch.moments, solved)
+          filterUnsolvedMoments(batch.moments, excludeKeys)
         );
         scannedIdsRef.current = batch.scannedGameIds;
         pendingCandidatesRef.current = filterUnsolvedMoments(
           batch.pendingCandidates,
-          solved
+          new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
         );
         deferredCandidatesRef.current = filterUnsolvedMoments(
           batch.deferredCandidates || [],
-          solved
+          new Set([...excludeKeys, ...moments.map((item) => candidateKey(item))])
         );
         setPendingCount(pendingCandidatesRef.current.length);
         thresholdPassRef.current = batch.thresholdPass;
@@ -794,18 +809,12 @@ export function StudyScreen() {
       return;
     }
     const keptMoments = mistakesRef.current;
-    let slots = Math.max(0, TARGET_MISTAKE_MOMENTS - keptMoments.length);
-    let replaceBatch = false;
-    if (slots <= 0) {
-      if (silent) return;
-      replaceBatch = true;
-      slots = TARGET_MISTAKE_MOMENTS;
-    }
+    const slots = TARGET_MISTAKE_MOMENTS;
     cancelRef.current.cancelled = true;
     cancelRef.current = { cancelled: false };
     const signal = cancelRef.current;
     const carriedCandidates = pendingCandidatesRef.current;
-    const sessionBase = replaceBatch ? [] : keptMoments;
+    const sessionBase = keptMoments;
     if (!silent) {
       setShowScanMore(false);
       setAllDone(false);
@@ -847,6 +856,12 @@ export function StudyScreen() {
       }
 
       const solved = await loadSolvedMistakeKeys(queryFilters);
+      const consumed = await loadConsumedKeys(queryFilters);
+      const excludeKeys = new Set([
+        ...solved,
+        ...consumed.mistake,
+        ...sessionBase.map((item) => candidateKey(item)),
+      ]);
       const refineOpts = {
         games,
         evaluate,
@@ -867,7 +882,6 @@ export function StudyScreen() {
       let batch: Awaited<
         ReturnType<typeof refineRecentMistakeCandidates>
       > | null = null;
-      let taken: MistakeItem[] = [];
 
       const vault = await periodReservoirStatus(
         queryFilters,
@@ -881,7 +895,7 @@ export function StudyScreen() {
 
       const pool = filterUnsolvedMoments(
         [...carriedCandidates, ...vault.batch],
-        solved
+        excludeKeys
       );
 
       if (pool.length) {
@@ -890,8 +904,6 @@ export function StudyScreen() {
           candidates: pool,
           lookupEval: createEvalLookup(vault.state),
         });
-        taken = batch.moments.slice(sessionBase.length);
-        await consumeCandidates(queryFilters, "mistake", taken);
       } else if (!vault.complete || isStudyPrefetchActive()) {
         if (!silent) {
           setAnalyzeStatus("Waiting for more eval buffer…");
@@ -915,7 +927,7 @@ export function StudyScreen() {
           );
           const againPool = filterUnsolvedMoments(
             [...carriedCandidates, ...again.batch],
-            solved
+            excludeKeys
           );
           if (againPool.length) {
             batch = await refineRecentMistakeCandidates({
@@ -923,8 +935,6 @@ export function StudyScreen() {
               candidates: againPool,
               lookupEval: createEvalLookup(again.state),
             });
-            taken = batch.moments.slice(sessionBase.length);
-            await consumeCandidates(queryFilters, "mistake", taken);
             break;
           }
           if (again.complete && !isStudyPrefetchActive()) break;
@@ -952,22 +962,32 @@ export function StudyScreen() {
 
       if (signal.cancelled || !batch) return;
       const nextSolved = await loadSolvedMistakeKeys(queryFilters);
-      const merged = replaceBatch
-        ? capMistakeMoments(
-            filterUnsolvedMoments(batch.moments, nextSolved)
-          )
-        : mergeSessionMoments(sessionBase, batch.moments, nextSolved);
+      const merged = appendMistakeMoments(
+        sessionBase,
+        batch.moments,
+        new Set([
+          ...nextSolved,
+          ...sessionBase.map((item) => candidateKey(item)),
+        ]),
+        slots
+      );
+      const nextConsumed = await loadConsumedKeys(queryFilters);
+      const nextExclude = new Set([
+        ...nextSolved,
+        ...nextConsumed.mistake,
+        ...merged.map((item) => candidateKey(item)),
+      ]);
       scannedIdsRef.current = [
         ...scannedIdsRef.current,
         ...batch.scannedGameIds,
       ];
       pendingCandidatesRef.current = filterUnsolvedMoments(
         batch.pendingCandidates,
-        nextSolved
+        nextExclude
       );
       deferredCandidatesRef.current = filterUnsolvedMoments(
         batch.deferredCandidates || [],
-        nextSolved
+        nextExclude
       );
       setPendingCount(pendingCandidatesRef.current.length);
       thresholdPassRef.current = batch.thresholdPass;
@@ -977,9 +997,7 @@ export function StudyScreen() {
         pendingCandidatesRef.current.length
       );
 
-      const hasNew = replaceBatch
-        ? merged.length > 0
-        : merged.length > sessionBase.length;
+      const hasNew = merged.length > sessionBase.length;
       await persistSessionMoments(merged);
       if (silent) {
         if (hasNew) {
@@ -991,12 +1009,12 @@ export function StudyScreen() {
             remaining: reservoir.remaining,
             thresholdPass: batch.thresholdPass,
             baselineAvailable: batch.baselineAvailable,
-            previousLength: replaceBatch ? 0 : sessionBase.length,
+            previousLength: sessionBase.length,
           };
           setPendingReady(true);
         }
         await writeCache(mistakesCacheKey, {
-          moments: replaceBatch ? merged : keptMoments,
+          moments: keptMoments,
           pendingCandidates: pendingCandidatesRef.current,
           deferredCandidates: deferredCandidatesRef.current,
           scannedGameIds: scannedIdsRef.current,
@@ -1006,18 +1024,12 @@ export function StudyScreen() {
         } satisfies MistakesCachePayload);
       } else {
         setMistakes(merged);
-        visibleBatchStartRef.current = replaceBatch
-          ? 0
-          : hasNew
-            ? sessionBase.length
-            : 0;
+        visibleBatchStartRef.current = hasNew ? sessionBase.length : 0;
         secondPagePrefetchKeyRef.current = null;
         setIdx(
-          replaceBatch
-            ? 0
-            : hasNew
-              ? sessionBase.length
-              : Math.max(0, merged.length - 1)
+          hasNew
+            ? sessionBase.length
+            : Math.max(0, merged.length - 1)
         );
         await writeCache(mistakesCacheKey, {
           moments: merged,
@@ -1054,9 +1066,8 @@ export function StudyScreen() {
           if (pending) {
             pendingBatchRef.current = null;
             setPendingReady(false);
-            const capped = capMistakeMoments(pending.moments);
-            setMistakes(capped);
-            void persistSessionMoments(capped);
+            setMistakes(pending.moments);
+            void persistSessionMoments(pending.moments);
             visibleBatchStartRef.current = pending.previousLength;
             secondPagePrefetchKeyRef.current = null;
             setIdx(pending.previousLength);
@@ -1065,7 +1076,7 @@ export function StudyScreen() {
             setMistakesError(null);
             resetQuizChrome();
             void writeCache(mistakesCacheKey, {
-              moments: capped,
+              moments: pending.moments,
               pendingCandidates: pending.pendingCandidates,
               deferredCandidates: pending.deferredCandidates,
               scannedGameIds: pending.scannedGameIds,
@@ -1103,24 +1114,19 @@ export function StudyScreen() {
     if (!pending) return false;
     pendingBatchRef.current = null;
     setPendingReady(false);
-    const capped = capMistakeMoments(
-      mergeSessionMoments(
-        mistakesRef.current,
-        pending.moments,
-        completedKeysRef.current
-      )
-    );
-    setMistakes(capped);
-    void persistSessionMoments(capped);
+    setMistakes(pending.moments);
+    void persistSessionMoments(pending.moments);
     visibleBatchStartRef.current = pending.previousLength;
     secondPagePrefetchKeyRef.current = null;
-    setIdx(Math.min(pending.previousLength, Math.max(0, capped.length - 1)));
+    setIdx(
+      Math.min(pending.previousLength, Math.max(0, pending.moments.length - 1))
+    );
     setShowScanMore(false);
     setAllDone(false);
     setMistakesError(null);
     resetQuizChrome();
     void writeCache(mistakesCacheKey, {
-      moments: capped,
+      moments: pending.moments,
       pendingCandidates: pending.pendingCandidates,
       deferredCandidates: pending.deferredCandidates,
       scannedGameIds: pending.scannedGameIds,
@@ -1229,7 +1235,6 @@ export function StudyScreen() {
       setHighlightUci(current.best_uci);
       setSequencePv(res.best_pv.length ? res.best_pv : current.best_uci ? [current.best_uci] : []);
       setSequencePlaying(false);
-      void markCurrentSolved(current);
     } catch (e) {
       setQuizFeedback(e instanceof Error ? e.message : "Validate failed");
       setPuzzleFen(current.fen);
@@ -1244,6 +1249,10 @@ export function StudyScreen() {
       (remainingGames > 0 || pendingCount > 0 || !periodComplete));
 
   const nextMistake = () => {
+    const leaving = mistakesRef.current[idx] || current;
+    if (leaving) {
+      void markCurrentSolved(leaving);
+    }
     if (idx >= mistakes.length - 1) {
       if (canScanMoreMistakes) {
         resetQuizChrome();
@@ -1271,10 +1280,7 @@ export function StudyScreen() {
 
   const evalBefore = current?.eval_before_cp ?? 0;
   const evalAfter = current?.eval_after_cp ?? 0;
-  const whiteShare = Math.max(
-    8,
-    Math.min(92, 50 + displayCp(evalBefore) / 4)
-  );
+  const whiteShare = evalBarWhiteShare(evalBefore);
 
   return (
     <KeyboardAvoidingView
@@ -1306,15 +1312,17 @@ export function StudyScreen() {
         <PageLoadingTransition
           active={loadingMistakes || scanningMore}
           contentKey={
-            showScanMore
-              ? "scan-more"
-              : allDone
-                ? "all-done"
-                : mistakesError
-                  ? `error:${mistakesError}`
-                  : mistakes.length === 0
-                    ? "empty"
-                    : `batch:${visibleBatchStartRef.current}:${mistakes.length}`
+            loadingMistakes || scanningMore
+              ? `mistakes:${scanningMore ? "scan" : "init"}`
+              : showScanMore
+                ? "scan-more"
+                : allDone
+                  ? "all-done"
+                  : mistakesError
+                    ? `error:${mistakesError}`
+                    : mistakes.length === 0
+                      ? "empty"
+                      : `quiz:${visibleBatchStartRef.current}:${mistakes.length}`
           }
           loader={
             <View style={styles.center}>
@@ -1531,7 +1539,6 @@ export function StudyScreen() {
                       setUserMoveEval(null);
                       setHighlightUci(current.best_uci);
                       setSequencePlaying(false);
-                      void markCurrentSolved(current);
                       try {
                         const res = await validateMoveLocal(
                           evaluate,

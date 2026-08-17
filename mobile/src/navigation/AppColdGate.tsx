@@ -1,47 +1,58 @@
 import React, { useEffect, useState } from "react";
 import { StyleSheet, View } from "react-native";
-import { ChessPieceLoader } from "../components/LoadingSkeletons";
+import {
+  ChessPieceLoader,
+  RecapSkeleton,
+} from "../components/LoadingSkeletons";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useAuth } from "../context/AuthContext";
 import { resetBackgroundWork } from "../engine/backgroundWork";
 import { colors } from "../theme";
 
-const COLD_BOOT_MAX_MS = 2500;
+const COLD_PAWN_MS = 600;
+
+type ColdPhase = "pawn" | "skeleton" | "done";
 
 export function AppColdGate({ children }: { children: React.ReactNode }) {
   const auth = useAuth();
   const { gamesLoading, recap } = useAnalytics();
-  const [coldDone, setColdDone] = useState(false);
+  const [phase, setPhase] = useState<ColdPhase>("pawn");
+
+  const monthReady =
+    auth.ready &&
+    (!auth.isLoggedIn || recap != null || !gamesLoading);
 
   useEffect(() => {
     resetBackgroundWork();
   }, []);
 
   useEffect(() => {
-    if (coldDone) return;
-    if (!auth.ready) return;
-    if (!auth.isLoggedIn) {
-      setColdDone(true);
-      return;
-    }
-    if (recap != null || !gamesLoading) {
-      setColdDone(true);
-      return;
-    }
-    const t = setTimeout(() => setColdDone(true), COLD_BOOT_MAX_MS);
-    return () => clearTimeout(t);
-  }, [auth.ready, auth.isLoggedIn, gamesLoading, recap, coldDone]);
+    if (!monthReady) return;
+    setPhase("done");
+  }, [monthReady]);
 
-  const blocking = !coldDone;
+  useEffect(() => {
+    if (phase !== "pawn") return;
+    const t = setTimeout(() => {
+      setPhase((prev) => (prev === "pawn" ? "skeleton" : prev));
+    }, COLD_PAWN_MS);
+    return () => clearTimeout(t);
+  }, [phase]);
+
+  if (phase === "done") {
+    return <View style={styles.root}>{children}</View>;
+  }
 
   return (
     <View style={styles.root}>
-      {blocking ? (
+      {phase === "pawn" ? (
         <View style={styles.overlay} pointerEvents="auto">
           <ChessPieceLoader fullscreen />
         </View>
       ) : (
-        children
+        <View style={styles.overlay} pointerEvents="auto">
+          <RecapSkeleton />
+        </View>
       )}
     </View>
   );

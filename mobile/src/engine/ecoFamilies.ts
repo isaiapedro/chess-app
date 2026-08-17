@@ -287,7 +287,21 @@ export function resolveEcoFamily(
 export function resolveFamilyByName(name?: string | null): EcoFamily | null {
   const key = normalizeOpeningText(String(name || ""));
   if (!key) return null;
-  return FAMILIES_BY_NAME.get(key) || null;
+  const exact = FAMILIES_BY_NAME.get(key);
+  if (exact) return exact;
+  // Lichess/Chess.com names are long ("King's Indian Defense: Orthodox…").
+  let best: EcoFamily | null = null;
+  let bestLen = 0;
+  for (const [famName, fam] of FAMILIES_BY_NAME) {
+    if (famName.length < 6) continue;
+    if (key.includes(famName) || famName.includes(key)) {
+      if (famName.length > bestLen) {
+        best = fam;
+        bestLen = famName.length;
+      }
+    }
+  }
+  return best;
 }
 
 export function familyMatchesSelection(

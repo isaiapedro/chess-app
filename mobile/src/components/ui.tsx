@@ -10,7 +10,16 @@ import {
   View,
   ViewStyle,
 } from "react-native";
-import { Ionicons } from "@expo/vector-icons";
+import type { LucideIcon } from "lucide-react-native";
+import {
+  Check,
+  ChevronDown,
+  ChevronLeft,
+  ChevronRight,
+  Search,
+  X,
+} from "lucide-react-native";
+import { AppIcon } from "../icons";
 import { colors, font, radius, spacing, type, withAlpha } from "../theme";
 
 /* ---------------------------------------------------------------- surfaces */
@@ -125,14 +134,14 @@ export function BrutalButton({
 
 /** Icon-only tap target. No frame, no background. */
 export function IconButton({
-  name,
+  icon,
   onPress,
   size = 22,
   color = colors.textSoft,
   accessibilityLabel,
   style,
 }: {
-  name: keyof typeof Ionicons.glyphMap;
+  icon: LucideIcon;
   onPress?: () => void;
   size?: number;
   color?: string;
@@ -151,7 +160,7 @@ export function IconButton({
         style,
       ]}
     >
-      <Ionicons name={name} size={size} color={color} />
+      <AppIcon icon={icon} size={size} color={color} />
     </Pressable>
   );
 }
@@ -176,7 +185,7 @@ export function BackLink({
         style,
       ]}
     >
-      <Ionicons name="chevron-back" size={18} color={colors.textMuted} />
+      <AppIcon icon={ChevronLeft} size={18} color={colors.textMuted} />
       <Text style={styles.backLinkLabel}>{label}</Text>
     </Pressable>
   );
@@ -441,7 +450,7 @@ export function SearchField({
 }) {
   return (
     <View style={styles.searchWrap}>
-      <Ionicons name="search" size={17} color={colors.textDim} />
+      <AppIcon icon={Search} size={17} color={colors.textDim} />
       <TextInput
         value={value}
         onChangeText={onChangeText}
@@ -451,7 +460,7 @@ export function SearchField({
       />
       {value ? (
         <Pressable onPress={() => onChangeText("")} hitSlop={10}>
-          <Ionicons name="close" size={17} color={colors.textDim} />
+          <AppIcon icon={X} size={17} color={colors.textDim} />
         </Pressable>
       ) : null}
     </View>
@@ -488,7 +497,7 @@ export function SelectField({
         <Text style={styles.selectValue} numberOfLines={1}>
           {current}
         </Text>
-        <Ionicons name="chevron-down" size={14} color={colors.textDim} />
+        <AppIcon icon={ChevronDown} size={14} color={colors.textDim} />
       </Pressable>
       <Modal
         visible={open}
@@ -519,7 +528,7 @@ export function SelectField({
                     {option.label}
                   </Text>
                   {active ? (
-                    <Ionicons name="checkmark" size={18} color={colors.text} />
+                    <AppIcon icon={Check} size={18} color={colors.text} />
                   ) : null}
                 </Pressable>
               );
@@ -542,7 +551,7 @@ export function SettingsRow({
 }: {
   label: string;
   value?: string;
-  icon?: keyof typeof Ionicons.glyphMap;
+  icon?: LucideIcon;
   tone?: string;
   onPress?: () => void;
   showChevron?: boolean;
@@ -554,12 +563,12 @@ export function SettingsRow({
       accessibilityRole="button"
     >
       {icon ? (
-        <Ionicons name={icon} size={20} color={tone} style={styles.rowIcon} />
+        <AppIcon icon={icon} size={20} color={tone} style={styles.rowIcon} />
       ) : null}
       <Text style={[styles.rowLabel, { color: tone }]}>{label}</Text>
       {value ? <Text style={styles.rowValue}>{value}</Text> : null}
       {showChevron ? (
-        <Ionicons name="chevron-forward" size={18} color={colors.textDim} />
+        <AppIcon icon={ChevronRight} size={18} color={colors.textDim} />
       ) : null}
     </Pressable>
   );

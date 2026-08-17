@@ -142,6 +142,7 @@ function whyBetterContext(request?: CoachNoteRequest | null): {
     engineVsPlayedMetricDelta: request.engineVsPlayedMetricDelta,
     engineLineMetricDelta: request.engineLineMetricDelta,
     playedLineMetricDelta: request.playedLineMetricDelta,
+    phase: request.phase,
   });
   return {
     primarySoftKeys: explained.primarySoftKeys,
@@ -318,6 +319,15 @@ export function weightKeyBreakdown(args: {
       w -= 10;
       parts.push({ label: "openingDownrankCoordination", delta: -10 });
     }
+    if (
+      args.openingKeyId &&
+      (keyId === "imbalance.space" ||
+        keyId === "piece.centralization" ||
+        keyId === "attack.king_safety")
+    ) {
+      w -= 14;
+      parts.push({ label: "openingDownrankFiller", delta: -14 });
+    }
   }
 
   if (args.phase === "middlegame" && args.request) {
@@ -339,6 +349,23 @@ export function weightKeyBreakdown(args: {
       ) {
         w -= 8;
         parts.push({ label: "mgDownrankGenericInitiative", delta: -8 });
+      }
+    }
+    const evalBand = String(args.request.inputs?.eval_band || "");
+    if (
+      onAggregate &&
+      (evalBand === "winning" || evalBand === "better")
+    ) {
+      if (keyId === "piece.simplification") {
+        w += 18;
+        parts.push({ label: "mgWinningSimplification", delta: 18 });
+      }
+      if (
+        keyId === "attack.initiative" ||
+        keyId === "positional.pawn_break"
+      ) {
+        w -= 14;
+        parts.push({ label: "mgWinningDownrankAttackPlan", delta: -14 });
       }
     }
     const sIdx = structKeys.indexOf(keyId);
@@ -421,6 +448,24 @@ export function weightKeyBreakdown(args: {
         parts.push({ label: "whyBetterDownrankUnrelatedAttack", delta: -8 });
       }
     }
+
+    if (
+      args.phase === "opening" &&
+      (args.request.inputs?.played_tempo_waste === true ||
+        args.request.inputs?.played_tempo_waste === 1)
+    ) {
+      if (
+        keyId === "piece.centralization" ||
+        keyId === "methodology.candidate_moves"
+      ) {
+        w += 18;
+        parts.push({ label: "openingTempoWaste", delta: 18 });
+      }
+      if (keyId === "piece.coordination") {
+        w -= 14;
+        parts.push({ label: "openingTempoDownrankCoordination", delta: -14 });
+      }
+    }
   }
 
   const sitBoost = situationLockBoostForKey(
@@ -495,6 +540,13 @@ export function weightKeyBreakdown(args: {
   if (args.deltaCp >= 100 && TACTICAL_FAMILIES.has(family)) {
     w += 4;
     parts.push({ label: "deltaCpTactical", delta: 4 });
+  }
+  if (
+    args.request?.inputs?.tactical_sharp &&
+    TACTICAL_FAMILIES.has(family)
+  ) {
+    w += 6;
+    parts.push({ label: "tacticalSharp", delta: 6 });
   }
 
   if (args.request?.kind === "bad_move") {
@@ -698,6 +750,15 @@ export function explainAttachMetricTip(args: {
   /** Prefer request-driven attach when present. */
   request?: CoachNoteRequest | null;
 }): { attach: boolean; reasons: string[] } {
+  const quietPraise =
+    args.moment &&
+    args.moment.inputs?.praise_mark &&
+    args.moment.inputs.praise_mark !== "brilliant" &&
+    !args.moment.structuralKind;
+  if (quietPraise && !ERROR_MARKS.has(args.mark || ("" as MetricCoachMark))) {
+    return { attach: false, reasons: ["skipQuietPraise"] };
+  }
+
   const reasons: string[] = [];
   if (args.request) {
     if (requestAlwaysAttaches(args.request.kind)) {

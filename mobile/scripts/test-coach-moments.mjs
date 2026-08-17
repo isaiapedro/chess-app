@@ -23,9 +23,19 @@ import {
   weightKeyBreakdown,
 } from "../src/engine/gameCoach/metricNoteWeights.ts";
 import { pickMetricTip } from "../src/engine/gameCoach/metricNotes.ts";
+import { composeMomentJudgmentTip } from "../src/engine/gameCoach/momentJudgmentTip.ts";
 import {
   explainEngineLineVsPlayed,
 } from "../src/engine/gameCoach/engineLineExplain.ts";
+import {
+  buildTipCoordinate,
+  localizeTipCoordinate,
+  detectLocationFactors,
+  scanPillarConditions,
+} from "../src/engine/gameCoach/tipCoordinate.ts";
+import { isOpeningTempoWasteMove } from "../src/engine/openingPhase.ts";
+import { buildCommentRefs } from "../src/engine/gameCoach/commentRefs.ts";
+import { scoreNoteConditions } from "../src/engine/gameCoach/packNoteContent.ts";
 import { classifyUserError } from "../src/engine/gameCoach/noteCompose.ts";
 import { buildOpeningPeerSignals } from "../src/engine/gameCoach/openingCoachInputs.ts";
 import {
@@ -65,6 +75,13 @@ import {
 import {
   composeEndgameStrategicTip,
 } from "../src/engine/gameCoach/endgameStrategicTip.ts";
+import { resolveOpeningPackKey } from "../src/engine/gameCoach/structureDetect.ts";
+import { checkpointMistakeTakesOver } from "../src/engine/gameCoach/phaseCheckpointTip.ts";
+import {
+  evalBandFromInputs,
+  formatEvalSwingSummary,
+} from "../src/engine/gameCoach/evalSwingIndex.ts";
+import { strategicToneFromInputs } from "../src/engine/gameCoach/tipAspectAssemble.ts";
 
 function assert(cond, msg) {
   if (!cond) throw new Error(msg);
@@ -583,7 +600,7 @@ console.log(
       aggPly: byKind.opening_aggregate.ply,
       mgAggPly: byKind.middlegame_aggregate.ply,
       egAdvPly: byKind.endgame_advantage.ply,
-      cache: "game-coach:v149",
+      cache: "game-coach:v161",
     },
     null,
     2
@@ -730,7 +747,7 @@ const tipOpening = pickMetricTip({
       notes: [
         {
           id: "center-didactic-1",
-          text: "Centralize knights and bishops so they control more of the board and support breaks in the centre.",
+          text: "Centralize pieces to support breaks in the centre.",
           phase: "any",
           specificity: 3,
         },
@@ -1163,6 +1180,15 @@ console.log("ok coach moments smoke (mg peer + attack snaps)");
     "e-file lever vs QS plan stays wrong even if centre-strike flag is on"
   );
 
+  assert(
+    classifyPawnBreakClass({
+      toFile: 0,
+      activeWingUser: "center",
+      isLever: true,
+    }) === "thematic_wing_break",
+    "a-file lever vs centre plan = thematic_wing_break"
+  );
+
   const stranded = new Chess(
     "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQ1RK1 w kq - 5 5"
   );
@@ -1579,4 +1605,484 @@ console.log("ok coach moments smoke (strategic vectors MG+EG)");
   );
 }
 
+{
+  const fen =
+    "rnb1kb1r/pp2pppp/2qp1n2/8/4P3/2N2N2/PPPP1PPP/R1BQKB1R b KQkq - 2 6";
+  const board = new Chess(fen);
+  const move = board.move("Qc5");
+  board.undo();
+  const hit = isOpeningTempoWasteMove(board, move, "b");
+  assert(hit.waste === true, "queen leaving c6 is an opening tempo waste");
+  assert(hit.piece === "q", `tempo piece want q got ${hit.piece}`);
+  const develop = board.move("Nbd7");
+  board.undo();
+  const developHit = isOpeningTempoWasteMove(board, develop, "b");
+  assert(
+    developHit.waste === false,
+    "Nbd7 from home is not a tempo waste"
+  );
+}
+
+{
+  const vsPlayed = [
+    { field: "piece_support", before: 40, after: 70, delta: 30 },
+    { field: "mobility", before: 32, after: 38, delta: 6 },
+    { field: "king_attackers_pct", before: 8, after: 8, delta: 0 },
+    { field: "tempo_waste_rate_pct", before: 100, after: 0, delta: -100 },
+  ];
+  const explained = explainEngineLineVsPlayed({
+    bestSan: "Nbd7",
+    phase: "opening",
+    engineVsPlayedMetricDelta: vsPlayed,
+  });
+  assert(
+    explained.primaryField === "tempo_waste_rate_pct",
+    `primaryField want tempo_waste_rate_pct got ${explained.primaryField}`
+  );
+  assert(
+    /tempi|develop/i.test(explained.reasons.join(" ")),
+    `why_better must cite development/tempi, got ${explained.reasons.join("; ")}`
+  );
+  assert(
+    !/better defended/i.test(explained.reasons.join(" ")),
+    "piece_support must not steal the why_better lead"
+  );
+  assert(
+    explained.primarySoftKeys.includes("piece.centralization"),
+    `primary soft keys must include centralization, got ${explained.primarySoftKeys.join(",")}`
+  );
+  assert(
+    !explained.primarySoftKeys.includes("attack.king_safety"),
+    "king_safety must not be primary when tempo wins"
+  );
+
+  const coord = buildTipCoordinate({
+    phase: "opening",
+    mark: "mistake",
+    deltas: vsPlayed,
+    situations: [
+      {
+        id: "dragon_formation",
+        confidence: 1,
+        softKeys: ["structure.dragon_formation"],
+        metricHints: [],
+        lockBoost: 11,
+        role: "cramped",
+      },
+    ],
+    inputs: { played_tempo_waste: true, played_tempo_piece: "q" },
+  });
+  assert(
+    coord.primaryField === "tempo_waste_rate_pct",
+    `coordinate primary want tempo got ${coord.primaryField}`
+  );
+  const loc = localizeTipCoordinate(coord);
+  assert(
+    /queen|cramped|Dragon/i.test(loc.clause || ""),
+    `locale must mention queen re-move / Dragon, got ${loc.clause}`
+  );
+  assert(
+    !/better defended/i.test(loc.clause || ""),
+    "locale must not say pieces better defended"
+  );
+
+  const four = buildTipCoordinate({
+    phase: "opening",
+    mark: "mistake",
+    deltas: [
+      ...vsPlayed,
+      { field: "opp_king_in_centre", before: 1, after: 1, delta: 0 },
+    ],
+    situations: [
+      {
+        id: "dragon_formation",
+        confidence: 1,
+        softKeys: ["structure.dragon_formation"],
+        metricHints: [],
+        lockBoost: 11,
+        role: "cramped",
+      },
+    ],
+    inputs: {
+      played_tempo_waste: true,
+      played_tempo_piece: "q",
+      undeveloped_minors: 1,
+      minors_developed: 2,
+      opp_king_in_centre: 1,
+    },
+    bestSan: "Nbd7",
+    playedSan: "Qc5",
+    engineLineSans: ["Nbd7", "Nf3"],
+  });
+  const fourFactors = detectLocationFactors(four.location);
+  assert(
+    fourFactors.includes("dragon_cramped") &&
+      fourFactors.includes("queen_re_move") &&
+      fourFactors.includes("undeveloped_minors") &&
+      fourFactors.includes("opp_king_centre"),
+    `4-factor location want dragon_cramped+queen_re_move+undeveloped_minors+opp_king_centre got ${fourFactors.join(",")}`
+  );
+  assert(
+    /queenside/i.test(four.pillars.plan || "") &&
+      /Nbd7/i.test(four.pillars.principleLine || "") &&
+      /Qc5|queen/i.test(four.pillars.principleLine || "") &&
+      /minors/i.test(four.pillars.feature || "") &&
+      /king/i.test(four.pillars.feature || "") &&
+      /activit/i.test(four.pillars.value || ""),
+    `4 pillars want plan/principle/feature/value, got ${JSON.stringify(four.pillars)}`
+  );
+  const fourLoc = localizeTipCoordinate(four);
+  assert(
+    /cramped Dragon/i.test(fourLoc.clause || "") &&
+      /queen|Qc5/i.test(fourLoc.clause || "") &&
+      /minors/i.test(fourLoc.clause || "") &&
+      /king.*centre|centre.*king/i.test(fourLoc.clause || "") &&
+      /Nbd7/i.test(fourLoc.clause || ""),
+    `4-pillar comment must weave plan + engine line + features, got ${fourLoc.clause}`
+  );
+  assert(
+    fourLoc.includesContext === true,
+    "composed locale already carries situation context"
+  );
+  assert(
+    !/better defended/i.test(fourLoc.clause || ""),
+    "pillar weave must not say pieces better defended"
+  );
+
+  const noteScore = scoreNoteConditions(
+    {
+      id: "piece.coordination#0",
+      text: "cover one another",
+      book: "",
+      themes: ["piece.coordination"],
+      ecoHints: [],
+      conditions: [
+        { softKey: "piece.coordination" },
+        { metric: "mobility" },
+        { metric: "open_file_utilization" },
+      ],
+    },
+    {
+      softKeys: ["piece.coordination"],
+      metrics: ["tempo_waste_rate_pct", "piece_support"],
+      situations: ["dragon_formation"],
+      judgment: "bad",
+    }
+  );
+  assert(
+    noteScore === 0,
+    `open-file coordination note must not match tempo-only metrics, got ${noteScore}`
+  );
+
+  assert(
+    four.scan &&
+      four.scan.plan.some((t) => /dragon/i.test(t)) &&
+      four.scan.feature.some((t) => /undeveloped|king/i.test(t)) &&
+      four.scan.principleLine.length > 0,
+    `deep pillar scan must fill plan/principle/feature, got ${JSON.stringify({
+      plan: four.scan?.plan,
+      principle: four.scan?.principleLine,
+      feature: four.scan?.feature,
+    })}`
+  );
+
+  const twoSit = buildTipCoordinate({
+    phase: "opening",
+    mark: "mistake",
+    situations: [
+      {
+        id: "dragon_formation",
+        role: "cramped",
+        confidence: 0.9,
+        lockBoost: 12,
+        softKeys: [],
+        metricHints: [],
+      },
+      {
+        id: "closed_center",
+        confidence: 0.7,
+        lockBoost: 8,
+        softKeys: [],
+        metricHints: [],
+      },
+    ],
+    inputs: { opp_king_uncastled: 1, undeveloped_minors: 1 },
+    bestSan: "Nbd7",
+    playedSan: "Qc5",
+  });
+  assert(
+    twoSit.factors.includes("dragon_cramped") &&
+      twoSit.factors.includes("closed_center"),
+    `wide sit scan must keep dragon_cramped + closed_center, got ${twoSit.factors.join(",")}`
+  );
+  const uncastledNote = scoreNoteConditions(
+    {
+      id: "attack.king_safety#0",
+      text: "castle before opening the centre",
+      book: "",
+      themes: ["king safety"],
+      ecoHints: [],
+      conditions: [
+        { feature: "uncastled-king", polarity: "any" },
+        { softKey: "attack.king_safety" },
+      ],
+    },
+    scanPillarConditions(twoSit).ctx
+  );
+  assert(
+    uncastledNote >= 3,
+    `uncastled-king alias must score on opp_king_uncastled scan, got ${uncastledNote}`
+  );
+
+  const refs = buildCommentRefs({
+    tipText: "develop the queenside knight instead of moving the queen again",
+    keyIds: ["piece.centralization"],
+    weightTop: [
+      { keyId: "piece.centralization", weight: 80, formatted: "w=80" },
+      { keyId: "methodology.candidate_moves", weight: 60, formatted: "w=60" },
+    ],
+    primaryField: "tempo_waste_rate_pct",
+    primarySoftKeys: ["piece.centralization"],
+  });
+  assert(
+    !refs.topChoices.some((c) => c.keyId === "attack.king_safety" && c.weight === 0),
+    "comment refs must not invent king_safety at weight 0"
+  );
+
+  const selfTrap = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 220,
+    kind: "bad_move",
+    moment: { playedSan: "e4", bestSan: "Rg6" },
+    fact: {
+      kind: "trapped_piece",
+      selfInflicted: true,
+      pieceLabel: "rook",
+      trapSquare: "g4",
+      captureSan: "Kh3",
+      takenNext: true,
+      mateIn: null,
+    },
+    engineLineSans: ["Rg6", "Nf3"],
+  });
+  assert(
+    /no escape|g4/i.test(selfTrap.text),
+    `self-trap must diagnose the boxed rook, got ${selfTrap.text}`
+  );
+  assert(
+    /Rg6/i.test(selfTrap.text) && /save|rook|escape/i.test(selfTrap.text),
+    `self-trap correct idea must be engine move + idea, got ${selfTrap.text}`
+  );
+  assert(
+    !/\bNf3\b/.test(selfTrap.text),
+    `self-trap must not dump PV tail, got ${selfTrap.text}`
+  );
+  assert(
+    !/correct (idea|move) is kh3/i.test(selfTrap.text),
+    `self-trap must not frame opp hunt as the correct idea, got ${selfTrap.text}`
+  );
+
+  const selfTrapPrior = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 220,
+    kind: "bad_move",
+    moment: { playedSan: "e4", bestSan: "Rg6" },
+    fact: {
+      kind: "trapped_piece",
+      selfInflicted: true,
+      pieceLabel: "rook",
+      trapSquare: "g4",
+      captureSan: "Kh3",
+      takenNext: true,
+      mateIn: null,
+    },
+    engineLineSans: ["Rg6", "Nf3"],
+    priorTopics: { topics: ["continuation", "idea"], clauses: ["theideaisb5h6"] },
+  });
+  assert(
+    /Rg6/i.test(selfTrapPrior.text),
+    `self-trap correct idea must survive prior continuation topic, got ${selfTrapPrior.text}`
+  );
+
+  const missedTip = composeMomentJudgmentTip({
+    mark: "missed",
+    deltaCp: 160,
+    kind: "bad_move",
+    moment: { playedSan: "a6", bestSan: "Bxh7" },
+    engineLineSans: ["Bxh7", "Nxh7"],
+  });
+  assert(
+    /Bxh7/i.test(missedTip.text) && /a6/i.test(missedTip.text),
+    `missed must name engine line vs played, got ${missedTip.text}`
+  );
+  assert(
+    !/\bNxh7\b/.test(missedTip.text),
+    `missed must not dump PV tail, got ${missedTip.text}`
+  );
+  assert(
+    !/Missed the correct predicament answer/i.test(missedTip.text),
+    `missed must not stop at predicament slogan, got ${missedTip.text}`
+  );
+
+  const thinMistake = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 150,
+    kind: "bad_move",
+    moment: { playedSan: "Ne8", bestSan: "Nh5" },
+    engineLineSans: ["Nh5", "Nf3"],
+  });
+  assert(
+    /Nh5/i.test(thinMistake.text) && /Ne8/i.test(thinMistake.text),
+    `mistake must name engine line vs played, got ${thinMistake.text}`
+  );
+  assert(
+    !/\bNf3\b/.test(thinMistake.text),
+    `mistake must not dump PV tail, got ${thinMistake.text}`
+  );
+  for (const tip of [selfTrap, missedTip, thinMistake, fourLoc]) {
+    const text = tip.text || tip.clause || "";
+    assert(!/predicament/i.test(text), `no predicament, got ${text}`);
+    assert(!/;/.test(text), `no semicolon glue, got ${text}`);
+    assert(!/\s[—–]\s/.test(text), `no emdash glue, got ${text}`);
+  }
+}
+
+assert(
+  resolveOpeningPackKey("A57", "Benko Gambit") === "opening.benko",
+  "Benko ECO maps to opening.benko"
+);
+assert(
+  resolveOpeningPackKey("A60", "Benoni Defence") === "opening.benoni",
+  "Benoni ECO maps to opening.benoni"
+);
+
+{
+  const benko = composeOpeningJudgmentTipDetailed({
+    inputs: {
+      queenside_advance: 7,
+      queenside_advance_opponent: 2,
+      space_advantage_pct: 58,
+      uncastled_rate_pct: 0,
+      castle_fullmove: 8,
+      eval_band: "equal",
+    },
+    openingName: "Benko Gambit",
+    openingKeyId: "opening.benko",
+  });
+  assert(
+    /benko|queenside|hanging/i.test(benko.text),
+    `opening identity must lead Benko tip, got ${benko.text}`
+  );
+  assert(
+    !/useful space for your pieces/i.test(benko.text),
+    `Benko tip must not use space filler, got ${benko.text}`
+  );
+  const prior = mergeOpeningTipPrior(null, benko);
+  const second = composeOpeningJudgmentTipDetailed({
+    inputs: {
+      queenside_advance: 7,
+      queenside_advance_opponent: 2,
+      space_advantage_pct: 58,
+      uncastled_rate_pct: 0,
+      castle_fullmove: 8,
+      eval_band: "equal",
+    },
+    openingName: "Benko Gambit",
+    openingKeyId: "opening.benko",
+    priorTopics: prior,
+  });
+  assert(second.text && second.text !== benko.text, "second opening tip must shift");
+  assert(
+    !/useful space for your pieces/i.test(second.text),
+    `second opening tip must not repeat space filler, got ${second.text}`
+  );
+}
+
+{
+  const mixed = composeMiddlegameStrategicTip({
+    inputs: {
+      pawn_break_class: "thematic_wing_break",
+      played_impact:
+        "The wing lever fits this structure. A central idea was also available.",
+      mg_structure_type: "benoni_asymmetric",
+      engine_recommend: true,
+    },
+    mark: "excellent",
+  });
+  assert(
+    !/better move was available/i.test(mixed.text),
+    `excellent thematic break must not critique, got ${mixed.text}`
+  );
+  assert(
+    /fits the structure|wing lever|central idea/i.test(mixed.text),
+    `mixed break needs middle term, got ${mixed.text}`
+  );
+  assert(
+    strategicToneFromInputs(
+      { pawn_break_class: "thematic_wing_break" },
+      "excellent"
+    ) === "neutral",
+    "thematic + excellent = mixed/neutral"
+  );
+}
+
+assert(
+  !checkpointMistakeTakesOver({
+    mark: "missed",
+    playedSan: "Nd7",
+    kind: "fixed_checkpoint",
+    structuralKind: "endgame_advantage",
+  }),
+  "endgame_advantage checkpoint stays an aggregate"
+);
+
+{
+  const mgWin = composeMiddlegameJudgmentTipDetailed({
+    inputs: {
+      eval_band: "winning",
+      user_wp: 0.9,
+      engine_line_plan:
+        "Execute the queenside pawn break to open files before the kingside attack arrives.",
+      middlegame_accuracy_pct: 90,
+    },
+  });
+  assert(
+    /simplif|conversion|trade/i.test(mgWin.text),
+    `winning MG plan must convert, got ${mgWin.text}`
+  );
+  assert(
+    !/queenside pawn break/i.test(mgWin.text),
+    `winning MG must not keep engine-line QS break, got ${mgWin.text}`
+  );
+}
+
+{
+  const swing = formatEvalSwingSummary({
+    events: [],
+    peakWp: 0.9,
+    troughWp: 0.4,
+    finalWp: 1,
+    finalBand: "winning",
+    largestCrash: {
+      ply: 40,
+      moveNumber: 20,
+      kind: "crash",
+      wpBefore: 0.8,
+      wpAfter: 0.4,
+      dropPp: 40,
+    },
+    largestSurge: null,
+    swingCount: 1,
+  });
+  assert(!/%/.test(swing), `summary swing must not dump WP%, got ${swing}`);
+  assert(!/WP pts/i.test(swing), `summary swing must not dump WP pts, got ${swing}`);
+  assert(
+    evalBandFromInputs({ eval_band: "equal", material_balance: 5 }) ===
+      "better",
+    "material-up equal snapshot lifts to better"
+  );
+}
+
 console.log("ok coach moments smoke (eg enrich phase gate)");
+console.log("ok coach tip coordinate localization");
+console.log("ok coach game-spec identity");

@@ -6,6 +6,10 @@
 import type { MetricFieldDelta } from "./coachNoteRequest";
 import { keysForMetricFields } from "./metricNoteKeys";
 import {
+  rankMetricAxes,
+  significantRankedAxes,
+} from "./metricAxisRank";
+import {
   metricKeyLabel,
   openingPrincipleDirectives,
   themeTagToMetricKey,
@@ -72,6 +76,9 @@ const HIGHER_BETTER = new Set([
   "bishop_openness_light",
   "bishop_openness_dark",
   "pawn_storm_tempo",
+  "center_fluidity_index",
+  "pawn_storm_tempo_delta",
+  "king_center_file_exposure",
   "knight_vs_bishop",
   "good_vs_bad_bishop",
   "wp",
@@ -94,6 +101,9 @@ const HIGHER_BETTER = new Set([
 const LOWER_BETTER = new Set([
   "hanging_material_own",
   "king_attackers_pct",
+  "tempo_waste_rate_pct",
+  "uncastled_rate_pct",
+  "castle_fullmove",
   "queenside_advance_opponent",
   "kingside_advance_opponent",
   "center_advance_opponent",
@@ -110,6 +120,16 @@ const FIELD_REASON: Record<
   mobility: {
     betterHigh: "pieces had more activity (mobility)",
     betterLow: "activity was lower",
+    softHint: "piece_activity",
+  },
+  tempo_waste_rate_pct: {
+    betterHigh: "more tempi spent re-moving developed pieces",
+    betterLow: "development without wasting tempi",
+    softHint: "piece_activity",
+  },
+  minors_developed: {
+    betterHigh: "more minors developed",
+    betterLow: "fewer minors developed",
     softHint: "piece_activity",
   },
   king_attackers_pct: {
@@ -237,6 +257,21 @@ const FIELD_REASON: Record<
     betterLow: "slower pawn-storm race on the attack wing",
     softHint: "attack",
   },
+  center_fluidity_index: {
+    betterHigh: "a more fluid centre for a central break",
+    betterLow: "a more locked centre",
+    softHint: "pawn_break",
+  },
+  pawn_storm_tempo_delta: {
+    betterHigh: "queenside counterplay ahead of their kingside storm",
+    betterLow: "trailing the kingside pawn storm",
+    softHint: "attack",
+  },
+  king_center_file_exposure: {
+    betterHigh: "open d/e files against their central king",
+    betterLow: "closed d/e files toward their king",
+    softHint: "king_safety",
+  },
   knight_vs_bishop: {
     betterHigh: "stronger knight-vs-bishop imbalance for you",
     betterLow: "weaker knight-vs-bishop imbalance for you",
@@ -303,7 +338,7 @@ const FIELD_REASON: Record<
     softHint: "outpost",
   },
   piece_support: {
-    betterHigh: "pieces better defended",
+    betterHigh: "pieces covering one another",
     betterLow: "pieces less supported",
     softHint: "piece_activity",
   },
@@ -393,26 +428,20 @@ export function buildMetricSignals(
 
 function pickReasonRows(
   deltas: MetricFieldDelta[],
-  limit = 4
+  limit = 4,
+  phase?: string | null
 ): Array<{ field: string; abs: number; reason: string }> {
-  const scored = deltas
-    .filter((d) => d.delta != null && Math.abs(d.delta) > 1e-9)
-    .map((d) => ({
-      field: d.field,
-      abs: Math.abs(d.delta || 0),
-      reason: reasonForDelta(d),
-    }))
-    .filter((x): x is { field: string; abs: number; reason: string } =>
-      Boolean(x.reason)
-    )
-    .sort((a, b) => b.abs - a.abs);
+  const ranked = significantRankedAxes(rankMetricAxes({ deltas, phase }), limit);
+  const byField = new Map(deltas.map((d) => [d.field, d]));
   const out: Array<{ field: string; abs: number; reason: string }> = [];
   const seen = new Set<string>();
-  for (const row of scored) {
-    if (seen.has(row.reason)) continue;
-    seen.add(row.reason);
-    out.push(row);
-    if (out.length >= limit) break;
+  for (const row of ranked) {
+    const d = byField.get(row.field);
+    if (!d) continue;
+    const reason = reasonForDelta(d);
+    if (!reason || seen.has(reason)) continue;
+    seen.add(reason);
+    out.push({ field: row.field, abs: row.abs, reason });
   }
   return out;
 }
@@ -463,7 +492,7 @@ export function explainEngineLineVsPlayed(
   const vs = args.engineVsPlayedMetricDelta || [];
   const engine = args.engineLineMetricDelta || [];
   const deltas = vs.length ? vs : engine;
-  const reasonRows = pickReasonRows(deltas, 4);
+  const reasonRows = pickReasonRows(deltas, 4, args.phase);
   const reasons = reasonRows.map((r) => r.reason);
   const primaryField = reasonRows[0]?.field ?? null;
   const primarySoftHint = primaryField

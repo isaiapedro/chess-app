@@ -12,6 +12,10 @@ import {
   userWinProbability,
   type EvalDropKind,
 } from "../winProb";
+import {
+  checkpointEvalInputs,
+  whiteCpAtPly1,
+} from "./evalSwingIndex";
 import { formatOpeningLabel } from "./ecoLabels";
 import { toPhaseMetricKeys } from "./metricThemes";
 import { mergeOpeningCoachInputs } from "./openingCoachInputs";
@@ -585,6 +589,16 @@ function snapToUserPly1(ply1: number, userIsWhite: boolean): number {
   return ply1 + 1;
 }
 
+
+function evalStampAtPly1(
+  evals: number[],
+  ply1: number,
+  userIsWhite: boolean
+): Record<string, string | number | boolean | null> {
+  const cp = whiteCpAtPly1(evals, ply1);
+  return checkpointEvalInputs({ evalCpWhite: cp, userIsWhite });
+}
+
 function putStructuralMoment(
   byPly: Record<number, CoachMetricMoment>,
   moment: CoachMetricMoment,
@@ -639,70 +653,82 @@ export function injectStructuralCoachMoments(args: {
         ? evals.length - 1
         : 9999;
 
-  putStructuralMoment(
-    args.momentsByPly,
-    {
-      ply: ply1ForUserFullmove(5, args.userIsWhite),
-      moveNumber: 5,
-      severity: null,
-      dropCp: 0,
-      playedSan: "",
-      bestSan: null,
-      fen: "",
-      source: "structural",
-      structuralKind: "opening_name",
-      inputs: mergeOpeningCoachInputs(
-        {
-          opening_name:
-            formatOpeningLabel(
-              opening?.opening_eco,
-              opening?.opening_name
-            ) ||
-            opening?.opening_name ||
-            null,
+  {
+    const ply1 = ply1ForUserFullmove(5, args.userIsWhite);
+    putStructuralMoment(
+      args.momentsByPly,
+      {
+        ply: ply1,
+        moveNumber: 5,
+        severity: null,
+        dropCp: 0,
+        playedSan: "",
+        bestSan: null,
+        fen: "",
+        source: "structural",
+        structuralKind: "opening_name",
+        inputs: {
+          ...mergeOpeningCoachInputs(
+            {
+              opening_name:
+                formatOpeningLabel(
+                  opening?.opening_eco,
+                  opening?.opening_name
+                ) ||
+                opening?.opening_name ||
+                null,
+            },
+            opening || null,
+            {
+              userColor: args.userIsWhite ? "white" : "black",
+              badAccuracyMoves: (args.record?.openingCandidates || []).length,
+            }
+          ),
+          ...evalStampAtPly1(evals, ply1, args.userIsWhite),
         },
-        opening || null,
-        {
-          userColor: args.userIsWhite ? "white" : "black",
-          badAccuracyMoves: (args.record?.openingCandidates || []).length,
-        }
-      ),
-    },
-    9999
-  );
+      },
+      9999
+    );
+  }
 
   const openBad = (args.record?.openingCandidates || []).length;
-  putStructuralMoment(
-    args.momentsByPly,
-    {
-      ply: ply1ForUserFullmove(10, args.userIsWhite),
-      moveNumber: 10,
-      severity: null,
-      dropCp: 0,
-      playedSan: "",
-      bestSan: null,
-      fen: "",
-      source: "structural",
-      structuralKind: "opening_aggregate",
-      inputs: mergeOpeningCoachInputs(
-        {
-          opening_name:
-            formatOpeningLabel(
-              opening?.opening_eco,
-              opening?.opening_name
-            ) ||
-            opening?.opening_name ||
-            null,
+  {
+    const ply1 = ply1ForUserFullmove(10, args.userIsWhite);
+    putStructuralMoment(
+      args.momentsByPly,
+      {
+        ply: ply1,
+        moveNumber: 10,
+        severity: null,
+        dropCp: 0,
+        playedSan: "",
+        bestSan: null,
+        fen: "",
+        source: "structural",
+        structuralKind: "opening_aggregate",
+        inputs: {
+          ...mergeOpeningCoachInputs(
+            {
+              opening_name:
+                formatOpeningLabel(
+                  opening?.opening_eco,
+                  opening?.opening_name
+                ) ||
+                opening?.opening_name ||
+                null,
+            },
+            opening || null,
+            {
+              userColor: args.userIsWhite ? "white" : "black",
+              badAccuracyMoves: openBad,
+            }
+          ),
+          ...evalStampAtPly1(evals, ply1, args.userIsWhite),
         },
-        opening || null,
-        {
-          userColor: args.userIsWhite ? "white" : "black",
-          badAccuracyMoves: openBad,
-        }
-      ),
-    },
-    9999
-  );
+      },
+      9999
+    );
+  }
 
   const egStart0 = args.heuristics?.endgame?.endgame_start_ply;
   if (egStart0 != null) {
@@ -731,6 +757,13 @@ export function injectStructuralCoachMoments(args: {
           brilliant_moves: style?.brilliant_moves ?? null,
           excellent_moves: style?.excellent_moves ?? null,
           important_moves: style?.important_moves ?? null,
+          had_endgame_advantage: style?.had_endgame_advantage ?? null,
+          converted_endgame: style?.converted_endgame ?? null,
+          ...evalStampAtPly1(
+            evals,
+            snapToUserPly1(egStart0 + 1, args.userIsWhite),
+            args.userIsWhite
+          ),
         },
       },
       maxPly1
@@ -762,6 +795,11 @@ export function injectStructuralCoachMoments(args: {
           best_line_wp: wp,
           had_endgame_advantage: style?.had_endgame_advantage ?? false,
           converted_endgame: style?.converted_endgame ?? false,
+          ...checkpointEvalInputs({
+            evalCpWhite: cpAfter,
+            userWp: wp,
+            userIsWhite: args.userIsWhite,
+          }),
         },
       },
       maxPly1

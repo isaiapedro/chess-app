@@ -10,7 +10,6 @@ import { takeInflight } from "../storage/cache";
 
 const STORE_PREFIX = "@chess-wrapped:user-games:v1:";
 const META_SUFFIX = ":meta";
-const GAMES_FETCH_TTL_MS = 24 * 60 * 60 * 1000;
 const PLATFORM_LIST_TIMEOUT_MS = 20_000;
 const PLATFORM_GAMES_TIMEOUT_MS = 180_000;
 
@@ -205,24 +204,15 @@ async function readLastFetchedAt(
   return 0;
 }
 
-async function storeIsFresh(
-  platform: Platform,
-  username: string,
-  store: UserGamesStore
-): Promise<boolean> {
-  if (GAMES_FETCH_TTL_MS <= 0) return false;
-  const last = await readLastFetchedAt(platform, username, store);
-  if (last <= 0) return false;
-  return Date.now() / 1000 - last < GAMES_FETCH_TTL_MS / 1000;
-}
-
 function recentPullSinceMs(
   store: UserGamesStore,
-  lastFetchedAtSec: number
+  _lastFetchedAtSec: number
 ): number {
-  if (lastFetchedAtSec > 0) return Math.floor(lastFetchedAtSec * 1000);
   const watermark = Number(store.watermark || 0);
-  if (watermark > 0) return watermark;
+  if (watermark > 0) {
+    return Math.max(0, watermark - 2 * 60 * 60 * 1000);
+  }
+  if (_lastFetchedAtSec > 0) return Math.floor(_lastFetchedAtSec * 1000);
   return 0;
 }
 
@@ -313,6 +303,8 @@ async function fetchLichessApi(
   const params = new URLSearchParams({
     opening: "true",
     evals: "false",
+    moves: "true",
+    pgnInJson: "true",
     perfType: "bullet,blitz,rapid,classical",
   });
   if (sinceMs > 0) params.set("since", String(sinceMs));
@@ -356,20 +348,10 @@ function filterLichessSince(
 async function fetchLichessGamesRaw(
   username: string,
   sinceMs = 0,
-  force = false
+  _force = false
 ): Promise<Array<Record<string, unknown>>> {
   const platform: Platform = "lichess";
   let store = await loadStore(platform, username);
-
-  if (store && !force) {
-    const covers = coverageCovers(
-      await coverageSinceOf(platform, username, store),
-      sinceMs
-    );
-    if (covers && (await storeIsFresh(platform, username, store))) {
-      return filterLichessSince(store.games || [], sinceMs);
-    }
-  }
 
   if (!store) {
     const fetchSince = Math.max(0, Math.floor(sinceMs));
@@ -540,7 +522,7 @@ async function fetchChesscomArchives(
 async function chesscomRefreshHead(
   username: string,
   games: Array<Record<string, unknown>>
-): Promise<Array<Record<string, unknown>>> {
+): Promise<Array<Record<string, unknown>> | null> {
   const now = new Date();
   const currentKey = `${now.getFullYear()}-${now.getMonth() + 1}`;
   const prevMonth = now.getMonth() === 0 ? 12 : now.getMonth();
@@ -550,11 +532,10 @@ async function chesscomRefreshHead(
   const prevUrl = chesscomArchiveUrl(username, prevYear, prevMonth);
   const headGames = await fetchChesscomArchive(currentUrl);
   const prevGames = await fetchChesscomArchive(prevUrl);
-  if (headGames == null && prevGames == null) {
-    return games;
+  if (headGames == null) {
+    return null;
   }
-  const replaceMonths = new Set<string>();
-  if (headGames != null) replaceMonths.add(currentKey);
+  const replaceMonths = new Set<string>([currentKey]);
   if (prevGames != null) replaceMonths.add(prevKey);
   const retained = games.filter((game) => {
     const end = chesscomGameEnd(game);
@@ -562,10 +543,7 @@ async function chesscomRefreshHead(
     const dt = new Date(end * 1000);
     return !replaceMonths.has(`${dt.getFullYear()}-${dt.getMonth() + 1}`);
   });
-  const incoming = [
-    ...(prevGames || []),
-    ...(headGames || []),
-  ];
+  const incoming = [...(prevGames || []), ...headGames];
   return mergeGamesById(retained, incoming, chesscomGameId);
 }
 
@@ -591,20 +569,10 @@ async function mergedCoverageSince(
 async function fetchChesscomGamesRaw(
   username: string,
   sinceTimestamp = 0,
-  force = false
+  _force = false
 ): Promise<Array<Record<string, unknown>>> {
   const platform: Platform = "chesscom";
   let store = await loadStore(platform, username);
-
-  if (store && !force) {
-    const covers = coverageCovers(
-      await coverageSinceOf(platform, username, store),
-      sinceTimestamp
-    );
-    if (covers && (await storeIsFresh(platform, username, store))) {
-      return filterChesscomSince(store.games || [], sinceTimestamp);
-    }
-  }
 
   if (!store) {
     const listed = await chesscomListArchives(username);
@@ -682,6 +650,9 @@ async function fetchChesscomGamesRaw(
   }
 
   const refreshed = await chesscomRefreshHead(username, store.games || []);
+  if (refreshed == null) {
+    return filterChesscomSince(store.games || [], sinceTimestamp);
+  }
   const existing = (await loadStore(platform, username)) || store;
   const priorGames = existing.games || [];
   const games = mergeGamesById(priorGames, refreshed, chesscomGameId);
@@ -743,7 +714,9 @@ function parseLichessGames(
     if (winner === userColor) result = "Win";
     else if (winner === oppColor) result = "Loss";
     const opening = (g.opening || {}) as { name?: string; eco?: string };
-    const movesStr = String(g.moves || "");
+    const pgnRaw = String(g.pgn || g.pgn_str || "").trim();
+    let movesStr = String(g.moves || g.moves_str || "").trim();
+    if (!movesStr && pgnRaw) movesStr = movesFromPgn(pgnRaw);
     const moveCount = movesStr
       ? Math.max(1, Math.floor(movesStr.split(/\s+/).filter(Boolean).length / 2))
       : 30;
@@ -778,7 +751,7 @@ function parseLichessGames(
       opening_eco: opening.eco || "UNK",
       move_count: moveCount,
       moves_str: movesStr,
-      pgn_str: "",
+      pgn_str: pgnRaw,
       time_control: timeControl,
       termination: userTerm.replace(/^\w/, (c) => c.toUpperCase()),
       opp_termination: oppTerm.replace(/^\w/, (c) => c.toUpperCase()),
@@ -1033,18 +1006,125 @@ export async function loadLocalGamesPage(
   });
 }
 
+export function gameHasMoveSource(game: {
+  pgn_str?: string | null;
+  moves_str?: string | null;
+}): boolean {
+  return Boolean((game.moves_str || game.pgn_str || "").trim());
+}
+
+export function studyGamesHaveMoveSources(games: StudyGame[]): boolean {
+  if (!games.length) return false;
+  let withMoves = 0;
+  for (const g of games) {
+    if (gameHasMoveSource(g)) withMoves += 1;
+  }
+  return withMoves / games.length >= 0.5;
+}
+
 export async function findLocalGameById(
   filters: QueryFilters,
   gameId: string
 ): Promise<NormalizedGame | null> {
-  const page = await loadLocalGamesPage(filters, {
-    network: false,
-    limit: GAMES_PAGE_SIZE,
-    offset: 0,
+  const id = String(gameId || "").trim();
+  if (!id || !filters.username.trim()) return null;
+  const store = await loadStore(filters.platform, filters.username);
+  const rawGames = store?.games;
+  if (!rawGames?.length) return null;
+
+  const idFn =
+    filters.platform === "lichess" ? lichessGameId : chesscomGameId;
+  let raw: Record<string, unknown> | null = null;
+  for (const g of rawGames) {
+    const gid = idFn(g);
+    if (!gid) continue;
+    if (gid === id || String(gid).endsWith(id) || id.endsWith(String(gid))) {
+      raw = g;
+      break;
+    }
+    if (filters.platform === "chesscom") {
+      const short = String(gid).split("/").pop() || "";
+      if (short === id) {
+        raw = g;
+        break;
+      }
+    }
+  }
+  if (!raw) return null;
+
+  const parsed =
+    filters.platform === "lichess"
+      ? parseLichessGames([raw], filters.username)[0]
+      : parseChesscomGames([raw], filters.username)[0];
+  return parsed || null;
+}
+
+async function fetchLichessGameRaw(
+  gameId: string
+): Promise<Record<string, unknown> | null> {
+  const id = String(gameId || "").trim();
+  if (!id) return null;
+  try {
+    const res = await fetchWithTimeout(
+      `https://lichess.org/game/export/${encodeURIComponent(id)}?pgnInJson=true&clocks=false&evals=false&opening=true`,
+      { headers: { Accept: "application/json" } },
+      PLATFORM_LIST_TIMEOUT_MS
+    );
+    if (!res.ok) return null;
+    return (await res.json()) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+async function patchRawStoreGame(
+  platform: Platform,
+  username: string,
+  rawGame: Record<string, unknown>
+): Promise<void> {
+  const store = await loadStore(platform, username);
+  const existing = store?.games || [];
+  const idFn = platform === "lichess" ? lichessGameId : chesscomGameId;
+  const games = mergeGamesById(existing, [rawGame], idFn);
+  const watermark =
+    platform === "lichess"
+      ? Math.max(0, ...games.map(lichessGameEndMs))
+      : Math.max(0, ...games.map(chesscomGameEnd));
+  await saveStore(platform, username, {
+    games,
+    watermark,
+    coverage_since: store?.coverage_since || 0,
+    last_fetched_at: store?.last_fetched_at || Date.now() / 1000,
   });
-  return (
-    page.allFiltered.find((g) => g.id === gameId) ||
-    page.allFiltered.find((g) => String(g.id).endsWith(gameId)) ||
-    null
-  );
+}
+
+/** Resolve PGN/moves for analysis — in-memory / store first, then single-game export. */
+export async function resolveGameWithMoves(
+  filters: QueryFilters,
+  game: StudyGame | NormalizedGame
+): Promise<NormalizedGame> {
+  if (gameHasMoveSource(game)) {
+    return {
+      ...(game as NormalizedGame),
+      id: String(game.id),
+    };
+  }
+
+  const local = await findLocalGameById(filters, String(game.id));
+  const base: NormalizedGame = {
+    ...(game as NormalizedGame),
+    ...(local || {}),
+    id: String((local || game).id),
+  };
+  if (gameHasMoveSource(base)) return base;
+
+  if (filters.platform === "lichess" && filters.username.trim()) {
+    const raw = await fetchLichessGameRaw(String(game.id));
+    if (raw) {
+      await patchRawStoreGame("lichess", filters.username, raw);
+      const parsed = parseLichessGames([raw], filters.username)[0];
+      if (parsed && gameHasMoveSource(parsed)) return parsed;
+    }
+  }
+  return base;
 }

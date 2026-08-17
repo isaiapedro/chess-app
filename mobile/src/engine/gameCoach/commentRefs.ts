@@ -114,13 +114,19 @@ export function buildCommentRefs(args: {
 
   // Ensure selected keys appear even if outside weightTop cap.
   for (const id of selected) {
-    if (!topChoices.some((c) => c.keyId === id)) {
-      topChoices.unshift({
-        keyId: id,
-        weight: 0,
-        selected: true,
-      });
+    const existing = topChoices.find((c) => c.keyId === id);
+    if (existing) {
+      existing.selected = true;
+      continue;
     }
+    const fromBoard = (args.weightTop || []).find((w) => w.keyId === id);
+    if (!fromBoard || fromBoard.weight <= 0) continue;
+    topChoices.unshift({
+      keyId: id,
+      weight: fromBoard.weight,
+      selected: true,
+      parts: fromBoard.formatted,
+    });
   }
 
   const softKeys: string[] = [];
