@@ -218,6 +218,14 @@ const FEATURE_EXPAND: Record<string, string[]> = {
     "uncastled_king",
     "unmoved_king",
   ],
+  uncastled: [
+    "uncastled-king",
+    "unmoved-king",
+    "uncastled_king",
+    "unmoved_king",
+  ],
+  tactical_self_inflicted: ["self-trapped-piece", "self_trapped_piece"],
+  trapped_piece: ["zero-safe-squares", "zero_safe_squares", "self-trapped-piece"],
   opp_king_centre: [
     "central-king",
     "king-in-centre",

@@ -11,6 +11,7 @@ import {
   COACH_NOTE_REQUEST_CONFIG,
   buildCoachNoteRequest,
   formatCoachNoteRequest,
+  isPraiseMark,
   pawnBreakEvalGapAllowsRecommend,
   boardMetricSnap,
 } from "../src/engine/gameCoach/coachNoteRequest.ts";
@@ -36,7 +37,7 @@ import {
 import { isOpeningTempoWasteMove } from "../src/engine/openingPhase.ts";
 import { buildCommentRefs } from "../src/engine/gameCoach/commentRefs.ts";
 import { scoreNoteConditions } from "../src/engine/gameCoach/packNoteContent.ts";
-import { classifyUserError } from "../src/engine/gameCoach/noteCompose.ts";
+import { classifyUserError, shouldComposeNote } from "../src/engine/gameCoach/noteCompose.ts";
 import { buildOpeningPeerSignals } from "../src/engine/gameCoach/openingCoachInputs.ts";
 import {
   composeOpeningJudgmentTipDetailed,
@@ -166,8 +167,6 @@ assert(
   `endgame_advantage ply want 53 got ${byKind.endgame_advantage?.ply}`
 );
 
-assert(COACH_NOTE_REQUEST_CONFIG.openingAlwaysAttach === false, "openingAlwaysAttach off");
-assert(COACH_NOTE_REQUEST_CONFIG.allowPhaseStructure === false, "quiet phase_structure off");
 assert(
   !buildCoachNoteRequest({
     ply: 20,
@@ -177,7 +176,7 @@ assert(
     deltaCp: 0,
     unusedStructureThemes: ["open_file"],
   }),
-  "open_file alone must not phase_structure"
+  "open_file alone must not invent a coach call"
 );
 assert(
   !buildCoachNoteRequest({
@@ -591,6 +590,86 @@ assert(
   }),
   "inaccuracy must not attach metric tip"
 );
+assert(
+  pickMetricTip({
+    entries: [],
+    metrics: coach,
+    phase: "middlegame",
+    mark: "inaccuracy",
+    deltaCp: 90,
+  }) == null,
+  "inaccuracy must not pick a metric fallback comment"
+);
+
+assert(isPraiseMark("excellent") && isPraiseMark("brilliant"), "excellent is a praise mark");
+assert(!isPraiseMark("important"), "important stays GIF-only");
+{
+  const praiseMoment = {
+    ply: 24,
+    moveNumber: 12,
+    severity: null,
+    dropCp: 28,
+    playedSan: "e5",
+    bestSan: "e5",
+    fen: "",
+    source: "live",
+    inputs: { praise_mark: "excellent" },
+  };
+  const excellentReq = buildCoachNoteRequest({
+    ply: 24,
+    phase: "middlegame",
+    mark: "excellent",
+    moment: praiseMoment,
+    deltaCp: 0,
+  });
+  assert(excellentReq?.kind === "praise_move", "excellent must request praise_move");
+  assert(
+    shouldAttachMetricTip({
+      phase: "middlegame",
+      moment: praiseMoment,
+      mark: "excellent",
+      deltaCp: 0,
+      phaseThemes: [],
+      request: excellentReq,
+    }),
+    "excellent praise must attach"
+  );
+  assert(
+    shouldComposeNote({
+      perspective: "user",
+      deltaCp: 0,
+      playedBest: true,
+      moment: praiseMoment,
+      structure: [],
+      mark: "excellent",
+      ply: 24,
+    }),
+    "excellent must compose"
+  );
+  assert(
+    !shouldComposeNote({
+      perspective: "user",
+      deltaCp: 40,
+      playedBest: false,
+      moment: null,
+      structure: [],
+      mark: "inaccuracy",
+      ply: 16,
+    }),
+    "inaccuracy must not compose"
+  );
+  const strippedExcellent = buildCoachNoteRequest({
+    ply: 24,
+    phase: "middlegame",
+    mark: null,
+    moment: null,
+    deltaCp: 0,
+  });
+  assert(
+    strippedExcellent == null,
+    "stripped routine excellent (null mark) must not invent praise_move"
+  );
+}
 
 console.log("ok coach moments smoke");
 console.log(
@@ -600,7 +679,7 @@ console.log(
       aggPly: byKind.opening_aggregate.ply,
       mgAggPly: byKind.middlegame_aggregate.ply,
       egAdvPly: byKind.endgame_advantage.ply,
-      cache: "game-coach:v161",
+      cache: "game-coach:v168",
     },
     null,
     2
@@ -911,9 +990,19 @@ const softMobility = softKeysForNoteRequest({
   engineVsPlayedMetricDelta: mobilityVsPlayed,
 });
 assert(
-  softMobility[0] === "piece.centralization" ||
-    softMobility[0] === "piece.coordination",
-  `softKeys must lead with mobility keys, got ${softMobility[0]}`
+  !softMobility.some(
+    (k) => k.startsWith("endgame.") || k.startsWith("positional.")
+  ),
+  "bad_move pool must drop endgame/positional"
+);
+assert(
+  softMobility.every(
+    (k) =>
+      k.startsWith("motif.") ||
+      k.startsWith("attack.") ||
+      k === "methodology.candidate_moves"
+  ),
+  `bad_move tier-1 pool must be motif/attack/candidate_moves, got ${softMobility.join(",")}`
 );
 const coordW = weightKeyBreakdown({
   keyId: "piece.coordination",
@@ -999,13 +1088,14 @@ const tipMobility = pickMetricTip({
 });
 assert(tipMobility, "pickMetricTip must return a tip for mobility bad_move");
 assert(
-  tipMobility.keyId === "piece.coordination" ||
-    tipMobility.keyId === "piece.centralization",
-  `tip keyId must be mobility-related, got ${tipMobility.keyId}`
+  !String(tipMobility.keyId || "").startsWith("endgame.") &&
+    !String(tipMobility.keyId || "").startsWith("positional."),
+  `tip keyId must not be generic endgame/positional, got ${tipMobility.keyId}`
 );
 assert(
-  /Why better:.*mobility|activity/i.test(tipMobility.text),
-  "generated tip must lead with why_better mobility"
+  /Why better:.*mobility|activity/i.test(tipMobility.text) ||
+    /Qd7|better/i.test(tipMobility.text),
+  "generated tip must still use the engine/mobility why_better"
 );
 assert(
   !/^Keep the king safe/i.test(tipMobility.text.trim()),

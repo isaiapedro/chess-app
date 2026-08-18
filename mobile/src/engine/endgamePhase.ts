@@ -11,6 +11,8 @@ import {
 } from "./winProb";
 
 export const ENDGAME_NON_PAWN_MAX = 7;
+export const COACH_ENDGAME_MATERIAL_MAX = 14;
+export const COACH_ENDGAME_DROP_CP = 150;
 export const MATE_CP_THRESHOLD = 50000;
 
 const CENTER_SQUARES: Square[] = ["d4", "e4", "d5", "e5"];
@@ -193,6 +195,43 @@ export function nonPawnPieceCount(board: Chess): number {
     total += board.findPiece({ type: pt, color: "b" }).length;
   }
   return total;
+}
+
+const MATERIAL_TYPES: PieceSymbol[] = ["p", "n", "b", "r", "q"];
+
+export function materialPointsExcludingKings(fen: string): {
+  white: number;
+  black: number;
+} {
+  const board = new Chess(fen);
+  let white = 0;
+  let black = 0;
+  for (const pt of MATERIAL_TYPES) {
+    const val = PIECE_VALUE[pt] || 0;
+    white += board.findPiece({ type: pt, color: "w" }).length * val;
+    black += board.findPiece({ type: pt, color: "b" }).length * val;
+  }
+  return { white, black };
+}
+
+export function isCoachEndgame(args: {
+  fen?: string | null;
+  tacticalKind?: string | null;
+  dropCp?: number;
+}): boolean {
+  if (args.tacticalKind) return false;
+  if ((args.dropCp ?? 0) > COACH_ENDGAME_DROP_CP) return false;
+  const fen = (args.fen || "").trim();
+  if (!fen) return false;
+  try {
+    const m = materialPointsExcludingKings(fen);
+    return (
+      m.white <= COACH_ENDGAME_MATERIAL_MAX &&
+      m.black <= COACH_ENDGAME_MATERIAL_MAX
+    );
+  } catch {
+    return false;
+  }
 }
 
 function kingSquare(board: Chess, color: Color): Square | null {

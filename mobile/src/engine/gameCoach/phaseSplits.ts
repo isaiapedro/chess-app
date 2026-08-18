@@ -1,5 +1,9 @@
 import { Chess } from "chess.js";
-import { ENDGAME_NON_PAWN_MAX, nonPawnPieceCount } from "../endgamePhase";
+import {
+  ENDGAME_NON_PAWN_MAX,
+  isCoachEndgame,
+  nonPawnPieceCount,
+} from "../endgamePhase";
 import { middlegameStartPly } from "../middlegameBounds";
 import { openingPhaseEndFullmove } from "../openingPhase";
 
@@ -17,21 +21,52 @@ export type CoachPhaseBounds = {
   endgameStartPly0: number | null;
 };
 
+export type CoachPhaseHints = {
+  fen?: string | null;
+  tacticalKind?: string | null;
+  dropCp?: number;
+};
+
+function isOpeningPly(
+  ply1: number,
+  pieceCount: number,
+  bounds?: CoachPhaseBounds | null
+): boolean {
+  const mg0 = bounds?.middlegameStartPly0;
+  if (mg0 != null) return ply1 - 1 < mg0;
+  return ply1 <= 16 && pieceCount >= 28;
+}
+
 /**
  * Board phase from heuristic bounds (0-based) vs display ply (1-based).
- * Falls back to piece-count heuristics when bounds missing.
+ * Coach EG is per-ply material + tactic override, not sticky endgameStartPly0.
  */
 export function phaseForPlyBounds(
   ply1: number,
   pieceCount: number,
-  bounds?: CoachPhaseBounds | null
+  bounds?: CoachPhaseBounds | null,
+  hints?: CoachPhaseHints | null
 ): CoachPhaseName {
+  if (isOpeningPly(ply1, pieceCount, bounds)) return "opening";
+
+  if (hints?.tacticalKind || (hints?.dropCp ?? 0) > 150) {
+    return "middlegame";
+  }
+
+  if (hints?.fen) {
+    return isCoachEndgame({
+      fen: hints.fen,
+      tacticalKind: hints.tacticalKind,
+      dropCp: hints.dropCp,
+    })
+      ? "endgame"
+      : "middlegame";
+  }
+
   const eg0 = bounds?.endgameStartPly0;
   const mg0 = bounds?.middlegameStartPly0;
   if (eg0 != null && ply1 - 1 >= eg0) return "endgame";
   if (mg0 != null && ply1 - 1 >= mg0) return "middlegame";
-  if (mg0 != null && ply1 - 1 < mg0) return "opening";
-  if (ply1 <= 16 && pieceCount >= 28) return "opening";
   if (pieceCount <= 12) return "endgame";
   return "middlegame";
 }
@@ -45,6 +80,9 @@ export function phaseForCoachMoment(args: {
   pieceCount?: number;
   bounds?: CoachPhaseBounds | null;
   structuralKind?: string | null;
+  fen?: string | null;
+  tacticalKind?: string | null;
+  dropCp?: number;
 }): CoachPhaseName {
   const sk = args.structuralKind;
   if (sk === "opening_name" || sk === "opening_aggregate") return "opening";
@@ -58,7 +96,12 @@ export function phaseForCoachMoment(args: {
   return phaseForPlyBounds(
     args.ply1,
     args.pieceCount ?? 32,
-    args.bounds
+    args.bounds,
+    {
+      fen: args.fen,
+      tacticalKind: args.tacticalKind,
+      dropCp: args.dropCp,
+    }
   );
 }
 

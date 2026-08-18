@@ -10,11 +10,13 @@ import {
   reformatCoachNoteOneClaim,
   isCorruptPackNote,
 } from "./derivedPolish";
+import { polishCoachProse } from "./coachProse";
 import type { CoachGameMetrics, CoachMetricMoment } from "./coachGameMetrics";
 import type { CoachNoteRequest } from "./coachNoteRequest";
 import {
   requestAlwaysAttaches,
   isBadMoveMark,
+  isFixedCheckpointMoment,
 } from "./coachNoteRequest";
 import {
   type KeyTip,
@@ -62,6 +64,7 @@ import {
 } from "./tacticalFact";
 import {
   lessonFromPackNote,
+  packConditionFeatures,
   pickNoteForContext,
   type PackPickContext,
 } from "./packNoteContent";
@@ -125,22 +128,35 @@ function isOpeningCheckpointRequest(
   return sk === "opening_name" || sk === "opening_aggregate";
 }
 
+function noteBelongsToKey(
+  noteId: string,
+  keyId: string,
+  entryKeyId: string
+): boolean {
+  if (!keyId) return true;
+  if (entryKeyId === keyId) return true;
+  const id = String(noteId || "");
+  if (!id) return false;
+  return id === keyId || id.startsWith(`${keyId}#`) || id.startsWith(keyId);
+}
+
 function pickNoteFromEntry(args: {
   entry: DerivedCoachEntry;
   phase: PhaseName;
   excludeNoteIds?: Set<string>;
-  /** Prefer mid-specificity didactic notes; skip bookwalk when possible. */
   preferDidactic?: boolean;
-  /** Opening tips: one claim only. */
   oneClaim?: boolean;
-  /** Live metrics / situations / openings for condition scoring. */
   pickCtx?: PackPickContext | null;
+  winningKeyId?: string | null;
 }): { note: DerivedCoachNote; text: string } | null {
   const exclude = args.excludeNoteIds || new Set<string>();
+  const winningKeyId = args.winningKeyId || args.entry.keyId || "";
+  const entryKeyId = args.entry.keyId || args.entry.id || "";
   let notes = (args.entry.notes || []).filter((n) => {
     if (!(n.text || "").trim()) return false;
     if (n.id && exclude.has(n.id)) return false;
     if (!notePhaseOk(n, args.phase)) return false;
+    if (!noteBelongsToKey(n.id, winningKeyId, entryKeyId)) return false;
     return true;
   });
   if (args.preferDidactic) {
@@ -183,6 +199,13 @@ function pickNoteFromEntry(args: {
     : reformatCoachNote(slotLesson || note.text, 420);
   if ((!text || text.length < 40) && args.oneClaim) {
     text = reformatCoachNote(note.text, 280, 1);
+  }
+  if (!text || text.length < 28) {
+    text =
+      polishCoachProse(slotLesson || note.text) ||
+      slotLesson ||
+      note.text ||
+      "";
   }
   if (!text || text.length < 28 || isCorruptPackNote(text)) return null;
   return { note, text };
@@ -432,7 +455,7 @@ function metricFallbackText(args: {
       priorTopics: args.priorTopics,
     }).text;
   }
-  if (args.mark === "brilliant" || args.mark === "important") {
+  if (args.mark === "brilliant" || args.mark === "excellent") {
     return composeMomentJudgmentTip({
       mark: args.mark,
       deltaCp: args.deltaCp,
@@ -441,9 +464,6 @@ function metricFallbackText(args: {
       gamePlan: args.gamePlan,
       priorTopics: args.priorTopics,
     }).text;
-  }
-  if (args.mark === "excellent") {
-    return `Excellent accuracy around ${themeLabel}. Keep the same standard on the next decision.`;
   }
   return `Pay attention to ${themeLabel} here. The metrics flag it as a theme of this game.`;
 }
@@ -463,14 +483,7 @@ function poolEntriesForMetricKeys(
       const hit = byKey.get(keyId);
       if (hit) exact.push(hit);
     }
-    if (exact.length) return exact;
-    const families = new Set(allowedKeys.map((k) => k.split(".")[0] || ""));
-    const out: DerivedCoachEntry[] = [];
-    for (const [keyId, entry] of byKey) {
-      if (excludeKeys.has(keyId)) continue;
-      if (families.has(keyFamily(keyId))) out.push(entry);
-    }
-    return out;
+    return exact;
   }
   const exact: DerivedCoachEntry[] = [];
   for (const entry of entries) {
@@ -478,13 +491,7 @@ function poolEntriesForMetricKeys(
     if (!keyId || excludeKeys.has(keyId)) continue;
     if (allow.has(keyId)) exact.push(entry);
   }
-  if (exact.length) return exact;
-  const families = new Set(allowedKeys.map((k) => k.split(".")[0] || ""));
-  return entries.filter((entry) => {
-    const keyId = entry.keyId || entry.id || "";
-    if (!keyId || excludeKeys.has(keyId)) return false;
-    return families.has(keyFamily(keyId));
-  });
+  return exact;
 }
 
 export function pickMetricTip(args: {
@@ -512,6 +519,12 @@ export function pickMetricTip(args: {
   /** Sticky opening/structure plan for this game. */
   gamePlan?: GamePlanState | null;
 }): KeyTip | null {
+  if (args.mark === "inaccuracy") {
+    const always =
+      (args.request != null && requestAlwaysAttaches(args.request.kind)) ||
+      isFixedCheckpointMoment(args.moment);
+    if (!always) return null;
+  }
   const themes = uniqThemes([
     ...(args.themes || []),
     ...(args.metrics.themesByPhase[args.phase] || []),
@@ -588,6 +601,7 @@ export function pickMetricTip(args: {
     situations: args.request?.situations,
     planKeys: args.gamePlan?.stickyKeys,
     tacticalFact: args.request?.tacticalFact,
+    deltaCp: args.deltaCp,
   });
   const tacticalKeys = softKeysForTacticalFact(args.request?.tacticalFact);
   const pool = poolEntriesForMetricKeys(
@@ -659,10 +673,18 @@ export function pickMetricTip(args: {
         tacticalBoost +
         openingLockBoost +
         peerRankBoost;
+      if (total <= -500) return null;
       if (total < METRIC_TIP_MIN_WEIGHT && !requestAlwaysAttaches(args.request?.kind)) {
         return null;
       }
-      return { entry, keyId, weight: Math.max(total, METRIC_TIP_MIN_WEIGHT) };
+      return {
+        entry,
+        keyId,
+        weight:
+          total < METRIC_TIP_MIN_WEIGHT
+            ? Math.max(total, METRIC_TIP_MIN_WEIGHT)
+            : total,
+      };
     })
     .filter((r): r is { entry: DerivedCoachEntry; keyId: string; weight: number } =>
       Boolean(r)
@@ -764,11 +786,24 @@ export function pickMetricTip(args: {
     features: [
       ...coordinate.features,
       ...(pillarScan.ctx.features || []),
+      ...packConditionFeatures({
+        inputs: args.request?.inputs || args.moment?.inputs,
+        tacticalFact: args.request?.tacticalFact,
+      }),
+      ...String(
+        args.request?.inputs?.features || args.moment?.inputs?.features || ""
+      )
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean),
     ],
     judgment: pickJudgment,
   };
 
   for (const row of ranked.slice(0, 8)) {
+    if (tacticalKeys.length && row.keyId.startsWith("endgame.")) {
+      continue;
+    }
     const tail = keyTail(row.keyId);
     if (
       STRUCTURE_THEMES.has(tail) &&
@@ -786,6 +821,7 @@ export function pickMetricTip(args: {
       excludeNoteIds: args.excludeNoteIds,
       preferDidactic: true,
       oneClaim: usePeerWeave,
+      winningKeyId: row.keyId,
       pickCtx: {
         ...pickCtxBase,
         softKeys: [row.keyId, ...(pickCtxBase.softKeys || [])],
@@ -907,14 +943,7 @@ export function pickMetricTip(args: {
       args.onOpeningTipUsed?.({ text, ...tipMeta });
     }
 
-    const primaryKey =
-      (tacticalKeys.includes(row.keyId) && row.keyId) ||
-      tacticalKeys[0] ||
-      (coordinate.primarySoftKeys.includes(row.keyId) && row.keyId) ||
-      coordinate.primarySoftKeys[0] ||
-      (lineExplain?.primarySoftKeys?.includes(row.keyId) && row.keyId) ||
-      lineExplain?.primarySoftKeys?.[0] ||
-      row.keyId;
+    const primaryKey = row.keyId;
     const keyIds = [
       ...new Set([
         primaryKey,
@@ -1057,10 +1086,13 @@ export function pickMetricTip(args: {
     return {
       keyId:
         openingFallbackKey ||
+        tacticalKeys[0] ||
         lineExplain?.primarySoftKeys?.[0] ||
         lineExplain?.softKeys?.[0] ||
         args.openingKeyId ||
-        (args.metrics.themesByPhase[args.phase] || [])[0] ||
+        (tacticalKeys.length
+          ? tacticalKeys[0]
+          : (args.metrics.themesByPhase[args.phase] || [])[0]) ||
         `piece.centralization`,
       keyType: "methodology",
       label: "Game metrics",

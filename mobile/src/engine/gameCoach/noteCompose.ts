@@ -1372,7 +1372,7 @@ export function shouldComposeNote(args: {
 }): boolean {
   if (args.perspective === "user") {
     if (args.moment) return true;
-    if (args.mark === "brilliant") return true;
+    if (args.mark === "brilliant" || args.mark === "excellent") return true;
     if (args.mark === "inaccuracy") return false;
     if (
       args.mark === "blunder" ||

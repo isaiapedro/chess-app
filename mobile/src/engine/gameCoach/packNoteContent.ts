@@ -122,6 +122,63 @@ function noteConditions(note: DerivedCoachNote): PackNoteCondition[] {
 }
 
 export const WIDE_CONDITION_FLOOR = 3;
+export const FEATURE_POLARITY_MATCH = 30;
+export const METRIC_POLARITY_MATCH = 25;
+export const UNCONDITIONED_ANY = 5;
+
+function truthyInput(v: unknown): boolean {
+  return v === true || v === 1 || v === "1";
+}
+
+export function packConditionFeatures(args: {
+  inputs?: Record<string, string | number | boolean | null> | null;
+  tacticalFact?: {
+    kind?: string | null;
+    selfInflicted?: boolean | null;
+  } | null;
+}): string[] {
+  const out: string[] = [];
+  const inputs = args.inputs || {};
+  const self =
+    Boolean(args.tacticalFact?.selfInflicted) ||
+    truthyInput(inputs.tactical_self_inflicted);
+  const kind = String(
+    args.tacticalFact?.kind || inputs.tactical_kind || ""
+  ).trim();
+  if (self) out.push("self-trapped-piece");
+  if (kind === "trapped_piece") out.push("zero-safe-squares");
+  if (
+    truthyInput(inputs.uncastled) ||
+    truthyInput(inputs.opp_king_uncastled) ||
+    truthyInput(inputs.own_uncastled) ||
+    Number(inputs.uncastled_rate) > 0 ||
+    Number(inputs.uncastled_rate_pct) > 0
+  ) {
+    out.push("uncastled-king");
+  }
+  return [...new Set(out)];
+}
+
+function sentenceCaseSlot(raw: string): string {
+  const t = String(raw || "")
+    .trim()
+    .replace(/[.!?]+$/g, "")
+    .trim();
+  if (!t) return "";
+  return t.charAt(0).toUpperCase() + t.slice(1);
+}
+
+export function formatTacticalSlotComment(args: {
+  note: DerivedCoachNote | null | undefined;
+  bestSan?: string | null;
+}): string | null {
+  const slots = resolveNoteSlots(args.note);
+  const attention = sentenceCaseSlot(slots.attention || "");
+  const lesson = sentenceCaseSlot(slots.lesson || "");
+  const best = String(args.bestSan || "").trim();
+  if (!attention || !lesson || !best) return null;
+  return `${attention}. Best was ${best} (${lesson}).`;
+}
 
 function normTok(raw: string): string {
   return String(raw || "")
@@ -156,6 +213,15 @@ function familyOf(c: PackNoteCondition): "plan" | "principle" | "value" | "featu
   return "feature";
 }
 
+function polarityKind(
+  polarity: PackNoteCondition["polarity"] | undefined,
+  judgment: PackPickContext["judgment"]
+): "match" | "any" | "miss" {
+  if (!polarity || polarity === "any") return "any";
+  if (!judgment) return "any";
+  return polarity === judgment ? "match" : "miss";
+}
+
 /** Higher = better match to live metrics / situations / openings / polarity. */
 export function scoreNoteConditions(
   note: DerivedCoachNote,
@@ -164,6 +230,7 @@ export function scoreNoteConditions(
   const conds = noteConditions(note);
   if (!conds.length) return WIDE_CONDITION_FLOOR;
   let score = 0;
+  let anyBonus = 0;
   const soft = new Set((ctx.softKeys || []).map(String));
   const metrics = new Set((ctx.metrics || []).map(String));
   const sits = new Set((ctx.situations || []).map(String));
@@ -186,45 +253,84 @@ export function scoreNoteConditions(
   let coreHits = 0;
 
   for (const c of conds) {
-    if (c.polarity && c.polarity !== "any" && judgment && c.polarity !== judgment) {
+    const pol = polarityKind(c.polarity, judgment);
+    if (pol === "miss") continue;
+    const fam = familyOf(c);
+    const featureHit = Boolean(
+      c.feature && (features.has(c.feature) || ctxHas(wide, c.feature))
+    );
+    const metricHit = Boolean(
+      c.metric && (metrics.has(c.metric) || ctxHas(wide, c.metric))
+    );
+    const softHit = Boolean(
+      c.softKey && (soft.has(c.softKey) || ctxHas(wide, c.softKey))
+    );
+    const sitHit = Boolean(
+      c.situation && (sits.has(c.situation) || ctxHas(wide, c.situation))
+    );
+    const themeHit = Boolean(
+      c.theme && (themes.has(c.theme) || ctxHas(wide, c.theme))
+    );
+    const openHit = Boolean(
+      c.opening &&
+        (openings.has(String(c.opening).toLowerCase()) ||
+          ctxHas(wide, c.opening))
+    );
+    if (c.metric && !metricHit) metricMisses += 1;
+    const hit =
+      featureHit || metricHit || softHit || sitHit || themeHit || openHit;
+
+    if (pol === "any") {
+      if (
+        hit ||
+        (!c.feature &&
+          !c.metric &&
+          !c.softKey &&
+          !c.situation &&
+          !c.theme &&
+          !c.opening)
+      ) {
+        anyBonus = UNCONDITIONED_ANY;
+        if (featureHit || metricHit || softHit || sitHit || openHit) {
+          coreHits += 1;
+          families.add(fam);
+        }
+        if (metricHit) metricHits += 1;
+      }
       continue;
     }
-    const fam = familyOf(c);
-    if (c.softKey && (soft.has(c.softKey) || ctxHas(wide, c.softKey))) {
-      score += 4;
-      coreHits += 1;
-      families.add(c.softKey.startsWith("opening.") ? "plan" : fam);
-    }
-    if (c.metric) {
-      if (metrics.has(c.metric) || ctxHas(wide, c.metric)) {
-        score += 8;
-        metricHits += 1;
-        coreHits += 1;
-        families.add(fam);
-      } else {
-        metricMisses += 1;
-      }
-    }
-    if (c.situation && (sits.has(c.situation) || ctxHas(wide, c.situation))) {
-      score += 5;
-      coreHits += 1;
-      families.add("plan");
-    }
-    if (c.theme && (themes.has(c.theme) || ctxHas(wide, c.theme))) {
-      score += 1;
-    }
-    if (c.feature && (features.has(c.feature) || ctxHas(wide, c.feature))) {
-      score += 3;
+
+    if (featureHit) {
+      score += FEATURE_POLARITY_MATCH;
       coreHits += 1;
       families.add("feature");
     }
-    if (c.opening && (openings.has(String(c.opening).toLowerCase()) || ctxHas(wide, c.opening))) {
-      score += 3;
+    if (metricHit) {
+      score += METRIC_POLARITY_MATCH;
+      metricHits += 1;
+      coreHits += 1;
+      families.add(fam);
+    }
+    if (softHit) {
+      score += 8;
+      coreHits += 1;
+      families.add(c.softKey?.startsWith("opening.") ? "plan" : fam);
+    }
+    if (sitHit) {
+      score += 12;
       coreHits += 1;
       families.add("plan");
     }
-    if (c.polarity && judgment && c.polarity === judgment) score += 1;
+    if (themeHit) {
+      score += 1;
+    }
+    if (openHit) {
+      score += 8;
+      coreHits += 1;
+      families.add("plan");
+    }
   }
+  score += anyBonus;
   if (metricConds.length && metrics.size && metricHits === 0 && coreHits < 2) {
     return 0;
   }

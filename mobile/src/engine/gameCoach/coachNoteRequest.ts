@@ -47,6 +47,7 @@ import {
   formatMetricSignalShort,
 } from "./engineLineExplain";
 import { buildMiddlegameStrategicInputs } from "./middlegameStructure";
+import { packConditionFeatures } from "./packNoteContent";
 
 const MG_STRATEGY_META = [
   "prefer_center_strike",
@@ -118,8 +119,7 @@ export type CoachNoteRequestKind =
   | "bad_move"
   | "structural_moment"
   | "fixed_checkpoint"
-  | "praise_move"
-  | "phase_structure";
+  | "praise_move";
 
 export type BoardMetricSnap = {
   material_balance: number;
@@ -240,7 +240,7 @@ export const COACH_NOTE_REQUEST_CONFIG = {
   /** Engine PV / played-continuation horizon for line compare. */
   engineLineHorizonMoves: 8,
   badMoveMarks: ["blunder", "mistake", "missed"] as const,
-  praiseMarks: ["brilliant"] as const,
+  praiseMarks: ["brilliant", "excellent"] as const,
   alwaysAttachKinds: [
     "bad_move",
     "structural_moment",
@@ -261,14 +261,6 @@ export const COACH_NOTE_REQUEST_CONFIG = {
   liveStructuralKinds: ["decisive_pawn_break" as const],
   /** Kept for callers; line/snap diffs now emit every field (minAbs 0). */
   minNumericDelta: 0,
-  /**
-   * Quiet opening spam off — notes only on fixed checkpoints + bad/good marks
-   * + live structural. Durable structure alone must not invent coach calls.
-   */
-  openingAlwaysAttach: false,
-  /** Quiet durable structure tips off — metrics coach calls only (moments/marks). */
-  allowPhaseStructure: false,
-  /** Themes allowed to fire phase_structure when allowPhaseStructure is on. */
   durableStructureTipThemes: [
     "iqp",
     "maroczy_bind",
@@ -877,17 +869,15 @@ export function buildCoachNoteRequest(args: {
     (isBadMoveMark(args.mark) || (moment && moment.dropCp >= 80))
   ) {
     kind = "bad_move";
-  } else if (isPraiseMark(args.mark) || args.moment?.inputs?.praise_mark === "brilliant") {
-    kind = "praise_move";
   } else if (
-    COACH_NOTE_REQUEST_CONFIG.allowPhaseStructure &&
-    (args.unusedStructureThemes || []).some((t) =>
-      (
-        COACH_NOTE_REQUEST_CONFIG.durableStructureTipThemes as readonly string[]
-      ).includes(t)
+    isPraiseMark(args.mark) ||
+    isPraiseMark(
+      typeof args.moment?.inputs?.praise_mark === "string"
+        ? (args.moment.inputs.praise_mark as CoachMark)
+        : null
     )
   ) {
-    kind = "phase_structure";
+    kind = "praise_move";
   }
   // Bare Δ without mark/moment is not a coach call.
 
@@ -1114,6 +1104,23 @@ export function buildCoachNoteRequest(args: {
     userColor,
   });
 
+  const mergedInputs: Record<string, string | number | boolean | null> = {
+    ...(moment?.inputs || {}),
+    ...situationStamp,
+    ...tacticalStamp,
+    ...mgStamp,
+    ...evalStamp,
+    ...tempoStamp,
+    ...locationStamp,
+  };
+  const featureTags = packConditionFeatures({
+    inputs: mergedInputs,
+    tacticalFact,
+  });
+  if (featureTags.length) {
+    mergedInputs.features = featureTags.join(",");
+  }
+
   return {
     kind,
     ply: args.ply,
@@ -1128,15 +1135,7 @@ export function buildCoachNoteRequest(args: {
     engineLineSans,
     engineVsPlayedMetricDelta,
     structuralKind: moment?.structuralKind,
-    inputs: {
-      ...(moment?.inputs || {}),
-      ...situationStamp,
-      ...tacticalStamp,
-      ...mgStamp,
-      ...evalStamp,
-      ...tempoStamp,
-      ...locationStamp,
-    },
+    inputs: mergedInputs,
     situations,
     tacticalFact,
   };
@@ -1262,16 +1261,27 @@ export function coachRequestMetaInputs(
     const v = request.inputs?.[k];
     if (v != null && v !== "") tempo[k] = v;
   }
+  const featureTags = packConditionFeatures({
+    inputs: request.inputs,
+    tacticalFact: request.tacticalFact,
+  });
+  const feats: Record<string, string | number | boolean | null> = {};
+  if (typeof request.inputs?.features === "string" && request.inputs.features) {
+    feats.features = request.inputs.features;
+  } else if (featureTags.length) {
+    feats.features = featureTags.join(",");
+  }
   return {
     ...sit,
     ...tact,
     ...mg,
     ...tempo,
+    ...feats,
   };
 }
 
 /**
- * Unused durable structure/situation ids for quiet phase_structure tips.
+ * Unused durable structure/situation ids for structure-once tracking.
  * Prefer windowed structure + live situations; fall back to phase themes.
  */
 export function durableUnusedStructureThemes(args: {

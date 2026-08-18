@@ -1,9 +1,14 @@
-import { Chess, type Color, type Move } from "chess.js";
+import { Chess, type Color, type Move, type Square } from "chess.js";
+import { sameMove } from "../chessMoves";
 import {
   STYLE_PIECE_VALUE,
+  isHangingOrUnderdefended,
+  isUnderLesserAttack,
   sacrificeOfferAfterMove,
+  threatensHigherValueAfter,
 } from "../styleMetrics";
 import {
+  isMateScore,
   userWinProbability,
   wpDropPp,
   WP_INACCURACY_DROP,
@@ -11,7 +16,7 @@ import {
 } from "../winProb";
 import { hungMateAfterPlayedMove } from "../forcedMate";
 import { IMPORTANT_PV_GAP, multipvWpGap } from "./tacticSharpness";
-import { moveAccuracyPct } from "../openingPhase";
+import { gameAccuracyForSide } from "../gameAccuracy";
 
 export type CoachMark =
   | "book"
@@ -57,10 +62,26 @@ function coachWpDrop(wpBefore: number, wpAfter: number): number {
   return Math.max(0, wpBefore - wpAfter);
 }
 
-export function classifyCoachWpBand(wpDrop: number): CoachMark | null {
+export const CP_INACCURACY_DROP = 150;
+
+export function userCpDrop(
+  evalBeforeCp: number,
+  evalAfterCp: number,
+  side: "white" | "black"
+): number {
+  const userIsWhite = side === "white";
+  const before = userIsWhite ? evalBeforeCp : -evalBeforeCp;
+  const after = userIsWhite ? evalAfterCp : -evalAfterCp;
+  return before - after;
+}
+
+export function classifyCoachWpBand(
+  wpDrop: number,
+  cpDrop = 0
+): CoachMark | null {
   if (wpDrop >= 0.2) return "blunder";
   if (wpDrop >= 0.1) return "mistake";
-  if (wpDrop >= 0.05) return "inaccuracy";
+  if (wpDrop >= 0.05 || cpDrop >= CP_INACCURACY_DROP) return "inaccuracy";
   if (wpDrop >= 0.02) return "good";
   if (wpDrop >= 0) return "excellent";
   return null;
@@ -121,19 +142,7 @@ export function sideAccuracyPct(
   }>,
   side: "white" | "black"
 ): number | null {
-  const samples: number[] = [];
-  const moverIsWhite = side === "white";
-  for (const ply of plies) {
-    if (ply.side !== side) continue;
-    if (ply.evalBeforeCp == null || ply.evalAfterCp == null) continue;
-    const wpBefore = userWinProbability(ply.evalBeforeCp, moverIsWhite);
-    const wpAfter = userWinProbability(ply.evalAfterCp, moverIsWhite);
-    samples.push(moveAccuracyPct(wpBefore * 100, wpAfter * 100));
-  }
-  if (!samples.length) return null;
-  return (
-    Math.round((samples.reduce((a, b) => a + b, 0) / samples.length) * 10) / 10
-  );
+  return gameAccuracyForSide(plies, side);
 }
 
 function importantFromLines(
@@ -143,6 +152,167 @@ function importantFromLines(
 ): boolean {
   if (!playedBest || !lines || lines.length < 2) return false;
   return multipvWpGap(lines, side) >= IMPORTANT_PV_GAP;
+}
+
+function fromSquareHasCaptureThreat(
+  board: Chess,
+  from: Square,
+  piece: Move["piece"],
+  color: Color,
+  moverWasInCheck: boolean
+): boolean {
+  if (piece === "k") return moverWasInCheck;
+  return (
+    isHangingOrUnderdefended(board, from, color) ||
+    isUnderLesserAttack(board, from, color)
+  );
+}
+
+function threatEscapeHasExtraIdea(
+  boardAfter: Chess,
+  move: Move,
+  color: Color
+): boolean {
+  if (move.isCapture()) return true;
+  if (move.isPromotion()) return true;
+  if (move.isKingsideCastle() || move.isQueensideCastle()) return true;
+  if (boardAfter.inCheck()) return true;
+  if (sacrificeOfferAfterMove(boardAfter, move, color) >= BRILLIANT_SAC_MIN) {
+    return true;
+  }
+  return threatensHigherValueAfter(boardAfter, move, color);
+}
+
+export function isSimpleThreatEscape(
+  fenBefore: string,
+  playedSan: string
+): boolean {
+  try {
+    const before = new Chess(fenBefore);
+    const color = before.turn();
+    const moverWasInCheck = before.inCheck();
+    const after = new Chess(fenBefore);
+    const move = after.move(playedSan) as Move | null;
+    if (!move) return false;
+    if (
+      !fromSquareHasCaptureThreat(
+        before,
+        move.from as Square,
+        move.piece,
+        color,
+        moverWasInCheck
+      )
+    ) {
+      return false;
+    }
+    if (threatEscapeHasExtraIdea(after, move, color)) return false;
+    const to = move.to as Square;
+    if (
+      isHangingOrUnderdefended(after, to, color) ||
+      isUnderLesserAttack(after, to, color)
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function captureDest(fenBefore: string, san: string): string | null {
+  if (!san.includes("x")) return null;
+  try {
+    const board = new Chess(fenBefore);
+    const move = board.move(san) as Move | null;
+    if (!move?.isCapture()) return null;
+    return move.to;
+  } catch {
+    return null;
+  }
+}
+
+const OPENING_DEVELOP_FULLMOVE = 10;
+const MINOR_HOME: Record<Color, ReadonlySet<string>> = {
+  w: new Set(["b1", "c1", "f1", "g1"]),
+  b: new Set(["b8", "c8", "f8", "g8"]),
+};
+
+export function isRoutineExcellentMove(
+  fenBefore: string,
+  playedSan: string
+): boolean {
+  try {
+    const before = new Chess(fenBefore);
+    const color = before.turn();
+    const opp = color === "w" ? "b" : "w";
+    const after = new Chess(fenBefore);
+    const move = after.move(playedSan) as Move | null;
+    if (!move) return false;
+    if (after.inCheck()) return true;
+    if (
+      before.inCheck() &&
+      move.piece !== "k" &&
+      !move.isCapture()
+    ) {
+      return true;
+    }
+    if (move.isCapture()) {
+      const dest = move.to as Square;
+      if (
+        isHangingOrUnderdefended(before, dest, opp) ||
+        isUnderLesserAttack(before, dest, opp)
+      ) {
+        return true;
+      }
+    }
+    const fullmove = Number(fenBefore.split(" ")[5] || "1");
+    if (
+      fullmove <= OPENING_DEVELOP_FULLMOVE &&
+      (move.piece === "n" || move.piece === "b") &&
+      MINOR_HOME[color].has(move.from)
+    ) {
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+export function isRecapture(
+  fenBefore: string,
+  playedSan: string,
+  prevCaptureTo?: string | null
+): boolean {
+  if (!prevCaptureTo) return false;
+  try {
+    const before = new Chess(fenBefore);
+    const move = before.move(playedSan) as Move | null;
+    if (!move?.isCapture()) return false;
+    return move.to === prevCaptureTo;
+  } catch {
+    return false;
+  }
+}
+
+function moverHasMate(cpWhite: number, moverIsWhite: boolean): boolean {
+  if (!isMateScore(cpWhite)) return false;
+  return moverIsWhite ? cpWhite > 0 : cpWhite < 0;
+}
+
+export function lostOwnMate(args: {
+  side: "white" | "black";
+  evalBeforeCp: number | null;
+  evalAfterCp: number | null;
+  playedBest?: boolean;
+}): boolean {
+  if (args.playedBest) return false;
+  if (args.evalBeforeCp == null || args.evalAfterCp == null) return false;
+  const moverIsWhite = args.side === "white";
+  return (
+    moverHasMate(args.evalBeforeCp, moverIsWhite) &&
+    !moverHasMate(args.evalAfterCp, moverIsWhite)
+  );
 }
 
 export function isForcingEqualOrHigherRecapture(
@@ -173,6 +343,37 @@ export function isForcingEqualOrHigherRecapture(
     const onlyWayOnSquare = sameSquareRecaptures.length === 1;
 
     return givesCheck || uniqueRecapture || onlyWayOnSquare;
+  } catch {
+    return false;
+  }
+}
+
+export function isEqualOrLesserCapture(
+  fenBefore: string,
+  playedSan: string
+): boolean {
+  try {
+    const before = new Chess(fenBefore);
+    const move = before.move(playedSan) as Move | null;
+    if (!move?.isCapture() || !move.captured) return false;
+    const moverVal = STYLE_PIECE_VALUE[move.piece] ?? 0;
+    const capVal = STYLE_PIECE_VALUE[move.captured] ?? 0;
+    return capVal + 1e-9 <= moverVal;
+  } catch {
+    return false;
+  }
+}
+
+function isRoutineImportantMove(fenBefore: string, playedSan: string): boolean {
+  try {
+    const before = new Chess(fenBefore);
+    const after = new Chess(fenBefore);
+    const move = after.move(playedSan) as Move | null;
+    if (!move) return false;
+    if (before.inCheck() && move.piece !== "k" && !move.isCapture()) {
+      return true;
+    }
+    return isEqualOrLesserCapture(fenBefore, playedSan);
   } catch {
     return false;
   }
@@ -215,8 +416,17 @@ export function classifyCoachMark(args: {
   fenBefore?: string;
   playedSan?: string;
   missedOpportunity?: boolean;
+  prevCaptureTo?: string | null;
 }): CoachMark | null {
-  if (args.playedBest) {
+  const playedBest =
+    args.playedBest ||
+    Boolean(
+      args.fenBefore &&
+        args.playedSan &&
+        args.lines?.[0]?.san &&
+        sameMove(args.fenBefore, args.playedSan, args.lines[0].san)
+    );
+  if (playedBest) {
     if (args.evalBeforeCp == null || args.evalAfterCp == null) return "best";
     const userIsWhite = args.side === "white";
     const wpBefore = userWinProbability(args.evalBeforeCp, userIsWhite);
@@ -242,7 +452,13 @@ export function classifyCoachMark(args: {
       isForcingEqualOrHigherRecapture(args.fenBefore!, args.playedSan!);
     if (
       !forcedRecapture &&
-      importantFromLines(args.lines, true, args.side)
+      importantFromLines(args.lines, true, args.side) &&
+      !(
+        args.fenBefore &&
+        args.playedSan &&
+        (isSimpleThreatEscape(args.fenBefore, args.playedSan) ||
+          isRoutineImportantMove(args.fenBefore, args.playedSan))
+      )
     ) {
       return "important";
     }
@@ -263,6 +479,8 @@ export function classifyCoachMark(args: {
     return "blunder";
   }
 
+  if (lostOwnMate({ ...args, playedBest })) return "missed";
+
   if (args.missedOpportunity) return "missed";
   if (args.evalBeforeCp == null || args.evalAfterCp == null) {
     return null;
@@ -272,6 +490,11 @@ export function classifyCoachMark(args: {
   const wpBefore = userWinProbability(args.evalBeforeCp, userIsWhite);
   const wpAfter = userWinProbability(args.evalAfterCp, userIsWhite);
   const wpDrop = coachWpDrop(wpBefore, wpAfter);
+  const cpDrop = userCpDrop(
+    args.evalBeforeCp,
+    args.evalAfterCp,
+    args.side
+  );
 
   if (
     args.fenBefore &&
@@ -288,7 +511,18 @@ export function classifyCoachMark(args: {
     return "brilliant";
   }
 
-  return classifyCoachWpBand(wpDrop);
+  const band = classifyCoachWpBand(wpDrop, cpDrop);
+  if (
+    band === "excellent" &&
+    args.fenBefore &&
+    args.playedSan &&
+    (isRecapture(args.fenBefore, args.playedSan, args.prevCaptureTo) ||
+      isRoutineExcellentMove(args.fenBefore, args.playedSan) ||
+      isEqualOrLesserCapture(args.fenBefore, args.playedSan))
+  ) {
+    return "good";
+  }
+  return band;
 }
 
 export function coachMissedFromPending(args: {

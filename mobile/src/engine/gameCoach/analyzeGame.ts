@@ -7,7 +7,7 @@ import {
   COACH_CRITICAL_MOVETIME,
   COACH_CRITICAL_MULTIPV,
 } from "../analysisConfig";
-import { applyUciMove, fenKey, sanToUci, uciFromMove } from "../chessMoves";
+import { applyUciMove, fenKey, sameMove, sanToUci, uciFromMove } from "../chessMoves";
 import { formatEval, toWhiteCp } from "../analyzeMistakes";
 import { applyForcedMateWhiteCp, bestStmCp } from "../forcedMate";
 import type { StudyGame } from "../analyzeMistakes";
@@ -28,6 +28,7 @@ import { upsertHeuristicGame } from "../../storage/analyticsLoaders";
 import type { MistakeItem } from "../../api/client";
 import {
   classifyCoachMark,
+  captureDest,
   coachMissedFromPending,
   COACH_MARKS_KEEP_OVER_BOOK,
   type CoachMark,
@@ -45,24 +46,17 @@ import {
   type CoachGameMetrics,
   type CoachMetricMoment,
 } from "./gameMetricsLookup";
-import { expandCoachThemes, classifyUserError, shouldComposeNote, acceptKeyNote } from "./noteCompose";
-import { isCorruptPackNote } from "./derivedPolish";
 import { composeGameSummaryNote } from "./gameSummary";
 import {
   buildCommentRefs,
   type CommentRefs,
 } from "./commentRefs";
-import { assessPositionPov } from "./positionPov";
 import type { VectorRetrieveFn } from "./retrieve";
 import {
   collectGameKeys,
-  PHASE_NOTE_LIMITS,
   type KeyTip,
-  type PhaseName,
 } from "./keyRetrieve";
 import {
-  pickMetricTip,
-  shouldAttachMetricTip,
   buildCoachNoteRequest,
   lineComparisonMomentInputs,
   coachRequestMetaInputs,
@@ -71,25 +65,17 @@ import {
   pawnBreakEvalGapAllowsRecommend,
   engineLineSansBudget,
   composePlayedAltLine,
-  COACH_NOTE_REQUEST_CONFIG,
   isFixedCheckpointMoment,
-  requestAlwaysAttaches,
+  isPraiseMark,
 } from "./metricNotes";
-import {
-  rankMetricNoteWeights,
-  formatWeightBreakdown,
-  themesForPly,
-} from "./metricNoteWeights";
-import {
-  mergeOpeningTipPrior,
-  type OpeningTipPrior,
-} from "./openingJudgmentTip";
+import { attachCoachComment } from "./attachCoachComment";
+import { CoachSilenceManager } from "./coachSilence";
+import { loadNotesSchema } from "./loadNotesSchema";
 import {
   emptyGamePlanState,
   advanceGamePlan,
   formatGamePlanShort,
   markPlanKeysTaught,
-  mergeOpeningPlanKeys,
 } from "./gamePlanState";
 import { detectSituations, mergeStickySituations } from "./situationProfiles";
 import type { DetectedSituation } from "./situationProfiles";
@@ -380,13 +366,21 @@ function phaseForPly(
   ply: number,
   pieceCount: number,
   bounds?: { middlegameStartPly0: number | null; endgameStartPly0: number | null } | null,
-  structuralKind?: string | null
+  structuralKind?: string | null,
+  hints?: {
+    fen?: string | null;
+    tacticalKind?: string | null;
+    dropCp?: number;
+  } | null
 ): "opening" | "middlegame" | "endgame" {
   return phaseForCoachMoment({
     ply1: ply,
     pieceCount,
     bounds,
     structuralKind,
+    fen: hints?.fen,
+    tacticalKind: hints?.tacticalKind,
+    dropCp: hints?.dropCp,
   });
 }
 
@@ -844,7 +838,6 @@ export async function analyzeSelectedGame(options: {
     skeleton.map((s) => s.san)
   );
   const userColor = normalizeUserColor(options.userColor);
-  const usedTips = new Set<string>();
   const plies: GameCoachPly[] = [];
   let prevEval: number | null = null;
   let userPlyCount = 0;
@@ -861,14 +854,8 @@ export async function analyzeSelectedGame(options: {
   const userIsWhite = userColor === "white";
   const usedKeyTips: KeyTip[] = [];
   const selectedNotes: string[] = [];
-  const usedNoteIds = new Set<string>();
+  const commentSilence = new CoachSilenceManager();
   const structureThemeUsed = new Set<string>();
-  let openingPriorTopics: OpeningTipPrior | null = null;
-  const phaseNoteCounts: Record<PhaseName, number> = {
-    opening: 0,
-    middlegame: 0,
-    endgame: 0,
-  };
 
   // ——— Pass A: recalculate heuristics + bundled peers (tips later) ———
   options.onProgress?.({
@@ -1157,7 +1144,7 @@ export async function analyzeSelectedGame(options: {
         deltaCp = Math.max(0, Math.round(loss));
       }
 
-      let playedBest = Boolean(bestSan && bestSan === sk.san);
+      let playedBest = sameMove(sk.fenBefore, sk.san, bestSan);
       if (isUserPly) userPlyCount += 1;
 
       let missedOpportunity = false;
@@ -1175,7 +1162,7 @@ export async function analyzeSelectedGame(options: {
           wpBefore: userWinProbability(evalBefore, userIsWhite),
           wpAfter: userWinProbability(evalAfter, userIsWhite),
           pendingPeakWp: pendingOppWp,
-          playedBest: Boolean(bestSan && bestSan === sk.san),
+          playedBest: sameMove(sk.fenBefore, sk.san, bestSan),
         });
         if (missedOpportunity) missedAfterOpp = pendingOppKind;
         pendingOppChance = false;
@@ -1198,6 +1185,7 @@ export async function analyzeSelectedGame(options: {
               fenBefore: sk.fenBefore,
               playedSan: sk.san,
               missedOpportunity: isUserPly ? missedOpportunity : false,
+              prevCaptureTo: i > 0 ? captureDest(skeleton[i - 1].fenBefore, skeleton[i - 1].san) : null,
             })
           : null;
 
@@ -1206,7 +1194,15 @@ export async function analyzeSelectedGame(options: {
         sk.ply,
         pieceCountEarly,
         metrics.phaseBounds,
-        momentAtPly?.structuralKind
+        momentAtPly?.structuralKind,
+        {
+          fen: sk.fenAfter,
+          dropCp: deltaCp,
+          tacticalKind:
+            typeof momentAtPly?.inputs?.tactical_kind === "string"
+              ? momentAtPly.inputs.tactical_kind
+              : null,
+        }
       );
 
       const criticalBad =
@@ -1216,7 +1212,7 @@ export async function analyzeSelectedGame(options: {
       const metricCoachCall =
         criticalBad ||
         (isUserPly && isFixedCheckpointMoment(momentAtPly)) ||
-        (isUserPly && mark === "brilliant");
+        (isUserPly && isPraiseMark(mark));
 
       const runStrongEngine = async () => {
         options.onProgress?.({
@@ -1294,7 +1290,7 @@ export async function analyzeSelectedGame(options: {
           }
         }
 
-        playedBest = Boolean(bestSan && bestSan === sk.san);
+        playedBest = sameMove(sk.fenBefore, sk.san, bestSan);
       };
 
       let usedStrongEngine = false;
@@ -1325,6 +1321,7 @@ export async function analyzeSelectedGame(options: {
           fenBefore: sk.fenBefore,
           playedSan: sk.san,
           missedOpportunity,
+          prevCaptureTo: i > 0 ? captureDest(skeleton[i - 1].fenBefore, skeleton[i - 1].san) : null,
         });
       }
 
@@ -1367,11 +1364,28 @@ export async function analyzeSelectedGame(options: {
           evalBeforeCp: evalBefore,
           evalAfterCp: evalAfter,
         });
+        if (previewReq?.tacticalFact?.kind) {
+          const phasePreview = phaseForPly(
+            sk.ply,
+            pieceCountEarly,
+            metrics.phaseBounds,
+            keepStructural || momentAtPly?.structuralKind,
+            {
+              fen: sk.fenAfter,
+              dropCp: deltaCp,
+              tacticalKind: previewReq.tacticalFact.kind,
+            }
+          );
+          if (phasePreview !== phaseEarly) {
+            previewReq.phase = phasePreview;
+          }
+        }
         const lineInputs = previewReq
           ? lineComparisonMomentInputs(previewReq)
           : bestPvSan.length
             ? { engine_line: bestPvSan.join(" ") }
             : {};
+        const metaInputs = coachRequestMetaInputs(previewReq);
         momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
           ply: sk.ply,
           moveNumber: sk.fullmove,
@@ -1391,11 +1405,12 @@ export async function analyzeSelectedGame(options: {
           inputs: {
             ...(prevLive?.inputs || {}),
             ...lineInputs,
+            ...metaInputs,
             critical_mark: mark || "mistake",
             ...(missedAfterOpp ? { missed_after_opp: missedAfterOpp } : {}),
           },
         });
-      } else if (isUserPly && mark === "brilliant") {
+      } else if (isUserPly && isPraiseMark(mark)) {
         const praiseDrop = mark === "brilliant" ? 35 : 28;
         momentAtPly = upsertLiveMoment(metrics.momentsByPly, {
           ply: sk.ply,
@@ -1502,7 +1517,7 @@ export async function analyzeSelectedGame(options: {
             if (!usedStrongEngine) {
               await runStrongEngine();
               usedStrongEngine = true;
-              playedBest = Boolean(bestSan && bestSan === sk.san);
+              playedBest = sameMove(sk.fenBefore, sk.san, bestSan);
             }
             const openingTheme = metrics.themesByPhase.opening[0] || null;
             const breakContSans =
@@ -1618,11 +1633,19 @@ export async function analyzeSelectedGame(options: {
 
       if (sample && isUserPly) {
         const pieceCount = sk.fenAfter.split(" ")[0].replace(/\d/g, "").length;
-        const phase = phaseForPly(
+        let phase = phaseForPly(
           sk.ply,
           pieceCount,
           metrics.phaseBounds,
-          momentAtPly?.structuralKind
+          momentAtPly?.structuralKind,
+          {
+            fen: sk.fenAfter,
+            dropCp: deltaCp,
+            tacticalKind:
+              typeof momentAtPly?.inputs?.tactical_kind === "string"
+                ? momentAtPly.inputs.tactical_kind
+                : null,
+          }
         );
         const moment = momentAtPly;
         const phaseThemesEarly = metrics.themesByPhase[phase] || [];
@@ -1665,12 +1688,35 @@ export async function analyzeSelectedGame(options: {
           pawnStormTempo: stormTempo,
           situations: planSituations,
         });
-        if (noteRequest && moment) {
+        if (noteRequest?.tacticalFact?.kind) {
+          const phase2 = phaseForPly(
+            sk.ply,
+            pieceCount,
+            metrics.phaseBounds,
+            momentAtPly?.structuralKind,
+            {
+              fen: sk.fenAfter,
+              dropCp: deltaCp,
+              tacticalKind: noteRequest.tacticalFact.kind,
+            }
+          );
+          if (phase2 !== phase) {
+            phase = phase2;
+            noteRequest.phase = phase2;
+          }
+        }
+        if (noteRequest) {
           const lineInputs = lineComparisonMomentInputs(noteRequest);
           const metaInputs = coachRequestMetaInputs(noteRequest);
+          if (Object.keys(metaInputs).length) {
+            noteRequest.inputs = {
+              ...(noteRequest.inputs || {}),
+              ...metaInputs,
+            };
+          }
           if (
-            Object.keys(lineInputs).length ||
-            Object.keys(metaInputs).length
+            moment &&
+            (Object.keys(lineInputs).length || Object.keys(metaInputs).length)
           ) {
             moment.inputs = {
               ...(moment.inputs || {}),
@@ -1850,7 +1896,7 @@ export async function analyzeSelectedGame(options: {
     }
   }
 
-  // ——— Pass C: soft keys / themes / pack tips (after full metric context) ———
+  // ——— Pass C: classify event / guarded notes / silence ———
   options.onProgress?.({
     ply: skeleton.length,
     total: skeleton.length,
@@ -1858,6 +1904,7 @@ export async function analyzeSelectedGame(options: {
   });
   const coachPack = await loadCoachPack();
   const packByKey = getCoachPackByKey();
+  const notesSchema = loadNotesSchema();
   const gameKeys = collectGameKeys({
     entries: coachPack.entries,
     byKey: packByKey,
@@ -1891,32 +1938,20 @@ export async function analyzeSelectedGame(options: {
     if (moment && i === plies.length - 1) {
       moment.inputs = { ...(moment.inputs || {}), game_over: true };
     }
-    const phase = phaseForPly(
+    let phase = phaseForPly(
       ply.ply,
       pieceCount,
       metrics.phaseBounds,
-      moment?.structuralKind
+      moment?.structuralKind,
+      {
+        fen: ply.fenAfter,
+        dropCp: ply.deltaCp,
+        tacticalKind:
+          typeof moment?.inputs?.tactical_kind === "string"
+            ? moment.inputs.tactical_kind
+            : null,
+      }
     );
-    const playedBest = Boolean(ply.bestSan && ply.bestSan === ply.san);
-    const pov = assessPositionPov(ply.fenAfter, userColor);
-    const provisionalThemes = [
-      ...structure,
-      ...(pov.kingMotifLive ? pov.themes : []),
-      ...openingTags,
-      ...metrics.themesByPhase[phase],
-    ];
-    const errorKind = classifyUserError({
-      fenBefore: ply.fenBefore,
-      playedSan: ply.san,
-      bestSan: ply.bestSan,
-      bestPvSan: ply.bestPvSan,
-      deltaCp: ply.deltaCp,
-      themes: provisionalThemes,
-      userColor,
-      moment,
-      pov,
-      coachMark: ply.mark,
-    });
     const phaseThemes = metrics.themesByPhase[phase] || [];
     const liveSituations = detectSituations({
       fen: ply.fenAfter,
@@ -1966,185 +2001,106 @@ export async function analyzeSelectedGame(options: {
       pawnStormTempo: stormTempo,
       situations: planSituations,
     });
-    const noteWorthy = shouldComposeNote({
-      perspective: "user",
-      deltaCp: ply.deltaCp,
-      playedBest,
-      moment,
-      structure,
-      errorKind,
-      mark: ply.mark,
-      ply: ply.ply,
-      userPlyCount: Math.ceil(ply.ply / 2),
-    });
-    const metricTipOk = shouldAttachMetricTip({
-      phase,
-      moment,
-      mark: ply.mark,
-      deltaCp: ply.deltaCp,
-      phaseThemes,
-      structureThemeUsed,
-      request: noteRequest,
-    });
-    if (!metricTipOk) continue;
-
-    const metricsThemes = [
-      ...metrics.themesByPhase[phase],
-      ...(moment || ply.deltaCp >= 50 ? metrics.globalThemes : []),
-    ];
-    const themes = expandCoachThemes({
-      structure,
-      openingTags,
-      phase,
-      deltaCp: ply.deltaCp,
-      playedBest,
-      metricsThemes,
-      moment,
-      perspective: "user",
-      errorKind,
-      noteWorthy: noteWorthy || metricTipOk,
-      pov,
-      fenBefore: ply.fenBefore,
-      playedSan: ply.san,
-      bestSan: ply.bestSan,
-      usedTips,
-    });
-    void noteWorthy;
-    // Always-attach coach calls (praise / bad / structural / fixed) skip phase cap.
-    const alwaysCall =
-      (noteRequest != null && requestAlwaysAttaches(noteRequest.kind)) ||
-      isFixedCheckpointMoment(moment);
-    if (
-      !alwaysCall &&
-      phaseNoteCounts[phase] >= PHASE_NOTE_LIMITS[phase]
-    ) {
-      continue;
-    }
-
-    const tip = pickMetricTip({
-      entries: coachPack.entries,
-      byKey: packByKey,
-      metrics,
-      phase,
-      mark: ply.mark,
-      deltaCp: ply.deltaCp,
-      moment,
-      openingKeyId,
-      eco: options.eco,
-      opening: options.opening,
-      themes,
-      excludeNoteIds: usedNoteIds,
-      structureThemeUsed,
-      allowStructureQuiet: false,
-      request: noteRequest,
-      userColor,
-      priorTopics: openingPriorTopics,
-      gamePlan,
-      onOpeningTipUsed: (meta) => {
-        openingPriorTopics = mergeOpeningTipPrior(openingPriorTopics, meta);
-        gamePlan = mergeOpeningPlanKeys(
-          gamePlan,
-          meta.softKeys,
-          openingKeyId
-        );
-      },
-    });
-    if (!tip) continue;
-    if (tip.keyIds?.length || tip.keyId) {
-      gamePlan = markPlanKeysTaught(
-        gamePlan,
-        tip.keyIds?.length ? tip.keyIds : tip.keyId ? [tip.keyId] : []
+    if (noteRequest?.tacticalFact?.kind) {
+      const phase2 = phaseForPly(
+        ply.ply,
+        pieceCount,
+        metrics.phaseBounds,
+        moment?.structuralKind,
+        {
+          fen: ply.fenAfter,
+          dropCp: ply.deltaCp,
+          tacticalKind: noteRequest.tacticalFact.kind,
+        }
       );
-    }
-    if (moment) {
-      const ids =
-        tip.keyIds?.length
-          ? tip.keyIds.slice(0, 3)
-          : tip.keyId
-            ? [tip.keyId]
-            : [];
-      const metaStamp = coachRequestMetaInputs(noteRequest);
-      if (ids.length || Object.keys(metaStamp).length) {
-        moment.inputs = {
-          ...(moment.inputs || {}),
-          ...metaStamp,
-          ...(ids.length
-            ? {
-                key_id: ids[0]!,
-                key_ids: ids.join(","),
-                game_plan: formatGamePlanShort(gamePlan) || null,
-              }
-            : {
-                game_plan: formatGamePlanShort(gamePlan) || null,
-              }),
-        };
+      if (phase2 !== phase) {
+        phase = phase2;
+        noteRequest.phase = phase2;
       }
     }
-    const tipHasSquares = /\b[a-h][1-8]\b/i.test(tip.text || "");
-    const alwaysAttach =
-      noteRequest != null && requestAlwaysAttaches(noteRequest.kind);
-    const rawNote = (tip.text || "").replace(/\s+/g, " ").trim();
-    if (!rawNote || isCorruptPackNote(rawNote)) continue;
-    const note = alwaysAttach
-      ? rawNote
-      : acceptKeyNote(rawNote, usedTips, {
-          themes,
-          fenBefore: tipHasSquares ? ply.fenBefore : undefined,
-          san: tipHasSquares ? ply.san : undefined,
-          bestSan: tipHasSquares ? ply.bestSan : undefined,
-          bestPvSan: tipHasSquares ? ply.bestPvSan : undefined,
-          userColor,
-          phase,
-          noteId: tip.noteId,
-        });
-    if (!note) continue;
-    tip.text = note;
-    ply.note = note;
-    const weightTop = rankMetricNoteWeights({
-      phase,
-      themes: themesForPly({
-        metrics,
-        phase,
-        moment,
-        deltaCp: ply.deltaCp,
-        request: noteRequest,
-      }),
+    if (noteRequest) {
+      const prePickMeta = coachRequestMetaInputs(noteRequest);
+      if (Object.keys(prePickMeta).length) {
+        noteRequest.inputs = {
+          ...(noteRequest.inputs || {}),
+          ...prePickMeta,
+        };
+        if (moment) {
+          moment.inputs = {
+            ...(moment.inputs || {}),
+            ...prePickMeta,
+          };
+        }
+      }
+    }
+    const praiseMark =
+      typeof moment?.inputs?.praise_mark === "string"
+        ? String(moment.inputs.praise_mark)
+        : isPraiseMark(ply.mark)
+          ? String(ply.mark)
+          : null;
+    const primaryField =
+      typeof noteRequest?.inputs?.primary_field === "string"
+        ? String(noteRequest.inputs.primary_field)
+        : null;
+    const attached = attachCoachComment({
       mark: ply.mark,
-      deltaCp: ply.deltaCp,
-      moment,
-      openingKeyId,
-      eco: options.eco,
-      opening: options.opening,
-      limit: 8,
-      request: noteRequest,
-      gamePlan,
-    }).map((w) => ({
-      keyId: w.keyId,
-      weight: w.weight,
-      formatted: formatWeightBreakdown(w),
-    }));
+      dropCp: ply.deltaCp,
+      tacticalFact: noteRequest?.tacticalFact || null,
+      structuralKind: moment?.structuralKind || noteRequest?.structuralKind || null,
+      praiseMark,
+      primaryField,
+      ply: ply.ply,
+      fen: ply.fenBefore || ply.fenAfter,
+      userColor,
+      bestSan: ply.bestSan,
+      playedSan: ply.san,
+      notes: notesSchema,
+      silence: commentSilence,
+    });
+    if (!attached) continue;
+    gamePlan = markPlanKeysTaught(gamePlan, [attached.note.keyId]);
+    if (moment) {
+      moment.inputs = {
+        ...(moment.inputs || {}),
+        key_id: attached.note.keyId,
+        key_ids: attached.note.keyId,
+        game_plan: formatGamePlanShort(gamePlan) || null,
+      };
+    }
+    ply.note = attached.text;
     ply.noteRefs = buildCommentRefs({
-      tipText: note,
-      keyIds: tip.keyIds || (tip.keyId ? [tip.keyId] : []),
-      tipMeta: tip.tipMeta || null,
-      weightTop,
-      softKeysPool: tip.tipMeta?.softKeys || tip.keyIds || [],
+      tipText: attached.text,
+      keyIds: [attached.note.keyId],
+      tipMeta: {
+        softKeys: [attached.note.keyId],
+        metrics: [],
+        clauses: [],
+        topics: [attached.event.kind],
+      },
+      weightTop: [],
+      softKeysPool: [attached.note.keyId],
       inputs: {
         ...(moment?.inputs || {}),
         ...(noteRequest?.inputs || {}),
       },
       situations: noteRequest?.situations || null,
       tacticalFact: noteRequest?.tacticalFact || null,
-      primaryField:
-        typeof noteRequest?.inputs?.primary_field === "string"
-          ? noteRequest.inputs.primary_field
-          : null,
-      primarySoftKeys: tip.tipMeta?.softKeys || null,
+      primaryField,
+      primarySoftKeys: [attached.note.keyId],
     });
-    usedKeyTips.push(tip);
-    phaseNoteCounts[phase] += 1;
-    if (tip.noteId) usedNoteIds.add(tip.noteId);
-    selectedNotes.push(note);
+    usedKeyTips.push({
+      keyId: attached.note.keyId,
+      keyIds: [attached.note.keyId],
+      keyType: attached.note.keyId.split(".")[0] || "motif",
+      label: attached.note.keyId,
+      text: attached.text,
+      games: [],
+      score: attached.event.tier,
+      noteId: attached.note.id,
+      phase,
+    });
+    selectedNotes.push(attached.text);
     for (const t of structure) structureThemeUsed.add(t);
   }
 
@@ -2224,10 +2180,11 @@ export async function analyzeSelectedGame(options: {
 
 export function stampAccuracyMarks(plies: GameCoachPly[]): GameCoachPly[] {
   let changed = false;
-  const next = plies.map((ply) => {
+  const next = plies.map((ply, i) => {
     if (ply.mark != null) return ply;
     if (ply.evalBeforeCp == null || ply.evalAfterCp == null) return ply;
-    const playedBest = Boolean(ply.bestSan && ply.bestSan === ply.san);
+    const playedBest = sameMove(ply.fenBefore, ply.san, ply.bestSan);
+    const prev = i > 0 ? plies[i - 1] : null;
     const mark = classifyCoachMark({
       side: ply.side,
       evalBeforeCp: ply.evalBeforeCp,
@@ -2236,6 +2193,7 @@ export function stampAccuracyMarks(plies: GameCoachPly[]): GameCoachPly[] {
       lines: ply.lines,
       fenBefore: ply.fenBefore,
       playedSan: ply.san,
+      prevCaptureTo: prev ? captureDest(prev.fenBefore, prev.san) : null,
     });
     if (!mark) return ply;
     changed = true;

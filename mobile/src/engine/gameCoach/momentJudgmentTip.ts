@@ -15,6 +15,7 @@ import type { OpeningTipPrior } from "./openingJudgmentTip";
 import type { DerivedCoachNote } from "./derivedCoachPack";
 import {
   clauseFromPackNote,
+  formatTacticalSlotComment,
   lessonFromPackNote,
   planFromPackNote,
 } from "./packNoteContent";
@@ -433,13 +434,38 @@ export function composeMomentJudgmentTip(args: {
       );
 
   const tact = tacticalDiagnosis(args.fact);
+  const bestSan =
+    args.moment?.bestSan ||
+    args.explained?.primaryText?.match(/\bPrefer\s+(\S+)/i)?.[1] ||
+    null;
+  if (
+    args.fact?.kind &&
+    args.kind === "bad_move" &&
+    tone === "critique"
+  ) {
+    const slotComment = formatTacticalSlotComment({
+      note: args.packNote,
+      bestSan: bestSan || args.engineLineSans?.[0] || null,
+    });
+    if (slotComment) {
+      return {
+        text: slotComment,
+        softKeys: [
+          ...new Set(
+            [args.packKeyId, args.fact.kind ? `motif.${args.fact.kind}` : ""]
+              .filter(Boolean)
+          ),
+        ].slice(0, 6),
+        metrics: [],
+        clauses: [slotComment],
+        topics: [`tone:${tone}`, "tactical-slots"],
+      };
+    }
+  }
   const engineStory = narrateEngineLine({
     fact: args.fact,
     engineLineSans: args.engineLineSans,
-    bestSan:
-      args.moment?.bestSan ||
-      args.explained?.primaryText?.match(/\bPrefer\s+(\S+)/i)?.[1] ||
-      null,
+    bestSan,
     explained: args.explained,
     factors: args.coordinate?.factors,
     phase: args.coordinate?.phase,

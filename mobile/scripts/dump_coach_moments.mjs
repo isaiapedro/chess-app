@@ -2,8 +2,8 @@
  * Dump coach-call moment inputs + generated tip text for one annotated game.
  *
  * Prefer annotate JSON (samples/metrics_all.json). Optional matching PGN for
- * notePick / noteRequest comment bits. Regenerates soft keys + pack tip via
- * buildCoachNoteRequest / softKeysForNoteRequest / pickMetricTip, with live
+ * notePick / noteRequest comment bits. Regenerates comments via
+ * attachCoachComment (classifyMoment → selectNote → interpolate), with live
  * situations / tacticalFact / gamePlan (same path as analyzeGame tip loop).
  * Passes annotate JSON `engine[].lines` so MultiPV gap + motif re-detect.
  * Rebuilds MG centre stamp (prefer_center_strike / fluidity / exposure / wing).
@@ -14,7 +14,9 @@
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --json
  *   npx --yes tsx scripts/dump_coach_moments.mjs --pgn ../samples/metrics_all.pgn
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --comment-refs
- *   # --comment-refs: top pack choices + only coach-moment fields the tip references
+ *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --ignore-silence
+ *   # --comment-refs: note id + only coach-moment fields the tip text references
+ *   # --ignore-silence: skip 2-rule silence manager (debug)
  */
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -22,14 +24,14 @@ import { fileURLToPath } from "node:url";
 
 import {
   buildCoachNoteRequest,
+  coachRequestMetaInputs,
   formatCoachNoteRequest,
 } from "../src/engine/gameCoach/coachNoteRequest.ts";
 import { softKeysForNoteRequest } from "../src/engine/gameCoach/metricNoteKeys.ts";
-import { pickMetricTip } from "../src/engine/gameCoach/metricNotes.ts";
+import { attachCoachComment } from "../src/engine/gameCoach/attachCoachComment.ts";
+import { CoachSilenceManager } from "../src/engine/gameCoach/coachSilence.ts";
+import { loadNotesSchema } from "../src/engine/gameCoach/loadNotesSchema.ts";
 import {
-  explainAttachMetricTip,
-  formatWeightBreakdown,
-  rankMetricNoteWeights,
   themesForPly,
 } from "../src/engine/gameCoach/metricNoteWeights.ts";
 import {
@@ -40,7 +42,6 @@ import {
   buildOpeningPeerSignals,
 } from "../src/engine/gameCoach/openingCoachInputs.ts";
 import { buildMiddlegamePeerSignals } from "../src/engine/gameCoach/middlegameCoachInputs.ts";
-import { mergeOpeningTipPrior } from "../src/engine/gameCoach/openingJudgmentTip.ts";
 import { defaultBundledPeerContext } from "../src/engine/gameCoach/openingCoachPeers.ts";
 import { resolveOpeningPackKey } from "../src/engine/gameCoach/structureDetect.ts";
 import {
@@ -48,7 +49,6 @@ import {
   emptyGamePlanState,
   formatGamePlanShort,
   markPlanKeysTaught,
-  mergeOpeningPlanKeys,
 } from "../src/engine/gameCoach/gamePlanState.ts";
 import {
   formatSituationRolesShort,
@@ -75,18 +75,28 @@ const DEFAULT_JSON = join(CHESS_ROOT, "samples/metrics_all.json");
 const DEFAULT_PGN = join(CHESS_ROOT, "samples/metrics_all.pgn");
 
 function usage() {
-  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json] [--comment-refs]
-  --comment-refs  top pack choices + only coach-moment refs used by the tip
+  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json] [--comment-refs] [--ignore-silence]
+  --comment-refs  note id + only coach-moment refs used by the tip
+  --ignore-silence  skip ply-gap and unique-key silence
   Default annotate JSON: ${DEFAULT_JSON}`);
 }
 
 function parseArgs(argv) {
-  const out = { jsonPath: null, pgnPath: null, asJson: false, commentRefs: false };
+  const out = {
+    jsonPath: null,
+    pgnPath: null,
+    asJson: false,
+    commentRefs: false,
+    ignoreSilence: false,
+  };
   const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--json") out.asJson = true;
     else if (a === "--comment-refs") out.commentRefs = true;
+    else if (a === "--ignore-silence" || a === "--ignore-phase-limits") {
+      out.ignoreSilence = true;
+    }
     else if (a === "--pgn") {
       out.pgnPath = argv[++i];
     } else if (a === "-h" || a === "--help") {
@@ -151,11 +161,15 @@ function parseScalar(s) {
   return Number.isFinite(n) ? n : s;
 }
 
-function phaseForPly(ply, coach, structuralKind) {
+function phaseForPly(ply, coach, structuralKind, hints) {
   const bounds = coach?.phaseBounds || {};
+  const fen = hints?.fen ?? null;
+  const pieceCount = fen
+    ? String(fen).split(" ")[0].replace(/\d/g, "").length
+    : 32;
   return phaseForCoachMoment({
     ply1: ply,
-    pieceCount: 32,
+    pieceCount,
     bounds: {
       middlegameStartPly0:
         bounds.middlegameStartPly0 ??
@@ -169,12 +183,15 @@ function phaseForPly(ply, coach, structuralKind) {
         null,
     },
     structuralKind,
+    fen,
+    tacticalKind: hints?.tacticalKind ?? null,
+    dropCp: hints?.dropCp,
   });
 }
 
 function markFromMoment(moment) {
   const praise = moment?.inputs?.praise_mark;
-  if (praise === "brilliant") return "brilliant";
+  if (praise === "brilliant" || praise === "excellent") return praise;
   const s = moment?.severity;
   if (
     s === "blunder" ||
@@ -208,7 +225,7 @@ function injectMissingBrilliantMoments(args) {
     const isUser = userColor === "white" ? whiteMove : !whiteMove;
     if (!isUser) continue;
     const existing = byPly[ply1] || byPly[String(ply1)] || null;
-    if (markFromMoment(existing) === "brilliant") continue;
+    if (markFromMoment(existing) === "brilliant" || markFromMoment(existing) === "excellent") continue;
     const row = engineRowAtPly(engineRows, ply1);
     const next = engineRowAtPly(engineRows, ply1 + 1);
     if (!row?.fen) continue;
@@ -226,10 +243,10 @@ function injectMissingBrilliantMoments(args) {
       fenBefore: row.fen,
       playedSan,
     });
-    if (mark !== "brilliant") continue;
+    if (mark !== "brilliant" && mark !== "excellent") continue;
     const praiseInputs = {
       ...(existing?.inputs || {}),
-      praise_mark: "brilliant",
+      praise_mark: mark,
     };
     if (existing) {
       existing.inputs = praiseInputs;
@@ -239,7 +256,7 @@ function injectMissingBrilliantMoments(args) {
       ply: ply1,
       moveNumber: Math.floor(i / 2) + 1,
       severity: null,
-      dropCp: 35,
+      dropCp: mark === "brilliant" ? 35 : 28,
       playedSan,
       bestSan: pv1 || playedSan,
       fen: row.fen,
@@ -274,17 +291,6 @@ function reconstructDumpMark(args) {
     fenBefore: row.fen,
     playedSan,
   });
-}
-
-function loadPackEntries() {
-  const packPath = join(MOBILE, "assets/coach/mobile_coach_pack.json");
-  const pack = JSON.parse(readFileSync(packPath, "utf8"));
-  const raw = Array.isArray(pack?.entries) ? pack.entries : [];
-  return raw.filter((e) =>
-    /^(structure|opening|endgame|imbalance|positional|piece|motif|attack|methodology)\./.test(
-      e.keyId || ""
-    )
-  );
 }
 
 function engineLinesForMoment(data, moment) {
@@ -331,11 +337,13 @@ function extractAnnotateBits(comment) {
   const noteRequest = comment.match(/noteRequest=([^\s]+(?:\s(?!mark=|phase=|best=|moment=|noteAttach|notePick|themes=|candidate=|deltaCp=|wpDrop=|missedAfter)[^\s]+)*)/);
   const noteAttach = comment.match(/noteAttach=([^\s]+)/);
   const themes = comment.match(/themes=([^\s]+)/);
+  const tipComment = comment.match(/comment=([^]+?)(?=\s+noteAlt\s|\s+noteSkip\s|\s+noteId=|\s+metrics\s|$)/);
   return {
     notePick: notePick?.[1]?.trim() || null,
     noteRequest: noteRequest?.[1]?.trim() || null,
     noteAttach: noteAttach?.[1] || null,
     themes: themes?.[1] || null,
+    comment: tipComment?.[1]?.trim() || null,
   };
 }
 
@@ -465,7 +473,7 @@ function dumpMomentCommentRefs(row) {
   lines.push(
     `played: ${moment.playedSan || "—"}  best: ${moment.bestSan || "—"}`
   );
-  if (!row.attachLive?.attach || !tip) {
+  if (!tip) {
     lines.push("generated comment: (none)");
     lines.push("");
     return lines.join("\n");
@@ -577,6 +585,7 @@ function dumpMoment(row) {
       "tactical_forcing_ratio",
       "key_id",
       "key_ids",
+      "features",
     ]);
     const metricSnap = keys.filter(
       (k) =>
@@ -590,6 +599,7 @@ function dumpMoment(row) {
         k === "situations" ||
         k === "situation_roles" ||
         k === "game_plan" ||
+        k === "features" ||
         k.startsWith("tactical_")
     );
     if (sitKeys.length) {
@@ -737,23 +747,16 @@ function dumpMoment(row) {
     );
   }
   lines.push(`softKeys: ${softKeys.length ? softKeys.join(", ") : "(none)"}`);
-  if (row.weightTop?.length) {
-    lines.push("weights (top):");
-    for (const w of row.weightTop) {
-      lines.push(`  ${formatWeightBreakdown(w)}`);
-    }
-  }
-  if (row.attachLive) {
-    lines.push(
-      `attach(live): ${row.attachLive.attach ? "yes" : "no"}` +
-        (row.attachLive.reasons.length
-          ? `(${row.attachLive.reasons.join("|")})`
-          : "(noRule)")
-    );
+  if (row.eventKind) {
+    lines.push(`event: ${row.eventKind} note=${row.generatedComment?.noteId || "—"}`);
   }
   if (annotate?.noteAttach) lines.push(`annotate.noteAttach: ${annotate.noteAttach}`);
   if (annotate?.notePick) lines.push(`annotate.notePick: ${annotate.notePick}`);
-  if (row.attachLive?.attach && tip) {
+  if (annotate?.comment) lines.push(`annotate.comment: ${annotate.comment}`);
+  if (row.silenceReason) {
+    lines.push(`silenced: ${row.silenceReason}`);
+  }
+  if (tip) {
     lines.push("─ generated comment ─");
     const ids =
       tip.keyIds?.length
@@ -829,7 +832,7 @@ function main() {
   const timeControl = data.timeControl || pgnHeader("TimeControl") || null;
   const speed = data.speed || null;
 
-  const entries = loadPackEntries();
+  const notesSchema = loadNotesSchema();
   const openingKeyId =
     data.openingKeyId ||
     resolveOpeningPackKey(data.eco || null, data.openingName || null);
@@ -871,11 +874,17 @@ function main() {
     (a, b) => (a.ply || 0) - (b.ply || 0)
   );
   const rows = [];
-  let openingPriorTopics = null;
   let gamePlan = emptyGamePlanState(openingKeyId);
   let stickySituations = [];
+  const commentSilence = new CoachSilenceManager({
+    ignoreSilence: args.ignoreSilence,
+  });
   for (const moment of moments) {
-    const phase = phaseForPly(moment.ply, coach, moment.structuralKind);
+    let phase = phaseForPly(moment.ply, coach, moment.structuralKind, {
+      fen: moment.fen || moment.inputs?.fen_after || null,
+      dropCp: moment.dropCp || 0,
+      tacticalKind: moment.inputs?.tactical_kind || null,
+    });
     const mark = reconstructDumpMark({
       moment,
       engineRows,
@@ -923,6 +932,27 @@ function main() {
     if (request) {
       request = { ...request, situations: stickySituations };
     }
+    if (request?.tacticalFact?.kind) {
+      const phase2 = phaseForPly(moment.ply, coach, moment.structuralKind, {
+        fen: moment.fen || moment.inputs?.fen_after || null,
+        dropCp: moment.dropCp || 0,
+        tacticalKind: request.tacticalFact.kind,
+      });
+      if (phase2 !== phase) {
+        phase = phase2;
+        request = { ...request, phase: phase2 };
+      }
+    }
+    if (request) {
+      const prePickMeta = coachRequestMetaInputs(request);
+      if (Object.keys(prePickMeta).length) {
+        request = {
+          ...request,
+          inputs: { ...(request.inputs || {}), ...prePickMeta },
+        };
+        moment.inputs = { ...(moment.inputs || {}), ...prePickMeta };
+      }
+    }
 
     gamePlan = advanceGamePlan(gamePlan, {
       situations: stickySituations,
@@ -950,6 +980,7 @@ function main() {
       situations: request?.situations,
       planKeys: gamePlan.stickyKeys,
       tacticalFact: request?.tacticalFact,
+      deltaCp: moment.dropCp || 0,
     });
 
     const themes = themesForPly({
@@ -976,65 +1007,61 @@ function main() {
           })
         : null;
 
-    const attachLive = explainAttachMetricTip({
-      phase,
-      moment,
+    const attached = attachCoachComment({
       mark,
-      deltaCp: moment.dropCp || 0,
-      phaseThemes: coach.themesByPhase?.[phase] || [],
-      request,
+      dropCp: moment.dropCp || 0,
+      tacticalFact: request?.tacticalFact || null,
+      structuralKind: moment.structuralKind || request?.structuralKind || null,
+      praiseMark:
+        typeof moment.inputs?.praise_mark === "string"
+          ? moment.inputs.praise_mark
+          : mark === "brilliant" || mark === "excellent"
+            ? mark
+            : null,
+      primaryField:
+        typeof request?.inputs?.primary_field === "string"
+          ? request.inputs.primary_field
+          : null,
+      ply: moment.ply,
+      fen: moment.fen || "",
+      userColor,
+      bestSan: moment.bestSan,
+      playedSan: moment.playedSan,
+      notes: notesSchema,
+      silence: commentSilence,
     });
 
-    const weightTop =
-      request && attachLive.attach
-        ? rankMetricNoteWeights({
-            phase,
-            themes,
-            mark,
-            deltaCp: moment.dropCp || 0,
-            moment,
-            openingKeyId,
-            eco: data.eco || null,
-            opening: data.openingName || null,
-            limit: 8,
-            request,
-            gamePlan,
-          })
-        : [];
-
-    const tip =
-      request && attachLive.attach
-        ? pickMetricTip({
-            entries,
-            metrics: coach,
-            phase,
-            mark,
-            deltaCp: moment.dropCp || 0,
-            moment,
-            openingKeyId,
-            eco: data.eco || null,
-            opening: data.openingName || null,
-            themes,
-            request,
-            userColor,
-            priorTopics: openingPriorTopics,
-            gamePlan,
-            onOpeningTipUsed: (meta) => {
-              openingPriorTopics = mergeOpeningTipPrior(openingPriorTopics, meta);
-              gamePlan = mergeOpeningPlanKeys(
-                gamePlan,
-                meta.softKeys,
-                openingKeyId
-              );
-            },
-          })
-        : null;
-
-    if (attachLive.attach && (tip?.keyIds?.length || tip?.keyId)) {
-      gamePlan = markPlanKeysTaught(
-        gamePlan,
-        tip.keyIds?.length ? tip.keyIds : tip.keyId ? [tip.keyId] : []
-      );
+    const tip = attached
+      ? {
+          text: attached.text,
+          keyId: attached.note.keyId,
+          keyIds: [attached.note.keyId],
+          noteId: attached.note.id,
+          score: attached.event.tier,
+          tipMeta: {
+            softKeys: [attached.note.keyId],
+            metrics: [],
+            clauses: [],
+            topics: [attached.event.kind],
+          },
+        }
+      : null;
+    const silenceReason = attached ? null : "muted";
+    const attachLive = attached
+      ? { attach: true, reasons: [attached.event.kind] }
+      : { attach: false, reasons: ["muted"] };
+    const weightTop = attached
+      ? [
+          {
+            keyId: attached.note.keyId,
+            weight: attached.event.tier,
+            parts: [{ label: attached.event.kind }],
+            formatted: `${attached.event.kind} ${attached.note.id}`,
+          },
+        ]
+      : [];
+    if (tip?.keyId) {
+      gamePlan = markPlanKeysTaught(gamePlan, [tip.keyId]);
     }
 
     const annotate = extractAnnotateBits(pgnComments.get(moment.ply) || "");
@@ -1066,6 +1093,7 @@ function main() {
         "mg_structure_type",
         "engine_line_plan",
         "strategic_summary",
+        "features",
       ]) {
         if (request.inputs[k] != null && request.inputs[k] !== "") {
           stampedInputs[k] = request.inputs[k];
@@ -1115,8 +1143,9 @@ function main() {
         keyId: w.keyId,
         weight: w.weight,
         parts: w.parts,
-        formatted: formatWeightBreakdown(w),
+        formatted: w.formatted,
       })),
+      eventKind: attached?.event.kind || null,
       noteRequest: request
         ? {
             kind: request.kind,
@@ -1149,6 +1178,7 @@ function main() {
             tipMeta: tip.tipMeta || null,
           }
         : null,
+      silenceReason,
       annotate,
       moment,
       request,
@@ -1174,6 +1204,8 @@ function main() {
         generatedComment: r.generatedComment,
         commentRefs: r.commentRefs,
         attachLive: r.attachLive,
+        eventKind: r.eventKind || null,
+        silenceReason: r.silenceReason || null,
       };
       if (args.commentRefs) {
         return {

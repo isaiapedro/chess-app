@@ -72,6 +72,28 @@ import {
   multipvWpGap,
 } from "../src/engine/gameCoach/tacticSharpness.ts";
 import { composeMomentJudgmentTip } from "../src/engine/gameCoach/momentJudgmentTip.ts";
+import { classifyMoment } from "../src/engine/gameCoach/coachEvent.ts";
+import { attachCoachComment } from "../src/engine/gameCoach/attachCoachComment.ts";
+import {
+  CoachSilenceManager,
+  COMMENT_GAP_PLIES,
+  COMMENT_EMERGENCY_CP,
+} from "../src/engine/gameCoach/coachSilence.ts";
+import {
+  selectNote,
+  buildLiveFacts,
+  kingIsCastled,
+} from "../src/engine/gameCoach/noteGuards.ts";
+import { loadNotesSchema } from "../src/engine/gameCoach/loadNotesSchema.ts";
+import {
+  FEATURE_POLARITY_MATCH,
+  METRIC_POLARITY_MATCH,
+  UNCONDITIONED_ANY,
+  formatTacticalSlotComment,
+  packConditionFeatures,
+  scoreNoteConditions,
+} from "../src/engine/gameCoach/packNoteContent.ts";
+import { isCoachEndgame } from "../src/engine/endgamePhase.ts";
 import {
   advanceGamePlan,
   emptyGamePlanState,
@@ -961,6 +983,17 @@ function play(fen, san) {
       bestSan: "Ke2",
     }),
     "already-mating position is terminal noise"
+  );
+  assert(
+    !shouldDropNoiseCoachMoment({
+      source: "live",
+      severity: "missed",
+      evalBeforeCp: 98000,
+      evalAfterCp: 200,
+      playedSan: "Kd2",
+      bestSan: "Re8+",
+    }),
+    "lost mate is a missed opportunity, not noise"
   );
 }
 
@@ -2050,5 +2083,461 @@ function play(fen, san) {
   assert(!/dragon/i.test(pinTip.text), `pin tip skips Dragon: ${pinTip.text}`);
   assert(/pin/i.test(pinTip.text), `pin tip names pin: ${pinTip.text}`);
 }
+
+{
+  const startFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  assert(
+    isCoachEndgame({ fen: startFen }) === false,
+    "starting material is not coach endgame"
+  );
+  const rookEnding = "8/8/8/8/8/8/4k3/R3K3 w - - 0 1";
+  assert(
+    isCoachEndgame({ fen: rookEnding }) === true,
+    "both sides <=14 with no tactic is coach endgame"
+  );
+  assert(
+    isCoachEndgame({ fen: rookEnding, tacticalKind: "trapped_piece" }) === false,
+    "trap overrides low-material endgame"
+  );
+  assert(
+    isCoachEndgame({ fen: rookEnding, dropCp: 200 }) === false,
+    "high drop overrides low-material endgame"
+  );
+  const heavy = "4k3/8/8/8/8/8/8/RQNBK3 w - - 0 1";
+  assert(
+    isCoachEndgame({ fen: heavy }) === false,
+    "15+ points on a side is not coach endgame"
+  );
+}
+
+{
+  const trapFact = {
+    kind: "trapped_piece",
+    selfInflicted: true,
+    pieceLabel: "knight",
+    trapSquare: "d2",
+    captureSan: "Nc4",
+    takenNext: true,
+    mateIn: null,
+  };
+  const egWeight = weightKeyBreakdown({
+    keyId: "endgame.strategic.active_king",
+    phase: "endgame",
+    themes: ["endgame.strategic.active_king"],
+    mark: "mistake",
+    deltaCp: 220,
+    request: {
+      kind: "bad_move",
+      ply: 37,
+      phase: "endgame",
+      mark: "mistake",
+      moment: null,
+      deltaCp: 220,
+      playedMetricDelta: [],
+      playedLineMetricDelta: [],
+      playedLineSans: ["Nd2"],
+      engineLineMetricDelta: [],
+      engineLineSans: ["Re1"],
+      engineVsPlayedMetricDelta: [],
+      tacticalFact: trapFact,
+    },
+  });
+  assert(
+    egWeight.weight === -999 &&
+      egWeight.parts.some((p) => p.label === "tacticalSuppressEg"),
+    `active_king must be hard-suppressed on trap, got ${egWeight.weight}`
+  );
+  const trapWeight = weightKeyBreakdown({
+    keyId: "motif.trapped_piece",
+    phase: "endgame",
+    themes: [],
+    mark: "mistake",
+    deltaCp: 220,
+    request: {
+      kind: "bad_move",
+      ply: 37,
+      phase: "endgame",
+      mark: "mistake",
+      moment: null,
+      deltaCp: 220,
+      playedMetricDelta: [],
+      playedLineMetricDelta: [],
+      playedLineSans: ["Nd2"],
+      engineLineMetricDelta: [],
+      engineLineSans: ["Re1"],
+      engineVsPlayedMetricDelta: [],
+      tacticalFact: trapFact,
+    },
+  });
+  assert(
+    trapWeight.weight > 0,
+    `trapped_piece stays high, got ${trapWeight.weight}`
+  );
+  const posWeight = weightKeyBreakdown({
+    keyId: "positional.prophylaxis",
+    phase: "endgame",
+    themes: ["positional.prophylaxis"],
+    mark: "mistake",
+    deltaCp: 220,
+    request: {
+      kind: "bad_move",
+      ply: 37,
+      phase: "endgame",
+      mark: "mistake",
+      moment: null,
+      deltaCp: 220,
+      playedMetricDelta: [],
+      playedLineMetricDelta: [],
+      playedLineSans: ["Nd2"],
+      engineLineMetricDelta: [],
+      engineLineSans: ["Re1"],
+      engineVsPlayedMetricDelta: [],
+      tacticalFact: trapFact,
+    },
+  });
+  assert(
+    posWeight.weight === -999 &&
+      posWeight.parts.some((p) => p.label === "tacticalSuppressGeneric"),
+    `positional.* must be hard-suppressed on trap, got ${posWeight.weight}`
+  );
+
+  const feats = packConditionFeatures({
+    inputs: {
+      tactical_self_inflicted: 1,
+      tactical_kind: "trapped_piece",
+      uncastled: true,
+    },
+    tacticalFact: trapFact,
+  });
+  assert(
+    feats.includes("self-trapped-piece") &&
+      feats.includes("zero-safe-squares") &&
+      feats.includes("uncastled-king"),
+    `runtime features missing, got ${feats.join(",")}`
+  );
+
+  const targeted = scoreNoteConditions(
+    {
+      id: "motif.trapped_piece#2",
+      text: "do not push a piece into a pocket",
+      book: "",
+      themes: [],
+      ecoHints: [],
+      conditions: [
+        { feature: "self-trapped-piece", polarity: "bad" },
+        { softKey: "motif.trapped_piece", polarity: "bad" },
+      ],
+    },
+    {
+      softKeys: ["motif.trapped_piece"],
+      features: ["self-trapped-piece"],
+      judgment: "bad",
+    }
+  );
+  const genericAny = scoreNoteConditions(
+    {
+      id: "endgame.strategic.active_king#2",
+      text: "activate the king",
+      book: "",
+      themes: [],
+      ecoHints: [],
+      conditions: [{ polarity: "any" }],
+    },
+    {
+      softKeys: ["motif.trapped_piece"],
+      features: ["self-trapped-piece"],
+      judgment: "bad",
+    }
+  );
+  assert(
+    FEATURE_POLARITY_MATCH === 30,
+    `FEATURE_POLARITY_MATCH must be 30, got ${FEATURE_POLARITY_MATCH}`
+  );
+  assert(
+    targeted >= FEATURE_POLARITY_MATCH && genericAny <= UNCONDITIONED_ANY,
+    `feature+polarity ${targeted} must beat polarity any ${genericAny}`
+  );
+  assert(
+    genericAny < METRIC_POLARITY_MATCH,
+    `polarity any ${genericAny} must stay below metric polarity match`
+  );
+
+  const trapNote = {
+    id: "motif.trapped_piece#2",
+    text: "Do not push your own piece into a pocket with zero safe replies. Seek a retreat before the net closes.",
+    book: "",
+    themes: ["motif.trapped_piece"],
+    ecoHints: [],
+    specificity: 2,
+    slots: {
+      attention: "your last move left a piece with no safe reply",
+      lesson: "do not push a piece into a pocket with zero safe escapes",
+    },
+    conditions: [
+      { softKey: "motif.trapped_piece", polarity: "bad" },
+      { feature: "self-trapped-piece", polarity: "bad" },
+    ],
+  };
+  const notes = loadNotesSchema();
+  const eventTrap = classifyMoment({
+    mark: "blunder",
+    dropCp: 220,
+    tacticalFact: trapFact,
+  });
+  assert(eventTrap?.kind === "tactical_blunder", "trap must classify as tactical_blunder");
+  const liveTrap = buildLiveFacts({
+    ply: 37,
+    fen: "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1",
+    userColor: "white",
+    dropCp: 220,
+    bestSan: "Re1",
+    playedSan: "Nd2",
+    tacticalFact: trapFact,
+  });
+  const picked = selectNote(eventTrap, liveTrap, notes);
+  assert(picked, "self-inflicted trap must pick a note");
+  assert(
+    picked.id === "motif.trapped_piece#self_trapped",
+    `trap note must win on guard count, got ${picked.id}`
+  );
+  assert(
+    picked.keyId === "motif.trapped_piece",
+    `winning keyId must stay trapped_piece, got ${picked.keyId}`
+  );
+
+  const slotText = formatTacticalSlotComment({
+    note: trapNote,
+    bestSan: "Re1",
+  });
+  assert(
+    slotText && /Best was Re1/i.test(slotText),
+    `slot render must include Best was SAN, got ${slotText}`
+  );
+  const slotTip = composeMomentJudgmentTip({
+    mark: "mistake",
+    deltaCp: 220,
+    kind: "bad_move",
+    moment: { playedSan: "Nd2", bestSan: "Re1" },
+    fact: trapFact,
+    packNote: trapNote,
+    packKeyId: "motif.trapped_piece",
+  });
+  assert(
+    /Best was Re1/i.test(slotTip.text) &&
+      /no safe reply/i.test(slotTip.text) &&
+      /zero safe escapes/i.test(slotTip.text),
+    `bad_move trap tip must use slots + SAN, got ${slotTip.text}`
+  );
+}
+
+function testCoach3Stage() {
+  const notes = loadNotesSchema();
+  const startFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
+  const castledFen = "rnbq1rk1/pppppppp/8/8/8/8/PPPPPPPP/RNBQ1RK1 w - - 0 1";
+  const trapFact = {
+    kind: "trapped_piece",
+    selfInflicted: true,
+    pieceLabel: "knight",
+    trapSquare: "d2",
+  };
+
+  assert(COMMENT_GAP_PLIES === 2, "ply gap must mute when (ply - last) < 2");
+  assert(COMMENT_EMERGENCY_CP === 300, "emergency drop must be 300cp");
+
+  assert(
+    classifyMoment({ mark: "inaccuracy", dropCp: 80 }) === null,
+    "inaccuracy must not create an event"
+  );
+  const excellent = classifyMoment({ mark: "excellent" });
+  assert(
+    excellent?.kind === "praise" && excellent.praiseKind === "great_find",
+    `excellent must map to great_find, got ${excellent && excellent.praiseKind}`
+  );
+
+  const clash = classifyMoment({
+    mark: "blunder",
+    dropCp: 250,
+    structuralKind: "opening_aggregate",
+  });
+  assert(
+    clash?.kind === "tactical_blunder",
+    "blunder on a checkpoint ply must stay tier 1"
+  );
+
+  assert(kingIsCastled(castledFen, "w"), "king on g1 with no rights is castled");
+  const liveCastled = buildLiveFacts({
+    ply: 20,
+    fen: castledFen,
+    userColor: "white",
+    dropCp: 120,
+    bestSan: "Re1",
+    playedSan: "Nd2",
+  });
+  assert(liveCastled.userCastled, "live facts must mark g1 king as castled");
+  const posEvent = classifyMoment({ mark: "mistake", dropCp: 120 });
+  const uncastledNote = notes.find((n) => n.id === "attack.king_safety#user_uncastled");
+  assert(uncastledNote, "schema must include user_uncastled king-safety note");
+  const liveUncastled = buildLiveFacts({
+    ply: 20,
+    fen: startFen,
+    userColor: "white",
+    dropCp: 120,
+    bestSan: "Re1",
+    playedSan: "Nd2",
+  });
+  assert(!liveUncastled.userCastled, "starting king on e1 must be uncastled");
+  const rejected = selectNote(posEvent, liveCastled, [uncastledNote]);
+  assert(!rejected, "uncastled guard must reject when king is on g1");
+  const accepted = selectNote(posEvent, liveUncastled, [uncastledNote]);
+  assert(accepted?.id === "attack.king_safety#user_uncastled", "uncastled note must pass on e1");
+
+  const silence = new CoachSilenceManager();
+  const first = attachCoachComment({
+    mark: "mistake",
+    dropCp: 120,
+    ply: 10,
+    fen: startFen,
+    userColor: "white",
+    bestSan: "Re1",
+    playedSan: "Nd2",
+    notes,
+    silence,
+  });
+  assert(first, "first comment must attach");
+  const gap11 = attachCoachComment({
+    mark: "brilliant",
+    praiseMark: "brilliant",
+    ply: 11,
+    fen: startFen,
+    userColor: "white",
+    playedSan: "Nxf7",
+    notes,
+    silence,
+  });
+  assert(gap11, "brilliant must bypass ply gap");
+  const afterBrill = attachCoachComment({
+    mark: "mistake",
+    dropCp: 120,
+    ply: 12,
+    fen: startFen,
+    userColor: "white",
+    bestSan: "Nc3",
+    playedSan: "a3",
+    notes,
+    silence,
+  });
+  assert(!afterBrill, "ply immediately after a comment must mute non-emergency");
+
+  const gapSilence = new CoachSilenceManager();
+  assert(
+    attachCoachComment({
+      mark: "mistake",
+      dropCp: 120,
+      ply: 10,
+      fen: startFen,
+      userColor: "white",
+      bestSan: "Re1",
+      playedSan: "Nd2",
+      notes,
+      silence: gapSilence,
+    }),
+    "gap session first comment must attach"
+  );
+  assert(
+    !attachCoachComment({
+      mark: "excellent",
+      praiseMark: "excellent",
+      ply: 11,
+      fen: startFen,
+      userColor: "white",
+      playedSan: "Nf3",
+      notes,
+      silence: gapSilence,
+    }),
+    "excellent must not bypass ply gap"
+  );
+  const openingName = attachCoachComment({
+    structuralKind: "opening_name",
+    ply: 12,
+    fen: startFen,
+    userColor: "white",
+    playedSan: "e4",
+    notes,
+    silence: gapSilence,
+  });
+  assert(openingName, "distinct checkpoint key must attach after a 1-ply gap");
+  assert(
+    !attachCoachComment({
+      structuralKind: "opening_aggregate",
+      ply: 13,
+      fen: startFen,
+      userColor: "white",
+      playedSan: "d4",
+      notes,
+      silence: gapSilence,
+    }),
+    "checkpoints must still obey ply gap"
+  );
+
+  const dropSilence = new CoachSilenceManager();
+  assert(
+    attachCoachComment({
+      mark: "mistake",
+      dropCp: 120,
+      ply: 10,
+      fen: startFen,
+      userColor: "white",
+      bestSan: "Re1",
+      playedSan: "Nd2",
+      notes,
+      silence: dropSilence,
+    }),
+    "drop-bypass prelude must attach"
+  );
+  const emergency = attachCoachComment({
+    mark: "blunder",
+    dropCp: 300,
+    tacticalFact: trapFact,
+    ply: 11,
+    fen: startFen,
+    userColor: "white",
+    bestSan: "Re1",
+    playedSan: "Nd2",
+    notes,
+    silence: dropSilence,
+  });
+  assert(emergency, "tactical_blunder dropCp>=300 must bypass ply gap");
+
+  const unique = new CoachSilenceManager();
+  const trapOnce = attachCoachComment({
+    mark: "blunder",
+    dropCp: 220,
+    tacticalFact: trapFact,
+    ply: 20,
+    fen: startFen,
+    userColor: "white",
+    bestSan: "Re1",
+    playedSan: "Nd2",
+    notes,
+    silence: unique,
+  });
+  assert(trapOnce?.note.keyId === "motif.trapped_piece", "first trap must attach");
+  const trapTwice = attachCoachComment({
+    mark: "blunder",
+    dropCp: 220,
+    tacticalFact: trapFact,
+    ply: 24,
+    fen: startFen,
+    userColor: "white",
+    bestSan: "Re1",
+    playedSan: "Nd2",
+    notes,
+    silence: unique,
+  });
+  assert(!trapTwice, "second motif.trapped_piece in the same game must mute");
+}
+
+
+testCoach3Stage();
 
 console.log("phase tactical metrics smoke OK");

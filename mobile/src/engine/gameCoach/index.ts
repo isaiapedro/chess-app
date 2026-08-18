@@ -15,15 +15,13 @@ export {
   NOTE_SCORE_THRESHOLD,
   fenPlacementSimilarity,
 } from "./keyRetrieve";
+export { pickMetricTip, shouldAttachMetricTip, weightKeyForMoment } from "./metricNotes";
 export {
-  pickMetricTip,
-  shouldAttachMetricTip,
-  weightKeyForMoment,
   buildCoachNoteRequest,
   formatCoachNoteRequest,
   lineComparisonMomentInputs,
   COACH_NOTE_REQUEST_CONFIG,
-} from "./metricNotes";
+} from "./coachNoteRequest";
 export {
   softKeysForNoteRequest,
   keysForCoachInputs,
@@ -220,6 +218,44 @@ export { phasePlanNote, phasePlanSlotOpen, adaptCoachTipForSide } from "./phaseP
 export { adaptNoteSquares } from "./adaptNoteSquares";
 
 export { composeGameSummaryNote } from "./gameSummary";
+export { attachCoachComment } from "./attachCoachComment";
+export {
+  classifyMoment,
+  CHECKPOINT_KINDS,
+  type CoachEvent,
+  type CoachEventKind,
+  type CheckpointKind,
+} from "./coachEvent";
+export {
+  CoachSilenceManager,
+  COMMENT_GAP_PLIES,
+  COMMENT_EMERGENCY_CP,
+} from "./coachSilence";
+export {
+  selectNote,
+  validateFactGuards,
+  buildLiveFacts,
+  kingIsCastled,
+  countGuardMatches,
+  type GuardedCoachNote,
+  type CoachLiveFacts,
+  type NoteGuards,
+} from "./noteGuards";
+export { composeComment } from "./commentComposer";
+export { loadNotesSchema, resetNotesSchemaCache } from "./loadNotesSchema";
+export {
+  COMMENT_SILENCE_PLY_WINDOW,
+  COMMENT_PLY_COOLDOWN,
+  COMMENT_MAJOR_BLUNDER_CP,
+  claimCoachComment,
+  createCommentSilenceState,
+  createCoachCommentSession,
+  sessionAllowsPhase,
+  sessionRecordPhase,
+  normalizeBestSan,
+  normalizeCommentText,
+  windowRuleApplies,
+} from "./commentSilence";
 export {
   loadCachedGameAnalysis,
   saveCachedGameAnalysis,
@@ -343,4 +379,5 @@ export {
   type PhaseSplits,
   type CoachPhaseName,
   type CoachPhaseBounds,
+  type CoachPhaseHints,
 } from "./phaseSplits";

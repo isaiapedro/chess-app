@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "notes": [
+    {
+      "id": "motif.trapped_piece#self_trapped",
+      "keyId": "motif.trapped_piece",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "trapped_piece",
+        "self_inflicted": true
+      },
+      "template": {
+        "attention": "Your {piece} on {square} has no escape.",
+        "lesson": "Count escape squares before pushing into enemy territory",
+        "plan": "Save it with {bestSan}."
+      }
+    },
+    {
+      "id": "motif.trapped_piece#missed_net",
+      "keyId": "motif.trapped_piece",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "trapped_piece",
+        "self_inflicted": false
+      },
+      "template": {
+        "attention": "The {piece} on {square} could have been netted.",
+        "lesson": "When a piece has no safe squares, take it",
+        "plan": "Play {bestSan}."
+      }
+    },
+    {
+      "id": "motif.hung_mate#1",
+      "keyId": "motif.mate_threat",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "hung_mate"
+      },
+      "template": {
+        "attention": "{playedSan} walked into a forced mate.",
+        "lesson": "Check every check and flight square before leaving the king",
+        "plan": "The save starts with {bestSan}."
+      }
+    },
+    {
+      "id": "motif.missed_mate#1",
+      "keyId": "motif.mate_threat",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "missed_mate"
+      },
+      "template": {
+        "attention": "Mate was available and {playedSan} let it go.",
+        "lesson": "Calculate forcing checks to the end",
+        "plan": "Finish with {bestSan}."
+      }
+    },
+    {
+      "id": "motif.gave_piece#1",
+      "keyId": "motif.hanging_piece",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "gave_piece"
+      },
+      "template": {
+        "attention": "{playedSan} left the {piece} hanging.",
+        "lesson": "Count attackers and defenders before you let go of a piece",
+        "plan": "Prefer {bestSan}."
+      }
+    },
+    {
+      "id": "motif.missed_capture#1",
+      "keyId": "motif.hanging_piece",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "missed_capture"
+      },
+      "template": {
+        "attention": "A hanging piece was left on the board.",
+        "lesson": "Take free material when it does not drop a worse tactic",
+        "plan": "Take with {bestSan}."
+      }
+    },
+    {
+      "id": "motif.missed_tactic#1",
+      "keyId": "motif.fork",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {
+        "tactical_kind": "missed_tactic"
+      },
+      "template": {
+        "attention": "{playedSan} missed a forcing tactic.",
+        "lesson": "Scan checks, captures, and threats before a quiet move",
+        "plan": "Start with {bestSan}."
+      }
+    },
+    {
+      "id": "attack.king_safety#user_uncastled",
+      "keyId": "attack.king_safety",
+      "eventKinds": ["tactical_blunder", "positional_error"],
+      "guards": {
+        "user_castled": false
+      },
+      "template": {
+        "attention": "The king is still in the centre after {playedSan}.",
+        "lesson": "Castle before opening the files",
+        "plan": "Look at {bestSan}."
+      }
+    },
+    {
+      "id": "attack.king_safety#opp_uncastled",
+      "keyId": "attack.king_safety",
+      "eventKinds": ["tactical_blunder", "positional_error"],
+      "guards": {
+        "opp_castled": false
+      },
+      "template": {
+        "attention": "Their king is still uncastled.",
+        "lesson": "Open the centre while the king is stuck",
+        "plan": "Strike with {bestSan}."
+      }
+    },
+    {
+      "id": "attack.blunder#generic",
+      "keyId": "attack.initiative",
+      "eventKinds": ["tactical_blunder"],
+      "guards": {},
+      "template": {
+        "attention": "{playedSan} dropped the evaluation.",
+        "lesson": "Compare forcing replies before committing",
+        "plan": "Prefer {bestSan}."
+      }
+    },
+    {
+      "id": "positional.error#generic",
+      "keyId": "methodology.comparison_and_elimination",
+      "eventKinds": ["positional_error"],
+      "guards": {},
+      "template": {
+        "attention": "{playedSan} was not the right idea.",
+        "lesson": "Weigh the engine alternative against the pawn structure",
+        "plan": "Look at {bestSan}."
+      }
+    },
+    {
+      "id": "checkpoint.opening_name#uncastled",
+      "keyId": "checkpoint.opening_name",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "opening_name",
+        "user_castled": false
+      },
+      "template": {
+        "attention": "The opening is taking shape and the king is still in the centre.",
+        "plan": "Finish development and castle before the files open."
+      }
+    },
+    {
+      "id": "checkpoint.opening_name#1",
+      "keyId": "checkpoint.opening_name",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "opening_name"
+      },
+      "template": {
+        "attention": "The opening is taking shape.",
+        "plan": "Complete development before opening the centre."
+      }
+    },
+    {
+      "id": "checkpoint.opening_aggregate#1",
+      "keyId": "checkpoint.opening_aggregate",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "opening_aggregate"
+      },
+      "template": {
+        "attention": "The opening phase is done.",
+        "plan": "Connect the rooks and fight for the useful pawn breaks."
+      }
+    },
+    {
+      "id": "checkpoint.middlegame_aggregate#1",
+      "keyId": "checkpoint.middlegame_aggregate",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "middlegame_aggregate"
+      },
+      "template": {
+        "attention": "The middlegame plan now has to convert into an ending.",
+        "plan": "Trade into a favourable ending and keep the pieces active."
+      }
+    },
+    {
+      "id": "checkpoint.endgame_advantage#1",
+      "keyId": "checkpoint.endgame_advantage",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "endgame_advantage"
+      },
+      "template": {
+        "attention": "The ending is on the board.",
+        "plan": "Activate the king and convert the extra material or pawn."
+      }
+    },
+    {
+      "id": "checkpoint.decisive_pawn_break#1",
+      "keyId": "checkpoint.decisive_pawn_break",
+      "eventKinds": ["fixed_checkpoint"],
+      "guards": {
+        "structural_kind": "decisive_pawn_break"
+      },
+      "template": {
+        "attention": "The pawn break {playedSan} changes the structure.",
+        "plan": "Follow it up so the newly opened lines belong to your pieces."
+      }
+    },
+    {
+      "id": "praise.brilliant#1",
+      "keyId": "praise.brilliant",
+      "eventKinds": ["praise"],
+      "guards": {
+        "praise_kind": "brilliant"
+      },
+      "template": {
+        "attention": "Brilliant idea with {playedSan}.",
+        "plan": "Keep looking for the same kind of forcing shot."
+      }
+    },
+    {
+      "id": "praise.great_find#1",
+      "keyId": "praise.great_find",
+      "eventKinds": ["praise"],
+      "guards": {
+        "praise_kind": "great_find"
+      },
+      "template": {
+        "attention": "Clean solution with {playedSan}.",
+        "plan": "Hold the same standard on the next decision."
+      }
+    }
+  ]
+}

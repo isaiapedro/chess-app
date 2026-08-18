@@ -9,6 +9,7 @@ import { detectOpeningFamily } from "./structureDetect";
 import type { CoachNoteRequest } from "./coachNoteRequest";
 import {
   isPraiseMark,
+  isFixedCheckpointMoment,
   requestAlwaysAttaches,
 } from "./coachNoteRequest";
 import {
@@ -260,6 +261,18 @@ export function weightKeyBreakdown(args: {
   const zero = (): KeyWeightBreakdown => ({ keyId, weight: 0, parts });
 
   if (!CANON_KEY.test(keyId)) return zero();
+
+  const tactKind = args.request?.tacticalFact?.kind || null;
+  const tacticalGate =
+    args.request?.kind === "bad_move" || Boolean(tactKind);
+  if (tacticalGate && keyId.startsWith("endgame.")) {
+    parts.push({ label: "tacticalSuppressEg", delta: -999 });
+    return { keyId, weight: -999, parts };
+  }
+  if (tacticalGate && keyId.startsWith("positional.")) {
+    parts.push({ label: "tacticalSuppressGeneric", delta: -999 });
+    return { keyId, weight: -999, parts };
+  }
 
   if (args.entry) {
     if (
@@ -581,7 +594,7 @@ export function weightKeyBreakdown(args: {
     parts.push({ label: "mistakeCandidate", delta: 6 });
   }
 
-  if (w > 0) {
+  if (w > 0 && !tacticalGate) {
     w += 2;
     parts.push({ label: "phaseThemeBagSoft", delta: 2 });
   } else if (args.themes.length && themeHit === 0 && args.entry) {
@@ -601,11 +614,12 @@ export function weightKeyBreakdown(args: {
     }
   }
 
-  if (family === "endgame" && args.phase === "endgame") {
+  if (family === "endgame" && args.phase === "endgame" && !tacticalGate) {
     w += 3;
     parts.push({ label: "endgamePhase", delta: 3 });
   }
   if (
+    !tacticalGate &&
     args.themes.some((t) =>
       ["lucena", "philidor", "vancura", "fortress"].includes(t)
     ) &&
@@ -687,6 +701,7 @@ export function rankMetricNoteWeights(args: {
     situations: args.request?.situations,
     planKeys: args.gamePlan?.stickyKeys,
     tacticalFact: args.request?.tacticalFact,
+    deltaCp: args.deltaCp,
   });
   const keys = fromRequest.length
     ? fromRequest
@@ -714,9 +729,15 @@ export function rankMetricNoteWeights(args: {
         gamePlan: args.gamePlan,
       })
     )
-    .filter((r) => r.weight >= METRIC_TIP_MIN_WEIGHT || fromRequest.includes(r.keyId))
+    .filter(
+      (r) =>
+        r.weight >= METRIC_TIP_MIN_WEIGHT ||
+        (fromRequest.includes(r.keyId) && r.weight > -500)
+    )
     .map((r) =>
-      fromRequest.includes(r.keyId) && r.weight < METRIC_TIP_MIN_WEIGHT
+      fromRequest.includes(r.keyId) &&
+      r.weight < METRIC_TIP_MIN_WEIGHT &&
+      r.weight > -500
         ? {
             ...r,
             weight: METRIC_TIP_MIN_WEIGHT,
@@ -750,10 +771,21 @@ export function explainAttachMetricTip(args: {
   /** Prefer request-driven attach when present. */
   request?: CoachNoteRequest | null;
 }): { attach: boolean; reasons: string[] } {
+  if (args.mark === "inaccuracy") {
+    const always =
+      (args.request != null && requestAlwaysAttaches(args.request.kind)) ||
+      isFixedCheckpointMoment(args.moment);
+    if (!always) {
+      return { attach: false, reasons: ["skipInaccuracy"] };
+    }
+  }
+
+  const praiseMark = String(args.moment?.inputs?.praise_mark || "");
   const quietPraise =
     args.moment &&
-    args.moment.inputs?.praise_mark &&
-    args.moment.inputs.praise_mark !== "brilliant" &&
+    praiseMark &&
+    praiseMark !== "brilliant" &&
+    praiseMark !== "excellent" &&
     !args.moment.structuralKind;
   if (quietPraise && !ERROR_MARKS.has(args.mark || ("" as MetricCoachMark))) {
     return { attach: false, reasons: ["skipQuietPraise"] };
@@ -763,13 +795,6 @@ export function explainAttachMetricTip(args: {
   if (args.request) {
     if (requestAlwaysAttaches(args.request.kind)) {
       reasons.push(`request=${args.request.kind}`);
-    } else if (args.request.kind === "phase_structure") {
-      const unused = args.phaseThemes.filter(
-        (t) => STRUCTURE_THEMES.has(t) && !args.structureThemeUsed?.has(t)
-      );
-      if (unused.length) {
-        reasons.push(`unusedStructure=${unused.slice(0, 3).join(",")}`);
-      }
     }
     if (args.request.kind === "bad_move") {
       reasons.push("bad_move");
@@ -801,12 +826,6 @@ export function explainAttachMetricTip(args: {
     return { attach: reasons.length > 0, reasons: [...new Set(reasons)] };
   }
 
-  // Inaccuracy is a board mark only — never attach tips from mark/delta alone.
-  if (args.mark === "inaccuracy" && !args.moment) {
-    return { attach: false, reasons: ["skipInaccuracy"] };
-  }
-
-  // Opp-gift structural alone never attaches (legacy moments).
   const giftOnly =
     args.moment?.structuralKind === "opponent_mistake" &&
     !args.moment.inputs?.critical_mark;

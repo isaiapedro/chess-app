@@ -56,6 +56,8 @@ export const PHASE_METRIC_KEYS: Record<MetricPhaseName, readonly string[]> = {
     "structure.passed_pawn",
     "positional.color_complexes",
     "imbalance.bishop_pair",
+    "motif.trapped_piece",
+    "methodology.candidate_moves",
   ],
 };
 

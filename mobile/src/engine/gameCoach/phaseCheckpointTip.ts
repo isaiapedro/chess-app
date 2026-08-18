@@ -2,7 +2,7 @@
  * Rigid fixed-checkpoint tip grammar (opening / middlegame / endgame aggregates).
  * Shape: lead + core + phase-remember + optional plan.
  * MG/EG: lead = what worked so far; core = what needs attention now.
- * Mistake/blunder on the same ply takes over via pickMetricTip (not this weaver).
+ * Mistake/blunder on the same ply takes over via classifyMoment (not this weaver).
  */
 
 import type { DerivedCoachNote } from "./derivedCoachPack";

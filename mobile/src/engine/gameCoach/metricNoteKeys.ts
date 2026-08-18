@@ -534,11 +534,6 @@ export const MARK_KIND_KEYS: Record<string, string[]> = {
     "attack.initiative",
     "piece.centralization",
   ],
-  phase_structure: [
-    "methodology.candidate_moves",
-    "positional.pawn_break",
-    "imbalance.space",
-  ],
 };
 
 /** Min |Δ| for engine-vs-played / line compare to contribute opening soft keys. */
@@ -583,6 +578,8 @@ export function softKeysForNoteRequest(args: {
   planKeys?: string[] | null;
   /** Board-true tactic diagnosis (bad_move). */
   tacticalFact?: TacticalFact | null;
+  /** Eval drop in cp — Tier 1 pool when > 150. */
+  deltaCp?: number;
 }): string[] {
   const openingCheckpoint =
     args.structuralKind === "opening_name" ||
@@ -628,6 +625,25 @@ export function softKeysForNoteRequest(args: {
         : args.engineLineMetricDelta) || []
     ),
   ];
+
+  const tier1 =
+    args.kind === "bad_move" ||
+    Boolean(args.tacticalFact?.kind) ||
+    (args.deltaCp ?? 0) > 150;
+  if (tier1) {
+    const whyTactical = [
+      ...whyPrimary,
+      ...whySoft,
+      ...fromSituations,
+      ...fromMark,
+    ].filter((k) => {
+      if (k.startsWith("endgame.") || k.startsWith("positional.")) return false;
+      const fam = k.split(".")[0] || "";
+      if (fam === "motif" || fam === "attack") return true;
+      return k === "methodology.candidate_moves";
+    });
+    return dropOpening([...new Set([...fromTactical, ...whyTactical])]);
+  }
 
   if (openingCheckpoint) {
     const quietCompare = !(args.engineVsPlayedMetricDelta || []).some(

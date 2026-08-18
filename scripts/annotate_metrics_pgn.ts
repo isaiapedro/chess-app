@@ -1,8 +1,8 @@
 /**
- * Annotate a PGN with full app metrics + coach note-weight selection dump.
+ * Annotate a PGN with full app metrics + 3-stage coach comment dump.
  *
  * Usage:
- *   node scripts/annotate_metrics_pgn.mjs [path/to/game.pgn]
+ *   node scripts/annotate_metrics_pgn.mjs [path/to/game.pgn] [--ignore-silence]
  *   USER_COLOR=black|white  STOCKFISH_PATH=...  OUT_ALL=...  OUT_JSON=...
  *
  * Writes:
@@ -10,14 +10,9 @@
  *   samples/metrics_all.json  — full structured dump (all metric rows + candidates)
  *   optional split heur/eval PGNs when WRITE_SPLIT!=0
  *
- * Note weight parts (metricNoteWeights / pickMetricTip):
- *   metricInputKey+16 metricInputFamily+6 themeHit+14/12/4 openingKeyLock+12
- *   sacrificeTheme+10 errorTacticalFamily+8 deltaCpTactical+4
- *   phaseThemeBagSoft+2 endgamePhase+3 theoreticalEndgame+3
- *   situationLock / tacticalLock / gamePlanLock (soft-key boosts)
- *   tacticalSharp+6 (motif/attack/methodology when tactical_sharp)
- *   MG centre stamp (prefer_center_strike / fluidity / exposure / wing / break class)
- *   accept when weight >= METRIC_TIP_MIN_WEIGHT (4); pool = softKeysForNoteRequest
+ * Comments: classifyMoment → selectNote (fact guards) → interpolate templates.
+ * Silence: ply gap < 2 and unique keyId/note.id; bypass brilliant or dropCp>=300.
+ * --ignore-phase-limits is an alias for --ignore-silence.
  */
 import { accessSync, constants, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
@@ -66,15 +61,14 @@ import {
 } from "../mobile/src/engine/gameCoach/coachGameMetrics";
 import { isPawnBreakMove } from "../mobile/src/engine/phaseTacticalMetrics";
 import {
-  METRIC_TIP_MIN_WEIGHT,
   STRUCTURE_THEMES,
-  explainAttachMetricTip,
-  formatWeightBreakdown,
-  rankMetricNoteWeights,
-  themesForPly,
   type MetricCoachMark,
   type PhaseName,
 } from "../mobile/src/engine/gameCoach/metricNoteWeights";
+import { attachCoachComment } from "../mobile/src/engine/gameCoach/attachCoachComment";
+import { CoachSilenceManager } from "../mobile/src/engine/gameCoach/coachSilence";
+import { loadNotesSchema } from "../mobile/src/engine/gameCoach/loadNotesSchema";
+import { phaseForCoachMoment } from "../mobile/src/engine/gameCoach/phaseSplits";
 import {
   buildCoachNoteRequest,
   formatCoachNoteRequest,
@@ -86,6 +80,7 @@ import {
   COACH_NOTE_REQUEST_CONFIG,
   engineLineSansBudget,
   isFixedCheckpointMoment,
+  isPraiseMark,
   openingEvalGapAllowsEngineLine,
   pawnBreakEvalGapAllowsRecommend,
 } from "../mobile/src/engine/gameCoach/coachNoteRequest";
@@ -106,6 +101,7 @@ import {
 } from "../mobile/src/engine/forcedMate";
 import {
   classifyCoachMark,
+  captureDest,
   coachMissedFromPending,
 } from "../mobile/src/engine/gameCoach/coachMarkClassify";
 import {
@@ -279,9 +275,15 @@ type RankedCandidate = CoachCandidateItem & {
   best_uci: string | null;
 };
 
+const positional = process.argv.slice(2).filter((a) => !a.startsWith("-"));
+const IGNORE_SILENCE =
+  process.argv.includes("--ignore-silence") ||
+  process.argv.includes("--ignore-phase-limits") ||
+  process.env.IGNORE_SILENCE === "1" ||
+  process.env.IGNORE_PHASE_LIMITS === "1";
 const SRC =
   process.env.PGN_PATH?.trim() ||
-  process.argv[2] ||
+  positional[0] ||
   join(ROOT, "game.pgn");
 const OUT_DIR = join(ROOT, "samples");
 const OUT_ALL =
@@ -764,12 +766,13 @@ function deepenCriticalPositions(args: {
       missedOpportunity,
       lines: coachLinesFromPos(fenBefore, out[ply0]),
       userIsWhite,
+      prevCaptureTo: prevCaptureToAt(fens, historySans, ply0),
     });
 
     if (
       (!playedBest &&
         (mark === "blunder" || mark === "mistake" || mark === "missed")) ||
-      mark === "brilliant"
+      isPraiseMark(mark)
     ) {
       addPair(ply0);
     }
@@ -930,6 +933,7 @@ function userPlyMark(args: {
   missedOpportunity: boolean;
   lines: SfLine[];
   userIsWhite: boolean;
+  prevCaptureTo?: string | null;
 }): MetricCoachMark | null {
   return classifyCoachMark({
     side: args.userIsWhite ? "white" : "black",
@@ -940,7 +944,17 @@ function userPlyMark(args: {
     fenBefore: args.fenBefore,
     playedSan: args.playedSan,
     missedOpportunity: args.missedOpportunity,
+    prevCaptureTo: args.prevCaptureTo,
   });
+}
+
+function prevCaptureToAt(
+  fens: string[],
+  sans: string[],
+  ply0: number
+): string | null {
+  if (ply0 < 1) return null;
+  return captureDest(fens[ply0 - 1] || "", sans[ply0 - 1] || "");
 }
 
 function oppGiftKind(
@@ -990,7 +1004,13 @@ function buildVaultCandidates(args: {
     const playedSan = args.historySans[ply0] || "";
     const playedBest = Boolean(bestSan && playedSan && bestSan === playedSan);
     if (playedBest) continue;
-    if (isMateScore(before)) continue;
+    if (
+      isMateScore(before) &&
+      isMateScore(after) &&
+      Math.sign(after) === Math.sign(before)
+    ) {
+      continue;
+    }
     const mark = userPlyMark({
       playedBest: false,
       fenBefore: fen,
@@ -1000,6 +1020,7 @@ function buildVaultCandidates(args: {
       missedOpportunity: false,
       lines: coachLinesFromPos(fen, args.positions[ply0]),
       userIsWhite: args.userIsWhite,
+      prevCaptureTo: prevCaptureToAt(args.fens, args.historySans, ply0),
     });
     if (
       mark !== "inaccuracy" &&
@@ -1053,21 +1074,13 @@ function buildVaultCandidates(args: {
 function phaseForPly(
   ply0: number,
   metrics: Awaited<ReturnType<typeof analyzeHeuristicGame>>,
-  structuralKind?: string | null
+  structuralKind?: string | null,
+  hints?: {
+    fen?: string | null;
+    tacticalKind?: string | null;
+    dropCp?: number;
+  } | null
 ): PhaseName {
-  if (
-    structuralKind === "opening_name" ||
-    structuralKind === "opening_aggregate"
-  ) {
-    return "opening";
-  }
-  if (
-    structuralKind === "middlegame_aggregate" ||
-    structuralKind === "decisive_pawn_break"
-  ) {
-    return "middlegame";
-  }
-  if (structuralKind === "endgame_advantage") return "endgame";
   const o = metrics.opening;
   const m = metrics.middlegame;
   const e = metrics.endgame;
@@ -1075,10 +1088,23 @@ function phaseForPly(
     o?.phase_end_fullmove ??
     openingPhaseEndFullmove(o?.opening_castle_fullmove ?? null);
   const mgPly = m?.middlegame_start_ply ?? middlegameStartPly(phaseEnd);
-  const egPly = e?.endgame_start_ply;
-  if (egPly != null && ply0 >= egPly) return "endgame";
-  if (m?.reached_middlegame && ply0 >= mgPly) return "middlegame";
-  return "opening";
+  const egPly = e?.endgame_start_ply ?? null;
+  const fen = hints?.fen ?? null;
+  const pieceCount = fen
+    ? String(fen).split(" ")[0].replace(/\d/g, "").length
+    : 32;
+  return phaseForCoachMoment({
+    ply1: ply0 + 1,
+    pieceCount,
+    bounds: {
+      middlegameStartPly0: m?.reached_middlegame ? mgPly : null,
+      endgameStartPly0: egPly,
+    },
+    structuralKind,
+    fen,
+    tacticalKind: hints?.tacticalKind,
+    dropCp: hints?.dropCp,
+  });
 }
 
 function phaseComment(
@@ -1142,9 +1168,8 @@ function coachHeaders(
     `[CoachMoments "${tagList(moments)}"]`,
     `[CoachStrengths "${tagList(coach.strengths)}"]`,
     `[CoachWeaknesses "${tagList(coach.weaknesses)}"]`,
-    `[CoachNoteWeightRules "metricInputKey+16;metricInputFamily+6;themeHit+14/12/4;openingKeyLock+12;tacticalSharp+6;minAccept=${METRIC_TIP_MIN_WEIGHT}"]`,
-    `[CoachNoteAttachRules "requestKinds=${COACH_NOTE_REQUEST_CONFIG.alwaysAttachKinds.join(",")};engineHorizon=${engineLineSansBudget()};fixed=${COACH_NOTE_REQUEST_CONFIG.fixedCheckpoints.map((c) => c.structuralKind).join(",")};live=${COACH_NOTE_REQUEST_CONFIG.liveStructuralKinds.join(",")};openingAlwaysAttach=${COACH_NOTE_REQUEST_CONFIG.openingAlwaysAttach}"]`,
-    `[CoachNoteSelectRules "pool soft-keys from metricNoteKeys(softKeysForNoteRequest) only; pick highest weight>=${METRIC_TIP_MIN_WEIGHT}; didactic mid-specificity"]`,
+    `[CoachNoteAttachRules "stages=classifyMoment|selectNote|composeComment;silence=gap<2+uniqueKey;bypass=tactical_blunder&&dropCp>=300|brilliant;engineHorizon=${engineLineSansBudget()};fixed=${COACH_NOTE_REQUEST_CONFIG.fixedCheckpoints.map((c) => c.structuralKind).join(",")}"]`,
+    `[CoachNoteSelectRules "notes_schema.json; eventKinds+fact guards; most guards wins; interpolate {piece}{square}{bestSan}{playedSan}"]`,
     `[CoachNoteBadMovePayload "playedMetricDelta+playedLine+engineLine+engineVsPlayed(horizon=${engineLineSansBudget()});centre=strike/fluid/exp/wing/break"]`,
   ];
 }
@@ -1164,6 +1189,7 @@ function buildAllMoveText(args: {
   openingCands: RankedCandidate[];
   mistakeCands: RankedCandidate[];
   eventsByPly: Map<number, MetricTimelineEvent[]>;
+  ignoreSilence?: boolean;
 }): string {
   const chess = new Chess();
   chess.loadPgn(args.raw, { strict: false });
@@ -1186,6 +1212,10 @@ function buildAllMoveText(args: {
     const prev = candByPly.get(c.ply);
     if (!prev || c.priority > prev.priority) candByPly.set(c.ply, c);
   }
+  const notesSchema = loadNotesSchema();
+  const commentSilence = new CoachSilenceManager({
+    ignoreSilence: Boolean(args.ignoreSilence),
+  });
   const parts: string[] = [];
   let pendingOppKind: "mistake" | "blunder" | null = null;
   let pendingOppWp: number | null = null;
@@ -1213,7 +1243,6 @@ function buildAllMoveText(args: {
     }
 
     const moment = args.coach.momentsByPly[ply + 1] || null;
-    const phase = phaseForPly(ply, args.metrics, moment?.structuralKind);
     const before = args.evalsCp[ply] ?? 0;
     const after = args.evalsCp[ply + 1] ?? before;
     const wpBefore = userWinProbability(before, args.userIsWhite);
@@ -1221,6 +1250,14 @@ function buildAllMoveText(args: {
     const userBefore = args.userIsWhite ? before : -before;
     const userAfter = args.userIsWhite ? after : -after;
     const deltaCp = Math.max(0, Math.round(userBefore - userAfter));
+    let phase = phaseForPly(ply, args.metrics, moment?.structuralKind, {
+      fen: args.fens[ply + 1] || args.fens[ply] || null,
+      dropCp: deltaCp,
+      tacticalKind:
+        typeof moment?.inputs?.tactical_kind === "string"
+          ? moment.inputs.tactical_kind
+          : null,
+    });
     const dropKind = classifyEvalDrop(wpBefore, wpAfter);
     const bestUci = args.positions[ply]?.bestUci || null;
     const bestSan = uciToSan(args.fens[ply] || "", bestUci);
@@ -1254,14 +1291,14 @@ function buildAllMoveText(args: {
           missedOpportunity,
           lines: coachLinesFromPos(args.fens[ply] || "", args.positions[ply]),
           userIsWhite: args.userIsWhite,
+          prevCaptureTo: prevCaptureToAt(args.fens, historySans, ply),
         })
       : null;
     const isTerminalPly = isMateScore(before);
     const wpSwing = Math.abs(wpAfter - wpBefore);
-    const errorMarks = new Set(["blunder", "mistake", "inaccuracy", "missed"]);
     const mark =
       markRaw &&
-      errorMarks.has(markRaw) &&
+      (markRaw === "mistake" || markRaw === "blunder") &&
       (isTerminalPly || wpSwing < 0.02)
         ? null
         : markRaw;
@@ -1372,46 +1409,73 @@ function buildAllMoveText(args: {
         pawnStormTempo: stormTempo,
         situations: planSituations,
       });
-      if (noteRequest && moment) {
+      if (noteRequest?.tacticalFact?.kind) {
+        const phase2 = phaseForPly(ply, args.metrics, moment?.structuralKind, {
+          fen: args.fens[ply + 1] || args.fens[ply] || null,
+          dropCp: deltaCp,
+          tacticalKind: noteRequest.tacticalFact.kind,
+        });
+        if (phase2 !== phase) {
+          phase = phase2;
+          noteRequest.phase = phase2;
+        }
+      }
+      if (noteRequest) {
         const lineInputs = lineComparisonMomentInputs(noteRequest);
         const metaInputs = coachRequestMetaInputs(noteRequest);
-        if (
-          Object.keys(lineInputs).length ||
-          Object.keys(metaInputs).length ||
-          bestSan
-        ) {
-          moment.inputs = {
-            ...(moment.inputs || {}),
-            ...lineInputs,
+        if (Object.keys(metaInputs).length) {
+          noteRequest.inputs = {
+            ...(noteRequest.inputs || {}),
             ...metaInputs,
-            game_plan: formatGamePlanShort(gamePlan) || null,
           };
-          if (!moment.bestSan && bestSan) {
-            moment.bestSan = bestSan;
+        }
+        if (moment) {
+          if (
+            Object.keys(lineInputs).length ||
+            Object.keys(metaInputs).length ||
+            bestSan
+          ) {
+            moment.inputs = {
+              ...(moment.inputs || {}),
+              ...lineInputs,
+              ...metaInputs,
+              game_plan: formatGamePlanShort(gamePlan) || null,
+            };
+            if (!moment.bestSan && bestSan) {
+              moment.bestSan = bestSan;
+            }
+            if (!moment.playedSan && playedSan) moment.playedSan = playedSan;
+            args.coach.momentsByPly[ply1] = moment;
           }
-          if (!moment.playedSan && playedSan) moment.playedSan = playedSan;
-          args.coach.momentsByPly[ply1] = moment;
         }
       } else if (moment && bestSan && !moment.bestSan) {
         moment.bestSan = bestSan;
         if (!moment.playedSan && playedSan) moment.playedSan = playedSan;
         args.coach.momentsByPly[ply1] = moment;
       }
-      const attachInfo = explainAttachMetricTip({
-        phase,
-        moment,
+      const attached = attachCoachComment({
         mark,
-        deltaCp,
-        phaseThemes,
-        structureThemeUsed,
-        request: noteRequest,
-      });
-      const themes = themesForPly({
-        metrics: args.coach,
-        phase,
-        moment,
-        deltaCp,
-        request: noteRequest,
+        dropCp: deltaCp,
+        tacticalFact: noteRequest?.tacticalFact || null,
+        structuralKind:
+          moment?.structuralKind || noteRequest?.structuralKind || null,
+        praiseMark:
+          typeof moment?.inputs?.praise_mark === "string"
+            ? String(moment.inputs.praise_mark)
+            : mark === "brilliant" || mark === "excellent"
+              ? mark
+              : null,
+        primaryField:
+          typeof noteRequest?.inputs?.primary_field === "string"
+            ? String(noteRequest.inputs.primary_field)
+            : null,
+        ply: ply1,
+        fen: args.fens[ply] || "",
+        userColor: args.userIsWhite ? "white" : "black",
+        bestSan,
+        playedSan,
+        notes: notesSchema,
+        silence: commentSilence,
       });
 
       bits.push(`phase=${phase}`);
@@ -1437,89 +1501,31 @@ function buildAllMoveText(args: {
       }
 
       bits.push(
-        `noteAttach=${attachInfo.attach ? "yes" : "no"}` +
-          (attachInfo.reasons.length
-            ? `(${attachInfo.reasons.join("|")})`
-            : "(noRule)")
+        `noteAttach=${attached ? "yes" : "no"}` +
+          (attached
+            ? `(event=${attached.event.kind}|tier=${attached.event.tier}|note=${attached.note.id})`
+            : "(muted)")
       );
-      if (themes.length) bits.push(`themes=${themes.slice(0, 10).join(",")}`);
 
-      if (attachInfo.attach) {
-        const errorNow =
-          mark === "blunder" ||
-          mark === "mistake" ||
-          mark === "missed";
-        const rankedAll = rankMetricNoteWeights({
-          phase,
-          themes,
-          mark,
-          deltaCp,
-          moment,
-          openingKeyId: args.openingKeyId,
-          eco: args.eco,
-          opening: args.opening,
-          limit: 12,
-          request: noteRequest,
-          gamePlan,
-        });
-        const ranked = rankedAll.filter((row) => {
-          const tail = row.keyId.split(".").pop() || "";
-          if (!STRUCTURE_THEMES.has(tail)) return true;
-          if (!structureThemeUsed.has(tail)) return true;
-          return Boolean(moment) || errorNow || Boolean(noteRequest?.kind === "fixed_checkpoint");
-        }).slice(0, 6);
-        if (ranked.length) {
-          bits.push(
-            `noteCalc ${ranked
-              .map((r, i) => `#${i + 1}:${formatWeightBreakdown(r)}`)
-              .join(" ")}`
-          );
-          const selected = ranked[0]!;
-          bits.push(
-            `notePick selected=${selected.keyId} score=${selected.weight} rule=maxWeight>=${METRIC_TIP_MIN_WEIGHT};structureOnceUnlessMomentError parts=${selected.parts
-              .filter((p) => p.delta)
-              .map((p) => `${p.label}+${p.delta}`)
-              .join(",")}`
-          );
-          if (ranked.length > 1) {
-            bits.push(
-              `noteAlt ${ranked
-                .slice(1)
-                .map((r) => `${r.keyId}=${r.weight}`)
-                .join(",")}`
-            );
-          }
-          const skippedStruct = rankedAll
-            .filter((r) => {
-              const tail = r.keyId.split(".").pop() || "";
-              return (
-                STRUCTURE_THEMES.has(tail) &&
-                structureThemeUsed.has(tail) &&
-                !moment &&
-                !errorNow
-              );
-            })
-            .slice(0, 3)
-            .map((r) => r.keyId);
-          if (skippedStruct.length) {
-            bits.push(`noteSkip structureUsed=${skippedStruct.join(",")}`);
-          }
-          const tail = selected.keyId.split(".").pop() || "";
-          if (STRUCTURE_THEMES.has(tail)) structureThemeUsed.add(tail);
-          gamePlan = markPlanKeysTaught(gamePlan, [selected.keyId]);
-          if (moment) {
-            moment.inputs = {
-              ...(moment.inputs || {}),
-              key_id: selected.keyId,
-              game_plan: formatGamePlanShort(gamePlan) || null,
-            };
-            args.coach.momentsByPly[ply1] = moment;
-          }
-        } else {
-          bits.push(
-            `notePick selected=none score=0 rule=noKeyReachMin${METRIC_TIP_MIN_WEIGHT} fallback=metricTemplateInApp`
-          );
+      if (attached) {
+        bits.push(
+          `notePick selected=${attached.note.keyId} event=${attached.event.kind} noteId=${attached.note.id}`
+        );
+        bits.push(`comment=${attached.text}`);
+        const tail = attached.note.keyId.split(".").pop() || "";
+        if (STRUCTURE_THEMES.has(tail)) structureThemeUsed.add(tail);
+        gamePlan = markPlanKeysTaught(gamePlan, [attached.note.keyId]);
+        if (moment) {
+          moment.inputs = {
+            ...(moment.inputs || {}),
+            key_id: attached.note.keyId,
+            key_ids: attached.note.keyId,
+            game_plan: formatGamePlanShort(gamePlan) || null,
+          };
+          args.coach.momentsByPly[ply1] = moment;
         }
+      } else {
+        bits.push(`notePick selected=none event=muted`);
       }
     }
 
@@ -1776,9 +1782,22 @@ async function main() {
     const san = historySans[ply0] || "";
     const isUser = userIsWhite ? ply0 % 2 === 0 : ply0 % 2 === 1;
     const momentAtPly = coach.momentsByPly[ply1] || null;
-    const phase = phaseForPly(ply0, metrics, momentAtPly?.structuralKind);
     const before = evalsCp[ply0] ?? 0;
     const after = evalsCp[ply0 + 1] ?? before;
+    const dropCp = Math.max(
+      0,
+      Math.round(
+        userIsWhite ? before - after : after - before
+      )
+    );
+    const phase = phaseForPly(ply0, metrics, momentAtPly?.structuralKind, {
+      fen: fenAfter || fenBefore,
+      dropCp,
+      tacticalKind:
+        typeof momentAtPly?.inputs?.tactical_kind === "string"
+          ? momentAtPly.inputs.tactical_kind
+          : null,
+    });
     const bestUci = positions[ply0]?.bestUci || null;
     const bestSan = uciToSan(fenBefore, bestUci);
     const bestPvSan = pvUciToSan(
@@ -1817,6 +1836,7 @@ async function main() {
           missedOpportunity,
           lines: coachLinesFromPos(fenBefore, positions[ply0]),
           userIsWhite,
+          prevCaptureTo: prevCaptureToAt(fens, historySans, ply0),
         })
       : null;
 
@@ -1895,7 +1915,7 @@ async function main() {
       });
     }
 
-    if (isUser && mark === "brilliant") {
+    if (isUser && isPraiseMark(mark)) {
       const praiseDrop = mark === "brilliant" ? 35 : 28;
       const prevLive = coach.momentsByPly[ply1];
       upsertLiveMoment(coach.momentsByPly, {
@@ -2195,6 +2215,7 @@ async function main() {
       missedOpportunity: false,
       lines: coachLinesFromPos(fenBefore, positions[ply0]),
       userIsWhite,
+      prevCaptureTo: prevCaptureToAt(fens, historySans, ply0),
     });
     const userBefore = userIsWhite ? before : -before;
     const userAfter = userIsWhite ? after : -after;
@@ -2203,8 +2224,8 @@ async function main() {
       mark &&
       mark !== "excellent" &&
       mark !== "good" &&
-      !isTerminal &&
-      wpSwing >= 0.02
+      (!isTerminal || mark === "missed") &&
+      (wpSwing >= 0.02 || mark === "inaccuracy" || mark === "missed")
     ) {
       timeline.push({
         source: "eval",
@@ -2275,6 +2296,7 @@ async function main() {
     openingCands: vaultCands.opening,
     mistakeCands: vaultCands.mistake,
     eventsByPly,
+    ignoreSilence: IGNORE_SILENCE,
   });
   writeFileSync(
     OUT_ALL,
@@ -2337,28 +2359,11 @@ async function main() {
         })),
       ])
     ),
-    noteWeightRules: {
-      minAccept: METRIC_TIP_MIN_WEIGHT,
-      parts: [
-        "metricInputKey+16",
-        "metricInputFamily+6",
-        "themeHit+14/12/4",
-        "openingKeyLock+12",
-        "sacrificeTheme+10",
-        "errorTacticalFamily+8",
-        "deltaCpTactical+4",
-        "phaseThemeBagSoft+2",
-        "endgamePhase+3",
-        "theoreticalEndgame+3",
-        "tacticalSharp+6",
-        "preferCenterStrike+fluidity+exposure",
-      ],
-      attach:
-        "requestKinds=bad_move|fixed_checkpoint|structural_moment|praise_move;engineHorizon=8;openingAlwaysAttach=false;allowPhaseStructure=false",
-      select:
-        "pool soft-keys from softKeysForNoteRequest only; pick max if >= minAccept; didactic mid-specificity",
-      badMovePayload:
-        "playedMetricDelta + playedLineMetricDelta + engineLineMetricDelta + engineVsPlayedMetricDelta (8-move PV, all BoardMetricSnap fields); centre stamp prefer_center_strike/fluidity/exposure/wing/break",
+    noteSelectRules: {
+      stages: ["classifyMoment", "selectNote", "composeComment"],
+      silence: "gap<2 + unique keyId/note.id",
+      bypass: "tactical_blunder && dropCp>=300 | brilliant",
+      select: "notes_schema.json; eventKinds + fact guards; most guards wins",
     },
   };
   writeFileSync(OUT_JSON, `${JSON.stringify(jsonDump, null, 2)}\n`);
