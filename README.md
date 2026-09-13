@@ -1,115 +1,121 @@
 # Chess Wrapped Analytics
 
-Expo mobile client (on-device ingest + metrics) and a thin FastAPI VPC for
-peer baselines, opening explorer/masters proxy, and a username/email registry.
+[![Verify](https://github.com/isaiapedro/chess-app/actions/workflows/verify.yml/badge.svg)](https://github.com/isaiapedro/chess-app/actions/workflows/verify.yml)
 
-## Data residency
+Chess Wrapped is a privacy-first mobile companion for reviewing your chess
+games. It imports games from Chess.com or Lichess, builds Recap, Games, Study,
+and Insights views on the device, and uses Stockfish only where analysis adds
+value. The accompanying FastAPI service is intentionally thin: it serves peer
+baselines, opening-study proxies, and a minimal account registry rather than a
+copy of a player's game history.
 
-| Location | Allowed data |
-|----------|----------------|
-| **Server / VPC** | Usernames + emails (`.cache/users/`), peer baseline metrics (`.cache/baselines/`) |
-| **Mobile device** | Auth tokens, user games, Stockfish vault, Recap/Insights/Study caches |
+## What the app does
 
-User games and other bulk personal analytics must not persist on the server.
-Server-side `user_games*` / `session_stats` disk caches stay off unless
-`ALLOW_SERVER_USER_GAMES_CACHE=1` (scripts only; never for the API happy path).
+- Builds a time-filtered recap of games, results, activity, ratings, and streaks.
+- Explains opening, middlegame, endgame, and style metrics from locally held games.
+- Lets players revisit analyzed games with evaluation graphs, coach annotations,
+  and engine variations.
+- Provides on-device mistake study and opening preparation.
+- Compares selected aggregate metrics to bundled or API-supplied peer baselines.
+
+The mobile navigation currently contains **Recap**, **Games**, **Study**,
+**Insights**, and **Profile**. The global period and speed filters shape the
+local view without re-downloading the full game archive.
+
+## Privacy and data boundary
+
+| Location | May contain | Must not contain |
+|---|---|---|
+| Mobile device | Auth token, raw games, PGN, local metrics, engine vault, coach cache | Other players' private data |
+| API / VPC | Registered username/email, shared peer aggregates, study-proxy cache | Tokens, raw games, PGN, eval vault, or bulk personal analytics |
+
+The platform and the device cache remain the source of truth for a player's
+games. Optional coach comments send compact, selected moment facts only; they
+do not upload the raw game vault. See [GOVERNANCE.md](GOVERNANCE.md) and the
+[data-lifecycle contract](MOBILE_DATA_LIFECYCLE_CONTRACT.md) for the complete
+boundary and change-control rules.
 
 ## Architecture
 
-| Layer | Owns |
-|-------|------|
-| **Mobile** | Auth (Lichess OAuth PKCE or Chess.com username+email), user-game ingest from Chess.com/Lichess, Recap + Insights, Study Stockfish vault |
-| **API (VPC)** | `POST /users/register`, peer baselines, opening explorer, masters PGN |
+```text
+Chess.com / Lichess
+        │ direct, incremental pull
+        ▼
+Expo mobile app ──► device cache ──► Recap / Games / Study / Insights
+        │                  │
+        │                  └── heuristics + selective Stockfish analysis
+        │
+        └──► thin API ──► peer baselines, opening explorer, account registry
+```
 
-## Setup
+The API does not synchronize personal games. Its browser CORS policy is
+explicitly configured with `CHESS_ALLOWED_ORIGINS`; native clients do not need
+CORS. API request logs are structured and body-free.
+
+For deeper source ownership and runtime flow, read [ARCHITECTURE.md](ARCHITECTURE.md).
+Metric definitions are in [DATA_SPECIFICATION.md](DATA_SPECIFICATION.md).
+
+## Quick start
+
+### API
 
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-```
-
-## FastAPI (thin VPC)
-
-Run from the repository root (not from `mobile/`), otherwise `api` is not importable:
-
-```bash
-cd /path/to/chess
-# Dev (auto-reload, single process)
 uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-
-# Prod-ish on a small VPC (1–2 workers; no Redis)
-UVICORN_WORKERS=2 ./scripts/run_api.sh
 ```
 
-OpenAPI docs: http://localhost:8000/docs
+OpenAPI is available at <http://localhost:8000/docs>.
 
-### Production knobs
+Copy `.env.example` to `.env` to configure optional Lichess explorer access,
+per-process limits, and approved web origins. Keep
+`ALLOW_SERVER_USER_GAMES_CACHE` off on API hosts.
 
-Copy `.env.example` → `.env`. Useful env vars (process-local only; no Redis):
-
-| Variable | Default | Role |
-|----------|---------|------|
-| `LICHESS_TOKEN` | _(empty)_ | Opening explorer reliability |
-| `API_SEM_STUDY` | `6` | Cap concurrent explorer / masters work |
-| `API_SEM_CHEAP` | `32` | Cap cheap endpoints (health, baselines, users) |
-| `ALLOW_SERVER_USER_GAMES_CACHE` | off | Must stay off on API hosts |
-
-### Endpoints
-
-| Method | Path | Description |
-|--------|------|-------------|
-| GET | `/health` | Health check |
-| POST | `/api/v1/users/register` | Upsert username + email (no tokens, no games) |
-| GET | `/api/v1/users` | List registered usernames/emails |
-| GET | `/api/v1/baselines` | Peer baseline means (also bundled on device) |
-| GET | `/api/v1/study/explorer` | Lichess/masters/player opening explorer |
-| GET | `/api/v1/study/masters-pgn/{game_id}` | Masters game PGN by id |
-
-Legacy `/api/v1/games`, `/session`, `/stats/*` are removed from the API surface.
-
-### Examples
+### Mobile
 
 ```bash
-curl "http://localhost:8000/health"
-curl -X POST "http://localhost:8000/api/v1/users/register" \
-  -H 'content-type: application/json' \
-  -d '{"platform":"chesscom","username":"alice","email":"alice@example.com"}'
-curl "http://localhost:8000/api/v1/baselines"
-```
-
-Optional for opening explorer: set `LICHESS_TOKEN` (see `.env.example`). Without it, explorer requests may return empty move lists.
-
-## Mobile (Expo SDK 54)
-
-API port `8000` may be blocked on LAN by the host firewall while Metro `8081` stays reachable.
-Metro proxies `/api/*` and `/health` → `http://127.0.0.1:8000`. Point the app at Metro:
-
-```bash
-# terminal 1 — API (from repo root)
-uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
-
-# terminal 2 — Expo
 cd mobile
+npm ci
 npx expo start -c
 ```
 
-Leave `EXPO_PUBLIC_API_URL` unset: the app derives its base URL from Expo `hostUri` for explorer/baselines only.
+The app targets Expo SDK 57. Leave `EXPO_PUBLIC_API_URL` unset for local Expo
+development unless a specific API host is required; the app can derive its
+development base URL from the Expo host for shared API resources.
 
-### Auth
+For Lichess OAuth, register `com.chesswrapped.app://oauth` for the
+`chess-wrapped-mobile` client. A development build is preferable to Expo Go
+for that redirect flow.
 
-- **Chess.com:** Profile screen collects username + contact email (SecureStore). Email is used in the Chess.com `User-Agent`.
-- **Lichess:** OAuth PKCE (`email:read`, `study:write`), client id `chess-wrapped-mobile`,
-  redirect `com.chesswrapped.app://oauth` (reverse-domain custom scheme).
-  Register that exact URI with Lichess. Expo Go may use a different linking URI — prefer a
-  development build with the app scheme for OAuth.
-- After login, the phone ingests games incrementally into AsyncStorage and computes Recap/Insights locally.
+## Verification
 
-### App surface
+Run the same deterministic checks used by GitHub Actions:
 
-- Tabs: Recap | Insights | Study (mistakes quiz + repertoire explorer) | Profile.
-- Sticky filter header: period, speed (username/platform come from auth).
-- Study board uses `chess.js` + custom squares.
-- Peer baselines load once from the API and stay in permanent device cache.
-- Pull-to-refresh verifies the active period/speed filters match loaded data; mismatched filters load the correct cached slice. Games ingest only on cold first login and warm when a filter discovers new unregistered IDs.
-- Mistake quizzes and opening prep run on-device; background Stockfish waits until heuristic metrics finish (Scan more temporarily owns the engine).
+```bash
+cd mobile && npm ci && npm run verify
+cd .. && .venv/bin/python scripts/run_python_tests.py
+```
+
+The checks cover TypeScript, deterministic mobile smoke tests, metric fixtures,
+and API request-correlation behavior. They do not replace visual verification
+on a real device or cache/performance testing; record that runtime evidence for
+user-visible or lifecycle changes. See [QUALITY.md](QUALITY.md) and
+[RELEASE.md](RELEASE.md).
+
+## Repository guide
+
+| Path | Purpose |
+|---|---|
+| `mobile/` | Expo app, local storage, analytics, Stockfish integration, and UI |
+| `api/` | FastAPI service for small shared capabilities only |
+| `scripts/` | Offline baseline and metric tooling |
+| `fixtures/`, `samples/` | Deterministic test and analysis inputs |
+| `DATA_SPECIFICATION.md` | Definitions and provenance of tracked metrics |
+| `MOBILE_DATA_LIFECYCLE_CONTRACT.md` | Cache, invalidation, compute, and residency rules |
+| `GOVERNANCE.md` | Repository authority, privacy, and release controls |
+
+New contributors and coding agents should start with [AGENTS.md](AGENTS.md)
+and [mobile/AGENT_ONBOARDING.md](mobile/AGENT_ONBOARDING.md). The repository
+uses independent commit authority; keep unrelated product work separate from
+governance, testing, and release changes.
