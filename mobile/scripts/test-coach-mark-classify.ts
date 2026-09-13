@@ -101,7 +101,6 @@ assert(
     source: "live",
     severity: "blunder",
     evalBeforeCp: 98000,
-    dropCp: 50,
     playedSan: "Kd2",
     bestSan: "Ke2",
   }),

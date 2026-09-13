@@ -1,45 +1,58 @@
-import Constants from "expo-constants";
+/**
+ * Development diagnostics are deliberately local: they are never posted to a
+ * collector. Keep payloads small and free of account, game, or board data so
+ * a console capture is safe to share when debugging a development build.
+ */
 
-function debugHosts(): string[] {
-  const hosts = new Set<string>(["127.0.0.1", "10.0.2.2"]);
-  try {
-    const hostUri =
-      Constants.expoConfig?.hostUri ||
-      Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-    const host = hostUri?.split(":")[0];
-    if (host) hosts.add(host);
-  } catch {
-    /* ignore */
+type DiagnosticData = Record<string, unknown>;
+
+const MAX_DEPTH = 3;
+const MAX_ENTRIES = 24;
+const MAX_STRING_LENGTH = 160;
+const SENSITIVE_KEY =
+  /(?:auth|token|secret|password|cookie|email|user(?:name)?|account|owner|game(?:id)?|pgn|fen|move(?:s)?|position|url|uri|host|session|run)/i;
+const SENSITIVE_VALUE = /(?:https?:\/\/|bearer\s+|token=|^[prnbqk1-8/]+ [wb] [KQkq-]+ )/i;
+
+function redact(value: unknown, depth = 0): unknown {
+  if (value === null || typeof value === "boolean" || typeof value === "number") {
+    return value;
   }
-  return [...hosts];
+  if (typeof value === "string") {
+    if (SENSITIVE_VALUE.test(value)) return "[redacted]";
+    return value.length > MAX_STRING_LENGTH
+      ? `${value.slice(0, MAX_STRING_LENGTH)}…[truncated]`
+      : value;
+  }
+  if (depth >= MAX_DEPTH) return "[truncated]";
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_ENTRIES).map((item) => redact(item, depth + 1));
+  }
+  if (typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .slice(0, MAX_ENTRIES)
+        .map(([key, nested]) => [
+          key,
+          SENSITIVE_KEY.test(key) ? "[redacted]" : redact(nested, depth + 1),
+        ])
+    );
+  }
+  return String(value);
 }
 
 export function agentLog(
   hypothesisId: string,
   location: string,
   message: string,
-  data: Record<string, unknown> = {}
+  data: DiagnosticData = {}
 ): void {
-  const payload = JSON.stringify({
-    sessionId: "89656d",
-    runId: "freeze",
+  if (!__DEV__) return;
+
+  console.debug("[chess-wrapped diagnostic]", {
     hypothesisId,
     location,
     message,
-    data,
-    timestamp: Date.now(),
+    data: redact(data),
+    timestamp: new Date().toISOString(),
   });
-  // #region agent log
-  for (const host of debugHosts()) {
-    fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-Debug-Session-Id": "89656d",
-      },
-      body: payload,
-    }).catch(() => {});
-  }
-  console.log(`[dbg-89656d][${hypothesisId}] ${location}: ${message}`, data);
-  // #endregion
 }

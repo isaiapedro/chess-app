@@ -335,7 +335,7 @@ export function classifyPawnBreakClass(args: {
     return "wrong_wing_break";
   }
   if (breakWing === "center") return "wrong_center_break";
-  if (args.preferCenterStrike && breakWing !== "center") {
+  if (args.preferCenterStrike) {
     return "thematic_wing_break";
   }
   return "wrong_wing_break";

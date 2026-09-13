@@ -111,7 +111,18 @@ def analyze_opening_game(
     color = chess.WHITE if user_is_white else chess.BLACK
     board = game.board()
 
+    # Determine the user's first castle before deriving the phase boundary.
+    # Otherwise the fallback boundary for an uncastled game (move 15) stops
+    # the scan before a legitimate later castle can be observed.
     castle_fullmove: int | None = None
+    castle_scan = game.board()
+    for ply_idx, node in enumerate(game.mainline()):
+        move = node.move
+        full_move = ply_idx // 2 + 1
+        if castle_scan.turn == color and castle_scan.is_castling(move):
+            castle_fullmove = full_move
+            break
+        castle_scan.push(move)
     center_samples: list[float] = []
     accuracy_samples: list[float] = []
     tempo_moves = 0
@@ -131,19 +142,14 @@ def analyze_opening_game(
         return None
 
     last_white_cp = next_eval_cp()
-    phase_end = opening_phase_end_fullmove(None)
+    phase_end = opening_phase_end_fullmove(castle_fullmove)
 
     for ply_idx, node in enumerate(game.mainline()):
         move = node.move
         full_move = ply_idx // 2 + 1
         is_user = board.turn == color
         moving = board.piece_at(move.from_square)
-        is_castle = board.is_castling(move)
         cp_before_white = last_white_cp
-
-        if is_user and is_castle and castle_fullmove is None:
-            castle_fullmove = full_move
-            phase_end = opening_phase_end_fullmove(castle_fullmove)
 
         in_phase = full_move <= phase_end
 

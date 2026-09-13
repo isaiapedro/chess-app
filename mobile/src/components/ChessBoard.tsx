@@ -243,7 +243,7 @@ export function ChessBoard({
       ? enPassantCaptureSq(
           flyFrom,
           flyTo,
-          flyPiece,
+          flyPiece ?? null,
           Boolean(chess.get(flyTo))
         )
       : null;

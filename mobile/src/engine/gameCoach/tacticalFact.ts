@@ -760,7 +760,7 @@ export function formatTacticalFactHead(fact: TacticalFact): string {
 
 export function formatTacticalFactShort(fact: TacticalFact | null | undefined): string {
   if (!fact?.kind) return "";
-  const bits = [fact.kind];
+  const bits: string[] = [fact.kind];
   if (fact.selfInflicted) bits.push("own");
   if (fact.motif) bits.push(fact.motif);
   if (fact.pieceLabel) bits.push(fact.pieceLabel);
@@ -801,4 +801,3 @@ export function tacticalLockBoostForKey(
   if (idx < 0) return 0;
   return Math.max(8, 26 - idx * 4);
 }
-

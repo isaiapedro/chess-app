@@ -110,9 +110,12 @@ def test_late_castle_uncapped() -> None:
         "Bb8",
         "O-O",
     ]
+    game = chess.pgn.Game()
+    node = game
     for san in moves:
-        board.push_san(san)
-    game = chess.pgn.Game.from_board(board)
+        move = board.parse_san(san)
+        node = node.add_variation(move)
+        board.push(move)
     game.headers["White"] = "A"
     game.headers["Black"] = "B"
     exporter = chess.pgn.StringExporter(headers=True, variations=False, comments=False)

@@ -3,7 +3,7 @@ import type { StudyGame } from "./analyzeMistakes";
 import { resolveEcoFamily } from "./ecoFamilies";
 import { winProbabilityFromCp } from "./winProb";
 
-export const OPENING_PHASE_MIN_FULLMOVE = 11;
+export const OPENING_PHASE_MIN_FULLMOVE = 12;
 export const OPENING_PHASE_NEVER_CASTLE_FULLMOVE = 15;
 export const DEVELOPMENT_CHECK_FULLMOVE = 10;
 
@@ -213,10 +213,29 @@ export function analyzeOpeningGame(
   const sans = parseSans(game);
   if (!sans.length) return null;
 
-  const board = new Chess();
   const userIsWhite =
     String(game.user_color || "white").toLowerCase() === "white";
   const color: Color = userIsWhite ? "w" : "b";
+  // Resolve a late castle before calculating the boundary. A one-pass scan
+  // capped by the uncastled fallback would incorrectly classify a move-16+
+  // castle as "never castled".
+  const castleScan = new Chess();
+  let castleFullmove: number | null = null;
+  for (let plyIdx = 0; plyIdx < sans.length; plyIdx += 1) {
+    const isUser = castleScan.turn() === color;
+    let move: Move | null = null;
+    try {
+      move = castleScan.move(sans[plyIdx]) as Move;
+    } catch {
+      break;
+    }
+    if (isUser && (move.isKingsideCastle() || move.isQueensideCastle())) {
+      castleFullmove = Math.floor(plyIdx / 2) + 1;
+      break;
+    }
+  }
+
+  const board = new Chess();
   const evals = evalsWhiteCp ? [...evalsWhiteCp] : [];
   let evalIdx = 0;
   const nextEval = (): number | null => {
@@ -229,8 +248,7 @@ export function analyzeOpeningGame(
   };
 
   let lastWhiteCp = nextEval();
-  let castleFullmove: number | null = null;
-  let phaseEnd = openingPhaseEndFullmove(null);
+  const phaseEnd = openingPhaseEndFullmove(castleFullmove);
   const centerSamples: number[] = [];
   const accuracySamples: number[] = [];
   let tempoMoves = 0;
@@ -254,13 +272,6 @@ export function analyzeOpeningGame(
     const isUser = board.turn() === color;
     const moving = board.get(move.from);
     const cpBeforeWhite = lastWhiteCp;
-    const isCastle = move.isKingsideCastle() || move.isQueensideCastle();
-
-    if (isUser && isCastle && castleFullmove == null) {
-      castleFullmove = fullMove;
-      phaseEnd = openingPhaseEndFullmove(castleFullmove);
-    }
-
     const inPhase = fullMove <= phaseEnd;
 
     if (isUser && moving && inPhase && moving.type !== "p") {

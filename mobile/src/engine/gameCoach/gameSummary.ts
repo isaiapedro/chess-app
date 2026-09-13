@@ -16,9 +16,9 @@ type SummaryPly = {
   themes?: string[];
   ply?: number;
   fenAfter?: string;
-  deltaCp?: number;
-  evalBeforeCp?: number;
-  evalAfterCp?: number;
+  deltaCp?: number | null;
+  evalBeforeCp?: number | null;
+  evalAfterCp?: number | null;
 };
 
 function tipPhase(tip: KeyTip): PhaseName {

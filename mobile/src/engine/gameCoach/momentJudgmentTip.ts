@@ -453,7 +453,7 @@ export function composeMomentJudgmentTip(args: {
         softKeys: [
           ...new Set(
             [args.packKeyId, args.fact.kind ? `motif.${args.fact.kind}` : ""]
-              .filter(Boolean)
+              .filter((key): key is string => Boolean(key))
           ),
         ].slice(0, 6),
         metrics: [],

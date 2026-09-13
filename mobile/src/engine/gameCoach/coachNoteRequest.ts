@@ -1005,7 +1005,7 @@ export function buildCoachNoteRequest(args: {
             pawnStormTempo: args.pawnStormTempo ?? null,
           })
         : [];
-  const situationStamp =
+  const situationStamp: Record<string, string | number | boolean | null> =
     situations.length > 0
       ? {
           situations: formatSituationsShort(situations),
@@ -1091,7 +1091,7 @@ export function buildCoachNoteRequest(args: {
     engineVsPlayedMetricDelta,
     tempoHit.waste
   );
-  const tempoStamp = tempoHit.waste
+  const tempoStamp: Record<string, string | number | boolean | null> = tempoHit.waste
     ? {
         played_tempo_waste: true,
         played_tempo_piece: tempoHit.piece,
@@ -1226,7 +1226,7 @@ export function coachRequestMetaInputs(
   request: CoachNoteRequest | null | undefined
 ): Record<string, string | number | boolean | null> {
   if (!request) return {};
-  const sit =
+  const sit: Record<string, string | number | boolean | null> =
     request.inputs?.situations != null
       ? {
           situations: request.inputs.situations,

@@ -97,7 +97,6 @@ export const THEME_TO_METRIC_KEY: Record<string, string> = {
   dragon_formation: "structure.dragon_formation",
   dragon: "structure.dragon_formation",
   knight_vs_bishop: "imbalance.knight_vs_bishop",
-  good_vs_bad_bishop: "imbalance.good_vs_bad_bishop",
   pawn_storm: "attack.opposite_side_castling",
   pawn_storm_tempo: "attack.opposite_side_castling",
   bishop_pair: "imbalance.bishop_pair",

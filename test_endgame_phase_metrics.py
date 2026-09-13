@@ -82,7 +82,7 @@ def test_analyze_reaches_endgame() -> None:
 [FEN "4k3/4p3/8/8/8/8/8/R3K3 w - - 0 1"]
 [SetUp "1"]
 
-1. Ra7 Kf8 2. Ra8+ Ke7 3. Ra7+ Kd8 4. Ra8+ Ke7 1/2-1/2
+1. Ra7 Kf8 2. Ra8+ Kg7 3. Ra7+ Kf8 4. Ra8+ Kg7 1/2-1/2
 """
     row = analyze_endgame_game(pgn, "white", result="Draw")
     assert row is not None
@@ -103,7 +103,7 @@ def test_saved_disadvantage_side() -> None:
 [FEN "4k3/4p3/8/8/8/8/8/R3K3 w - - 0 1"]
 [SetUp "1"]
 
-1. Ra7 Kf8 2. Ra8+ Ke7 3. Ra7+ Kd8 4. Ra8+ Ke7 1/2-1/2
+1. Ra7 Kf8 2. Ra8+ Kg7 3. Ra7+ Kf8 4. Ra8+ Kg7 1/2-1/2
 """
     as_black = analyze_endgame_game(pgn, "black", result="Draw")
     assert as_black is not None

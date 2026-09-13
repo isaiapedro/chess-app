@@ -21,6 +21,7 @@ import {
   toneVerdictLead,
   type TipAspect,
 } from "./tipAspectAssemble";
+import type { CoachMark } from "./coachMarks";
 
 export type StrategicTipResult = {
   text: string;
@@ -52,7 +53,7 @@ export function composeMiddlegameStrategicTip(args: {
   const tone = strategicToneFromInputs(inputs, args.mark);
   const verdict = toneVerdictLead({
     tone,
-    mark: args.mark,
+    mark: args.mark as CoachMark | null | undefined,
     kind: "structural_moment",
     varietyKey:
       args.packKeyId ||
