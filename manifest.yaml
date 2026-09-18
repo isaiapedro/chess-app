@@ -1,0 +1,56 @@
+id: chess_wrapped
+type: side_project_application
+name: Chess Wrapped Analytics
+version: 1.0.0
+status: active
+owner: isaiapedro
+description: >
+  Privacy-first chess analytics with an Expo mobile client and a thin FastAPI
+  service for shared baselines, account registration, and study proxies.
+
+repository:
+  kind: nested_repository
+  commit_authority: independent
+  registry_id: chess_app
+  registry_path: registry/repositories.yaml
+
+data_boundary:
+  personal_game_data: device_only
+  permitted_server_data:
+    - username
+    - email
+    - peer_baseline_aggregates
+    - study_proxy_cache
+  prohibited_server_data:
+    - auth_tokens
+    - raw_games
+    - pgn
+    - eval_vault
+    - bulk_personal_analytics
+
+interfaces:
+  overview: README.md
+  architecture: ARCHITECTURE.md
+  agent_instructions: AGENTS.md
+  data_lifecycle: MOBILE_DATA_LIFECYCLE_CONTRACT.md
+  data_specification: DATA_SPECIFICATION.md
+  governance: GOVERNANCE.md
+  ownership: OWNERSHIP.md
+  quality_gate: QUALITY.md
+  release_runbook: RELEASE.md
+  audit_log: AUDIT.md
+  traceability_log: TRACEABILITY.md
+  decisions: DECISIONS.md
+
+components:
+  - id: chess_api
+    path: api
+    role: thin_shared_service
+  - id: chess_mobile
+    path: mobile
+    role: privacy_first_mobile_client
+
+quality_status:
+  unified_ci_gate: baseline_active
+  ci_workflow: .github/workflows/verify.yml
+  required_release_evidence: QUALITY.md

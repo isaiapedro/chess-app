@@ -1,0 +1,508 @@
+import { Chess, type Color, type Move, type Square } from "chess.js";
+import type { StudyGame } from "./analyzeMistakes";
+import { resolveEcoFamily } from "./ecoFamilies";
+import { winProbabilityFromCp } from "./winProb";
+
+export const OPENING_PHASE_MIN_FULLMOVE = 12;
+export const OPENING_PHASE_NEVER_CASTLE_FULLMOVE = 15;
+export const DEVELOPMENT_CHECK_FULLMOVE = 10;
+
+const CENTER_SQUARES: Square[] = ["d4", "e4", "d5", "e5"];
+const WHITE_MINOR_START = new Set<string>(["b1", "g1", "c1", "f1"]);
+const BLACK_MINOR_START = new Set<string>(["b8", "g8", "c8", "f8"]);
+
+const PIECE_START: Record<Color, Record<string, readonly string[]>> = {
+  w: {
+    n: ["b1", "g1"],
+    b: ["c1", "f1"],
+    r: ["a1", "h1"],
+    q: ["d1"],
+    k: ["e1"],
+  },
+  b: {
+    n: ["b8", "g8"],
+    b: ["c8", "f8"],
+    r: ["a8", "h8"],
+    q: ["d8"],
+    k: ["e8"],
+  },
+};
+
+export type OpeningTempoWasteHit = {
+  waste: boolean;
+  piece: string | null;
+};
+
+export function isOpeningTempoWasteMove(
+  board: Chess,
+  move: Pick<
+    Move,
+    "piece" | "from" | "isKingsideCastle" | "isQueensideCastle"
+  >,
+  color: Color
+): OpeningTempoWasteHit {
+  if (move.piece === "p") return { waste: false, piece: null };
+  if (move.isKingsideCastle() || move.isQueensideCastle()) {
+    return { waste: false, piece: null };
+  }
+  if (countMinorsDeveloped(board, color) >= 4) {
+    return { waste: false, piece: move.piece };
+  }
+  const homes = PIECE_START[color][move.piece];
+  if (!homes) return { waste: false, piece: move.piece };
+  if (homes.includes(move.from)) return { waste: false, piece: move.piece };
+  return { waste: true, piece: move.piece };
+}
+
+const ACCURACY_A = 103.1668;
+const ACCURACY_B = 0.04354;
+const ACCURACY_C = 3.1669;
+
+export type OpeningGameRow = {
+  opening_accuracy_pct: number | null;
+  opening_minors_developed_by_10: number | null;
+  opening_center_control_pct: number | null;
+  opening_castle_fullmove: number | null;
+  uncastled: boolean;
+  opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves: number;
+  accuracy_moves: number;
+  phase_end_fullmove: number;
+  /** Coach-only — not on Insights metrics tab. */
+  opening_king_attackers_score?: number | null;
+  opening_king_attackers_rises?: number;
+  opening_opp_king_attackers_score?: number | null;
+  opening_opp_king_attackers_rises?: number;
+  opening_pawn_breaks?: number;
+  opening_defended_pawns?: number;
+  opening_unblocking_bishop_light?: number;
+  opening_unblocking_bishop_dark?: number;
+  opening_checks?: number;
+  opening_blocking_checks?: number;
+  user_color?: string;
+  opening_eco?: string;
+  opening_name?: string;
+  result?: string;
+};
+
+export type OpeningMetricsAggregate = {
+  opening_accuracy_pct: number | null;
+  opening_minors_developed_by_10: number | null;
+  opening_center_control_pct: number | null;
+  opening_castle_fullmove: number | null;
+  opening_uncastled_rate_pct: number | null;
+  opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves_avg: number | null;
+  games: number;
+  castled_games: number;
+  accuracy_games: number;
+};
+
+export type OpeningSideCard = {
+  opening_eco: string;
+  opening_name: string;
+  eco_label?: string;
+  games: number;
+  win_rate: number;
+  opening_accuracy_pct: number | null;
+  opening_minors_developed_by_10: number | null;
+  opening_center_control_pct: number | null;
+  opening_castle_fullmove: number | null;
+  opening_uncastled_rate_pct: number | null;
+  opening_tempo_waste_rate_pct: number | null;
+  opening_pawn_moves_avg: number | null;
+};
+
+export function moveAccuracyPct(
+  winPctBefore: number,
+  winPctAfter: number
+): number {
+  const delta = winPctBefore - winPctAfter;
+  const raw = ACCURACY_A * Math.exp(-ACCURACY_B * delta) - ACCURACY_C;
+  return Math.max(0, Math.min(100, raw));
+}
+
+export function openingPhaseEndFullmove(
+  castleFullmove: number | null
+): number {
+  if (castleFullmove == null) {
+    return Math.max(
+      OPENING_PHASE_MIN_FULLMOVE,
+      OPENING_PHASE_NEVER_CASTLE_FULLMOVE
+    );
+  }
+  return Math.max(OPENING_PHASE_MIN_FULLMOVE, castleFullmove);
+}
+
+function parseSans(game: StudyGame): string[] {
+  if (game.moves_str?.trim()) {
+    return game.moves_str.trim().split(/\s+/).filter(Boolean);
+  }
+  if (!game.pgn_str?.trim()) return [];
+  try {
+    const chess = new Chess();
+    chess.loadPgn(game.pgn_str, { strict: false });
+    return chess.history();
+  } catch {
+    return [];
+  }
+}
+
+export function minorHomeSquares(color: Color): Set<string> {
+  return color === "w" ? WHITE_MINOR_START : BLACK_MINOR_START;
+}
+
+export function noteMinorLeftHome(
+  developedHomes: Set<string>,
+  color: Color,
+  from: string,
+  pieceType: string
+): void {
+  if (pieceType !== "n" && pieceType !== "b") return;
+  if (minorHomeSquares(color).has(from)) developedHomes.add(from);
+}
+
+export function countMinorsDeveloped(board: Chess, color: Color): number {
+  const start = minorHomeSquares(color);
+  let developed = 0;
+  const grid = board.board();
+  const files = "abcdefgh";
+  for (let rank = 0; rank < 8; rank += 1) {
+    for (let file = 0; file < 8; file += 1) {
+      const piece = grid[rank][file];
+      if (!piece || piece.color !== color) continue;
+      if (piece.type !== "n" && piece.type !== "b") continue;
+      const sq = `${files[file]}${8 - rank}`;
+      if (!start.has(sq)) developed += 1;
+    }
+  }
+  return Math.min(4, developed);
+}
+
+export function countMinorsEverDeveloped(developedHomes: Set<string>): number {
+  return Math.min(4, developedHomes.size);
+}
+
+export function centerControlShare(board: Chess, color: Color): number {
+  let controlled = 0;
+  for (const sq of CENTER_SQUARES) {
+    const piece = board.get(sq);
+    if (piece && piece.color === color) {
+      controlled += 1;
+      continue;
+    }
+    if (!piece && board.attackers(sq, color).length > 0) controlled += 1;
+  }
+  return (controlled / 4) * 100;
+}
+
+function mean(vals: number[], digits = 1): number | null {
+  if (!vals.length) return null;
+  const factor = 10 ** digits;
+  return (
+    Math.round(
+      (vals.reduce((a, b) => a + b, 0) / vals.length) * factor
+    ) / factor
+  );
+}
+
+export function analyzeOpeningGame(
+  game: StudyGame,
+  evalsWhiteCp?: number[] | null
+): OpeningGameRow | null {
+  const sans = parseSans(game);
+  if (!sans.length) return null;
+
+  const userIsWhite =
+    String(game.user_color || "white").toLowerCase() === "white";
+  const color: Color = userIsWhite ? "w" : "b";
+  // Resolve a late castle before calculating the boundary. A one-pass scan
+  // capped by the uncastled fallback would incorrectly classify a move-16+
+  // castle as "never castled".
+  const castleScan = new Chess();
+  let castleFullmove: number | null = null;
+  for (let plyIdx = 0; plyIdx < sans.length; plyIdx += 1) {
+    const isUser = castleScan.turn() === color;
+    let move: Move | null = null;
+    try {
+      move = castleScan.move(sans[plyIdx]) as Move;
+    } catch {
+      break;
+    }
+    if (isUser && (move.isKingsideCastle() || move.isQueensideCastle())) {
+      castleFullmove = Math.floor(plyIdx / 2) + 1;
+      break;
+    }
+  }
+
+  const board = new Chess();
+  const evals = evalsWhiteCp ? [...evalsWhiteCp] : [];
+  let evalIdx = 0;
+  const nextEval = (): number | null => {
+    if (evalIdx < evals.length) {
+      const cp = evals[evalIdx];
+      evalIdx += 1;
+      return cp;
+    }
+    return null;
+  };
+
+  let lastWhiteCp = nextEval();
+  const phaseEnd = openingPhaseEndFullmove(castleFullmove);
+  const centerSamples: number[] = [];
+  const accuracySamples: number[] = [];
+  let tempoMoves = 0;
+  let tempoWastes = 0;
+  let pawnMoves = 0;
+  const timesMoved = new Map<string, number>();
+  const developedHomes = new Set<string>();
+  let minorsAt10: number | null = null;
+
+  for (let plyIdx = 0; plyIdx < sans.length; plyIdx += 1) {
+    let move: Move | null = null;
+    try {
+      move = board.move(sans[plyIdx]) as Move;
+    } catch {
+      move = null;
+    }
+    if (!move) break;
+    board.undo();
+
+    const fullMove = Math.floor(plyIdx / 2) + 1;
+    const isUser = board.turn() === color;
+    const moving = board.get(move.from);
+    const cpBeforeWhite = lastWhiteCp;
+    const inPhase = fullMove <= phaseEnd;
+
+    if (isUser && moving && inPhase && moving.type !== "p") {
+      tempoMoves += 1;
+      const prior = timesMoved.get(move.from) || 0;
+      if (prior >= 1 && developedHomes.size < 4) tempoWastes += 1;
+      timesMoved.set(move.to, prior + 1);
+      if (move.to !== move.from) timesMoved.set(move.from, 0);
+    }
+
+    if (isUser && moving && inPhase && moving.type === "p") {
+      pawnMoves += 1;
+    }
+
+    if (isUser && moving) {
+      noteMinorLeftHome(developedHomes, color, move.from, moving.type);
+    }
+
+    board.move(move);
+
+    if (
+      minorsAt10 == null &&
+      fullMove === DEVELOPMENT_CHECK_FULLMOVE &&
+      board.turn() === "w"
+    ) {
+      minorsAt10 = countMinorsEverDeveloped(developedHomes);
+    }
+
+    const cpAfterWhite = nextEval();
+    if (cpAfterWhite != null) lastWhiteCp = cpAfterWhite;
+
+    if (inPhase) centerSamples.push(centerControlShare(board, color));
+
+    if (
+      isUser &&
+      inPhase &&
+      cpBeforeWhite != null &&
+      cpAfterWhite != null
+    ) {
+      const beforeUser = userIsWhite ? cpBeforeWhite : -cpBeforeWhite;
+      const afterUser = userIsWhite ? cpAfterWhite : -cpAfterWhite;
+      accuracySamples.push(
+        moveAccuracyPct(
+          winProbabilityFromCp(beforeUser) * 100,
+          winProbabilityFromCp(afterUser) * 100
+        )
+      );
+    }
+
+    if (fullMove > phaseEnd) break;
+  }
+
+  if (minorsAt10 == null) {
+    minorsAt10 = countMinorsEverDeveloped(developedHomes);
+  }
+
+  return {
+    opening_accuracy_pct: mean(accuracySamples, 1),
+    opening_minors_developed_by_10: minorsAt10,
+    opening_center_control_pct: mean(centerSamples, 1),
+    opening_castle_fullmove: castleFullmove,
+    uncastled: castleFullmove == null,
+    opening_tempo_waste_rate_pct:
+      tempoMoves > 0
+        ? Math.round((tempoWastes / tempoMoves) * 1000) / 10
+        : null,
+    opening_pawn_moves: pawnMoves,
+    accuracy_moves: accuracySamples.length,
+    phase_end_fullmove: openingPhaseEndFullmove(castleFullmove),
+    user_color: String(game.user_color || "white"),
+    opening_eco: game.opening_eco,
+    opening_name: game.opening_name,
+    result: game.result,
+  };
+}
+
+export function aggregateOpeningMetrics(
+  rows: OpeningGameRow[]
+): OpeningMetricsAggregate {
+  const empty: OpeningMetricsAggregate = {
+    opening_accuracy_pct: null,
+    opening_minors_developed_by_10: null,
+    opening_center_control_pct: null,
+    opening_castle_fullmove: null,
+    opening_uncastled_rate_pct: null,
+    opening_tempo_waste_rate_pct: null,
+    opening_pawn_moves_avg: null,
+    games: 0,
+    castled_games: 0,
+    accuracy_games: 0,
+  };
+  if (!rows.length) return empty;
+
+  const accuracy = rows
+    .map((r) => r.opening_accuracy_pct)
+    .filter((v): v is number => v != null);
+  const minors = rows
+    .map((r) => r.opening_minors_developed_by_10)
+    .filter((v): v is number => v != null);
+  const center = rows
+    .map((r) => r.opening_center_control_pct)
+    .filter((v): v is number => v != null);
+  const castles = rows
+    .map((r) => r.opening_castle_fullmove)
+    .filter((v): v is number => v != null);
+  const tempo = rows
+    .map((r) => r.opening_tempo_waste_rate_pct)
+    .filter((v): v is number => v != null);
+  const pawns = rows.map((r) => r.opening_pawn_moves);
+  const uncastledN = rows.filter((r) => r.uncastled).length;
+  const n = rows.length;
+  return {
+    opening_accuracy_pct: mean(accuracy, 1),
+    opening_minors_developed_by_10: mean(minors, 1),
+    opening_center_control_pct: mean(center, 1),
+    opening_castle_fullmove: mean(castles, 1),
+    opening_uncastled_rate_pct:
+      n > 0 ? Math.round((uncastledN / n) * 1000) / 10 : null,
+    opening_tempo_waste_rate_pct: mean(tempo, 1),
+    opening_pawn_moves_avg: mean(pawns, 1),
+    games: n,
+    castled_games: castles.length,
+    accuracy_games: accuracy.length,
+  };
+}
+
+export function topOpeningsBySide(
+  rows: OpeningGameRow[],
+  limit = 5,
+  minGames = 3
+): { white: OpeningSideCard[]; black: OpeningSideCard[] } {
+  const buckets = new Map<string, OpeningGameRow[]>();
+  const labels = new Map<string, { name: string; ecoLabel: string }>();
+
+  for (const row of rows) {
+    const color = String(row.user_color || "white").toLowerCase();
+    if (color !== "white" && color !== "black") continue;
+    const eco = String(row.opening_eco || "UNK").trim().toUpperCase() || "UNK";
+    const variation = String(row.opening_name || eco || "Unknown");
+    const family = resolveEcoFamily(eco, variation);
+    const familyKey =
+      family?.key || (eco !== "UNK" ? eco : variation.toLowerCase());
+    const key = `${color}::${familyKey}`;
+    const list = buckets.get(key) || [];
+    list.push(row);
+    buckets.set(key, list);
+    if (!labels.has(key)) {
+      labels.set(key, {
+        name: family?.name || variation,
+        ecoLabel: family?.ecoLabel || (eco !== "UNK" ? eco : "UNK"),
+      });
+    }
+  }
+
+  const build = (side: "white" | "black"): OpeningSideCard[] => {
+    const items: OpeningSideCard[] = [];
+    for (const [key, group] of buckets) {
+      if (!key.startsWith(`${side}::`) || group.length < minGames) continue;
+      const label = labels.get(key) || {
+        name: "Unknown",
+        ecoLabel: "UNK",
+      };
+      const agg = aggregateOpeningMetrics(group);
+      const wins = group.filter((g) => String(g.result) === "Win").length;
+      items.push({
+        opening_eco: label.ecoLabel,
+        opening_name: label.name,
+        eco_label: label.ecoLabel,
+        games: group.length,
+        win_rate: Math.round((wins / group.length) * 1000) / 10,
+        opening_accuracy_pct: agg.opening_accuracy_pct,
+        opening_minors_developed_by_10: agg.opening_minors_developed_by_10,
+        opening_center_control_pct: agg.opening_center_control_pct,
+        opening_castle_fullmove: agg.opening_castle_fullmove,
+        opening_uncastled_rate_pct: agg.opening_uncastled_rate_pct,
+        opening_tempo_waste_rate_pct: agg.opening_tempo_waste_rate_pct,
+        opening_pawn_moves_avg: agg.opening_pawn_moves_avg,
+      });
+    }
+    items.sort(
+      (a, b) =>
+        b.games - a.games || a.opening_name.localeCompare(b.opening_name)
+    );
+    return items.slice(0, limit);
+  };
+
+  return { white: build("white"), black: build("black") };
+}
+
+export async function analyzeOpeningGamesBatched(
+  games: StudyGame[],
+  evalsById: Record<string, number[]> | undefined,
+  options?: {
+    batchSize?: number;
+    signal?: { cancelled: boolean };
+    onPartial?: (
+      rows: OpeningGameRow[],
+      scanned: number,
+      total: number
+    ) => void;
+  }
+): Promise<OpeningGameRow[]> {
+  const batchSize = options?.batchSize ?? 3;
+  const rows: OpeningGameRow[] = [];
+  const total = games.length;
+  for (let i = 0; i < games.length; i += batchSize) {
+    if (options?.signal?.cancelled) break;
+    const chunk = games.slice(i, i + batchSize);
+    for (const game of chunk) {
+      const evals = evalsById?.[String(game.id)];
+      const row = analyzeOpeningGame(game, evals);
+      if (row) rows.push(row);
+    }
+    const scanned = Math.min(i + batchSize, total);
+    options?.onPartial?.([...rows], scanned, total);
+    await new Promise<void>((resolve) => {
+      requestAnimationFrame(() => setTimeout(resolve, 0));
+    });
+  }
+  return rows;
+}
+
+export function analyzeOpeningGames(
+  games: StudyGame[],
+  evalsById?: Record<string, number[]>
+): OpeningGameRow[] {
+  const rows: OpeningGameRow[] = [];
+  for (const game of games) {
+    const evals = evalsById?.[String(game.id)];
+    const row = analyzeOpeningGame(game, evals);
+    if (row) rows.push(row);
+  }
+  return rows;
+}

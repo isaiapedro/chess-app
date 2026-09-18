@@ -1,0 +1,1233 @@
+/**
+ * Metric-driven soft-key weights + FEN-free pack tip selection.
+ * Games analyze picks notes from vault/heuristics/marks — not FEN/SAN match.
+ */
+
+import type { CoachMark } from "./coachMarks";
+import type { DerivedCoachEntry, DerivedCoachNote } from "./derivedCoachPack";
+import {
+  reformatCoachNote,
+  reformatCoachNoteOneClaim,
+  isCorruptPackNote,
+} from "./derivedPolish";
+import { polishCoachProse } from "./coachProse";
+import type { CoachGameMetrics, CoachMetricMoment } from "./coachGameMetrics";
+import type { CoachNoteRequest } from "./coachNoteRequest";
+import {
+  requestAlwaysAttaches,
+  isBadMoveMark,
+  isFixedCheckpointMoment,
+} from "./coachNoteRequest";
+import {
+  type KeyTip,
+  type PhaseGameKeys,
+} from "./keyRetrieve";
+import { softKeysForNoteRequest } from "./metricNoteKeys";
+import { explainEngineLineVsPlayed } from "./engineLineExplain";
+import { metricKeyLabel } from "./metricThemes";
+import {
+  METRIC_TIP_MIN_WEIGHT,
+  STRUCTURE_THEMES,
+  shouldAttachMetricTip,
+  weightKeyForMoment,
+  type PhaseName,
+} from "./metricNoteWeights";
+import type { GamePlanState } from "./gamePlanState";
+import {
+  softKeysFromOpeningPeerGaps,
+} from "./openingCoachInputs";
+import { softKeysFromMiddlegamePeerGaps } from "./middlegameCoachInputs";
+import { softKeysFromEndgameContext } from "./endgameContext";
+import { composeMiddlegameJudgmentTipDetailed } from "./middlegameJudgmentTip";
+import {
+  composeMiddlegameStrategicTip,
+  hasMiddlegameStrategicLead,
+} from "./middlegameStrategicTip";
+import {
+  composeEndgameStrategicTip,
+  hasEndgameStrategicLead,
+} from "./endgameStrategicTip";
+import { composeEndgameJudgmentTipDetailed } from "./endgameJudgmentTip";
+import { checkpointMistakeTakesOver } from "./phaseCheckpointTip";
+import {
+  composeOpeningJudgmentTipDetailed,
+  rankOpeningTipKeyIds,
+  OPENING_TIP_KEY_ID_CAP,
+  type OpeningJudgmentTipResult,
+  type OpeningTipPrior,
+} from "./openingJudgmentTip";
+import { composeMomentJudgmentTip } from "./momentJudgmentTip";
+import { buildTipCoordinate, scanPillarConditions } from "./tipCoordinate";
+import {
+  softKeysForTacticalFact,
+  type TacticalFact,
+} from "./tacticalFact";
+import {
+  lessonFromPackNote,
+  packConditionFeatures,
+  pickNoteForContext,
+  type PackPickContext,
+} from "./packNoteContent";
+import type { PackNoteByKey } from "./phaseCheckpointTip";
+
+export type { OpeningTipPrior, OpeningJudgmentTipResult };
+
+export {
+  shouldAttachMetricTip,
+  explainAttachMetricTip,
+  weightKeyForMoment,
+  rankMetricNoteWeights,
+  formatWeightBreakdown,
+  themesForPly,
+  METRIC_TIP_MIN_WEIGHT,
+  STRUCTURE_THEMES,
+  type PhaseName,
+  type KeyWeightBreakdown,
+  type WeightPart,
+} from "./metricNoteWeights";
+
+export {
+  COACH_NOTE_REQUEST_CONFIG,
+  buildCoachNoteRequest,
+  formatCoachNoteRequest,
+  lineComparisonMomentInputs,
+  coachRequestMetaInputs,
+  durableUnusedStructureThemes,
+  isPraiseMark,
+  isFixedCheckpointMoment,
+  requestAlwaysAttaches,
+  playedMoveIsBest,
+  openingEvalGapAllowsEngineLine,
+  pawnBreakEvalGapAllowsRecommend,
+  engineLineSansBudget,
+  composePlayedAltLine,
+  type CoachNoteRequest,
+  type CoachNoteRequestKind,
+} from "./coachNoteRequest";
+
+function keyFamily(keyId: string): string {
+  return (keyId || "").split(".")[0] || "";
+}
+
+function keyTail(keyId: string): string {
+  const parts = (keyId || "").split(".");
+  return parts[parts.length - 1] || keyId;
+}
+
+function notePhaseOk(note: DerivedCoachNote, phase: PhaseName): boolean {
+  const p = (note.phase || "any").toLowerCase();
+  return p === "any" || p === phase || !note.phase;
+}
+
+function isOpeningCheckpointRequest(
+  request?: CoachNoteRequest | null,
+  moment?: CoachMetricMoment | null
+): boolean {
+  const sk =
+    request?.structuralKind || moment?.structuralKind || null;
+  return sk === "opening_name" || sk === "opening_aggregate";
+}
+
+function noteBelongsToKey(
+  noteId: string,
+  keyId: string,
+  entryKeyId: string
+): boolean {
+  if (!keyId) return true;
+  if (entryKeyId === keyId) return true;
+  const id = String(noteId || "");
+  if (!id) return false;
+  return id === keyId || id.startsWith(`${keyId}#`) || id.startsWith(keyId);
+}
+
+function pickNoteFromEntry(args: {
+  entry: DerivedCoachEntry;
+  phase: PhaseName;
+  excludeNoteIds?: Set<string>;
+  preferDidactic?: boolean;
+  oneClaim?: boolean;
+  pickCtx?: PackPickContext | null;
+  winningKeyId?: string | null;
+}): { note: DerivedCoachNote; text: string } | null {
+  const exclude = args.excludeNoteIds || new Set<string>();
+  const winningKeyId = args.winningKeyId || args.entry.keyId || "";
+  const entryKeyId = args.entry.keyId || args.entry.id || "";
+  let notes = (args.entry.notes || []).filter((n) => {
+    if (!(n.text || "").trim()) return false;
+    if (n.id && exclude.has(n.id)) return false;
+    if (!notePhaseOk(n, args.phase)) return false;
+    if (!noteBelongsToKey(n.id, winningKeyId, entryKeyId)) return false;
+    return true;
+  });
+  if (args.preferDidactic) {
+    notes = notes.filter(
+      (n) => !String(n.id || "").startsWith("bookwalk:")
+    );
+  }
+  notes = notes.filter((n) => !isCorruptPackNote(n.text || ""));
+  if (!notes.length) return null;
+
+  const ctxNote =
+    args.pickCtx &&
+    pickNoteForContext({
+      notes,
+      phase: args.phase,
+      ctx: {
+        ...args.pickCtx,
+        softKeys: [
+          ...(args.pickCtx.softKeys || []),
+          args.entry.keyId || "",
+        ].filter(Boolean),
+      },
+      preferDidactic: args.preferDidactic,
+    });
+  if (args.pickCtx && !ctxNote) return null;
+  const note = ctxNote || (() => {
+    notes.sort((a, b) => {
+      const sa = a.specificity ?? 3;
+      const sb = b.specificity ?? 3;
+      const da = Math.abs(sa - 3);
+      const db = Math.abs(sb - 3);
+      return da - db || (b.text || "").length - (a.text || "").length;
+    });
+    return notes[0]!;
+  })();
+
+  const slotLesson = lessonFromPackNote(note);
+  let text = args.oneClaim
+    ? reformatCoachNoteOneClaim(slotLesson || note.text, 420)
+    : reformatCoachNote(slotLesson || note.text, 420);
+  if ((!text || text.length < 40) && args.oneClaim) {
+    text = reformatCoachNote(note.text, 280, 1);
+  }
+  if (!text || text.length < 28) {
+    text =
+      polishCoachProse(slotLesson || note.text) ||
+      slotLesson ||
+      note.text ||
+      "";
+  }
+  if (!text || text.length < 28 || isCorruptPackNote(text)) return null;
+  return { note, text };
+}
+
+/**
+ * Opening tip = woven peer judgments + short pack clauses (one natural phrase).
+ * No raw metric dumps, peer Δ numbers, SAN lines, or book titles.
+ * Diversifies vs priorTopics when peers barely changed between moments.
+ */
+function composeOpeningCheckpointTip(args: {
+  inputs?: Record<string, string | number | boolean | null> | null;
+  openingName?: string | null;
+  openingKeyId?: string | null;
+  packByKey?: PackNoteByKey | null;
+  packNote?: DerivedCoachNote | null;
+  packKeyId?: string | null;
+  priorTopics?: OpeningTipPrior | null;
+}): OpeningJudgmentTipResult {
+  const packByKey: PackNoteByKey = {
+    ...(args.packByKey || {}),
+  };
+  if (args.packKeyId && args.packNote) {
+    packByKey[args.packKeyId] = args.packNote;
+  }
+  return composeOpeningJudgmentTipDetailed({
+    inputs: args.inputs,
+    openingName: args.openingName,
+    openingKeyId: args.openingKeyId,
+    packByKey,
+    priorTopics: args.priorTopics,
+  });
+}
+
+/** Quiet opening bad_move with no engine why_better — weave peer judgments. */
+function isQuietOpeningPeerTip(args: {
+  phase: PhaseName;
+  request?: CoachNoteRequest | null;
+  mark: CoachMark | null;
+  lineExplain: ReturnType<typeof lineExplainFromRequest>;
+}): boolean {
+  if (args.phase !== "opening") return false;
+  if (args.request?.kind !== "bad_move") return false;
+  if (!args.mark || !["blunder", "mistake", "missed"].includes(args.mark)) {
+    return false;
+  }
+  if (args.lineExplain?.reasons?.length) return false;
+  const inputs = args.request?.inputs;
+  if (!inputs) return false;
+  return softKeysFromOpeningPeerGaps(inputs).length > 0;
+}
+
+
+function metricFallbackText(args: {
+  mark: CoachMark | null;
+  deltaCp: number;
+  moment?: CoachMetricMoment | null;
+  themes: string[];
+  request?: CoachNoteRequest | null;
+  openingKeyId?: string | null;
+  openingName?: string | null;
+  phase?: PhaseName;
+  priorTopics?: OpeningTipPrior | null;
+  gamePlan?: GamePlanState | null;
+}): string {
+  const theme =
+    args.themes.find((t) => STRUCTURE_THEMES.has(t)) ||
+    args.themes[0] ||
+    "the position";
+  const themeLabel = theme.includes(".")
+    ? metricKeyLabel(theme)
+    : theme.replace(/_/g, " ");
+
+  const lineExplain = lineExplainFromRequest(args.request, {
+    phase: args.phase,
+    openingKeyId: args.openingKeyId,
+    openingName: args.openingName,
+  });
+
+  if (
+    args.request?.kind === "fixed_checkpoint" ||
+    args.request?.kind === "structural_moment"
+  ) {
+    const sk = args.request.structuralKind || "checkpoint";
+    if (sk === "decisive_pawn_break") {
+      const san =
+        args.request.playedLineSans?.[0] ||
+        args.moment?.playedSan ||
+        args.request.inputs?.san ||
+        "the break";
+      if (hasMiddlegameStrategicLead(args.request.inputs)) {
+        const tip = composeMiddlegameStrategicTip({
+          inputs: args.request.inputs,
+          priorTopics: args.priorTopics,
+          mark: args.mark,
+        }).text;
+        return tip.startsWith("Pawn break")
+          ? tip
+          : `Pawn break (${san}). ${tip.charAt(0).toUpperCase()}${tip.slice(1)}`;
+      }
+      const woven = composeMomentJudgmentTip({
+        mark: args.mark,
+        deltaCp: args.deltaCp,
+        moment: args.moment,
+        kind: "structural_moment",
+        explained: lineExplain,
+        gamePlan: args.gamePlan,
+        situations: args.request.situations,
+        engineLineSans: args.request.engineLineSans,
+        playedMetricDelta: args.request.playedLineMetricDelta.length
+          ? args.request.playedLineMetricDelta
+          : args.request.playedMetricDelta,
+        engineVsPlayedMetricDelta: args.request.engineVsPlayedMetricDelta,
+        priorTopics: args.priorTopics,
+      }).text;
+      if (/^(Serious|Costly) miss/i.test(woven)) {
+        return woven.replace(/^(Serious|Costly) miss/i, `Pawn break (${san})`);
+      }
+      return `Pawn break (${san}). ${woven.charAt(0).toUpperCase()}${woven.slice(1)}`;
+    }
+    if (sk === "opening_aggregate" || sk === "opening_name") {
+      return composeOpeningCheckpointTip({
+        inputs: args.request.inputs,
+        openingName: args.openingName,
+        openingKeyId: args.openingKeyId,
+        priorTopics: args.priorTopics,
+      }).text;
+    }
+    if (sk === "middlegame_aggregate") {
+      return composeMiddlegameJudgmentTipDetailed({
+        inputs: args.request.inputs,
+        priorTopics: args.priorTopics,
+      }).text;
+    }
+    if (sk === "endgame_advantage") {
+      return composeEndgameJudgmentTipDetailed({
+        inputs: args.request.inputs,
+        priorTopics: args.priorTopics,
+      }).text;
+    }
+    if (sk === "opponent_mistake") {
+      if (lineExplain?.reasons.length) {
+        return composeWhyBetterTip({
+          explained: lineExplain,
+          mark: args.mark,
+          deltaCp: args.deltaCp,
+          moment: args.moment,
+          kind: args.request.kind,
+          gamePlan: args.gamePlan,
+          request: args.request,
+          priorTopics: args.priorTopics,
+        });
+      }
+      if (lineExplain?.text) return lineExplain.text;
+    }
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: args.request.kind,
+      explained: lineExplain,
+      gamePlan: args.gamePlan,
+      situations: args.request.situations,
+      engineLineSans: args.request.engineLineSans,
+      playedMetricDelta: args.request.playedMetricDelta,
+      engineVsPlayedMetricDelta: args.request.engineVsPlayedMetricDelta,
+      priorTopics: args.priorTopics,
+    }).text;
+  }
+
+  if (args.request?.kind === "praise_move") {
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: "praise_move",
+      packText: null,
+      gamePlan: args.gamePlan,
+      situations: args.request.situations,
+      engineLineSans: args.request.engineLineSans,
+      playedMetricDelta: args.request.playedMetricDelta,
+      engineVsPlayedMetricDelta: args.request.engineVsPlayedMetricDelta,
+      priorTopics: args.priorTopics,
+      explained: lineExplain,
+    }).text;
+  }
+
+  if (args.request?.kind === "bad_move" && args.request.tacticalFact?.kind) {
+    return composeTacticalTip({
+      fact: args.request.tacticalFact,
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      gamePlan: args.gamePlan,
+      request: args.request,
+      priorTopics: args.priorTopics,
+    });
+  }
+
+  if (args.request?.kind === "bad_move" && lineExplain?.reasons.length) {
+    return composeWhyBetterTip({
+      explained: lineExplain,
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: args.request.kind,
+      gamePlan: args.gamePlan,
+      request: args.request,
+      priorTopics: args.priorTopics,
+    });
+  }
+
+  if (args.request?.kind === "bad_move") {
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: "bad_move",
+      gamePlan: args.gamePlan,
+      situations: args.request.situations,
+      playedMetricDelta: args.request.playedMetricDelta,
+      priorTopics: args.priorTopics,
+    }).text;
+  }
+
+  if (args.mark === "blunder" || (args.moment && args.moment.dropCp >= 150)) {
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: "bad_move",
+      gamePlan: args.gamePlan,
+      priorTopics: args.priorTopics,
+    }).text;
+  }
+  if (
+    args.mark === "mistake" ||
+    args.mark === "missed" ||
+    (args.moment && args.moment.severity === "mistake")
+  ) {
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: "bad_move",
+      gamePlan: args.gamePlan,
+      priorTopics: args.priorTopics,
+    }).text;
+  }
+  if (args.mark === "brilliant" || args.mark === "excellent") {
+    return composeMomentJudgmentTip({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      kind: "praise_move",
+      gamePlan: args.gamePlan,
+      priorTopics: args.priorTopics,
+    }).text;
+  }
+  return `Pay attention to ${themeLabel} here. The metrics flag it as a theme of this game.`;
+}
+
+function poolEntriesForMetricKeys(
+  entries: DerivedCoachEntry[],
+  allowedKeys: string[],
+  excludeKeys: Set<string>,
+  byKey?: Map<string, DerivedCoachEntry> | null
+): DerivedCoachEntry[] {
+  if (!allowedKeys.length) return [];
+  const allow = new Set(allowedKeys);
+  if (byKey?.size) {
+    const exact: DerivedCoachEntry[] = [];
+    for (const keyId of allowedKeys) {
+      if (excludeKeys.has(keyId)) continue;
+      const hit = byKey.get(keyId);
+      if (hit) exact.push(hit);
+    }
+    return exact;
+  }
+  const exact: DerivedCoachEntry[] = [];
+  for (const entry of entries) {
+    const keyId = entry.keyId || entry.id || "";
+    if (!keyId || excludeKeys.has(keyId)) continue;
+    if (allow.has(keyId)) exact.push(entry);
+  }
+  return exact;
+}
+
+export function pickMetricTip(args: {
+  entries: DerivedCoachEntry[];
+  byKey?: Map<string, DerivedCoachEntry> | null;
+  metrics: CoachGameMetrics;
+  phase: PhaseName;
+  mark: CoachMark | null;
+  deltaCp: number;
+  moment?: CoachMetricMoment | null;
+  openingKeyId?: string | null;
+  eco?: string | null;
+  opening?: string | null;
+  themes?: string[];
+  excludeKeyIds?: Set<string>;
+  excludeNoteIds?: Set<string>;
+  structureThemeUsed?: Set<string>;
+  allowStructureQuiet?: boolean;
+  request?: CoachNoteRequest | null;
+  userColor?: "white" | "black" | null;
+  /** Soft keys / judgments / clauses already used on earlier opening tips. */
+  priorTopics?: OpeningTipPrior | null;
+  /** Updated when an opening judgment tip is composed. */
+  onOpeningTipUsed?: (meta: OpeningJudgmentTipResult) => void;
+  /** Sticky opening/structure plan for this game. */
+  gamePlan?: GamePlanState | null;
+}): KeyTip | null {
+  if (args.mark === "inaccuracy") {
+    const always =
+      (args.request != null && requestAlwaysAttaches(args.request.kind)) ||
+      isFixedCheckpointMoment(args.moment);
+    if (!always) return null;
+  }
+  const themes = uniqThemes([
+    ...(args.themes || []),
+    ...(args.metrics.themesByPhase[args.phase] || []),
+    ...(args.moment ||
+    (args.request &&
+      (args.request.kind === "bad_move" ||
+        args.request.kind === "fixed_checkpoint" ||
+        args.request.kind === "structural_moment"))
+      ? args.metrics.globalThemes
+      : []),
+  ]);
+
+  const openingCheckpoint = isOpeningCheckpointRequest(
+    args.request,
+    args.moment
+  );
+  const excludeKeys = args.excludeKeyIds || new Set<string>();
+  const lineExplain = lineExplainFromRequest(args.request, {
+    phase: args.phase,
+    openingKeyId: args.openingKeyId,
+    openingName: args.opening,
+  });
+  const quietOpeningPeer = isQuietOpeningPeerTip({
+    phase: args.phase,
+    request: args.request,
+    mark: args.mark,
+    lineExplain,
+  });
+  const mistakeTakesOver = checkpointMistakeTakesOver({
+    mark: args.mark,
+    momentSeverity: args.moment?.severity,
+    inputs: args.request?.inputs || args.moment?.inputs,
+    kind: args.request?.kind,
+    playedSan: args.moment?.playedSan || args.request?.playedLineSans?.[0],
+    structuralKind:
+      args.request?.structuralKind || args.moment?.structuralKind,
+  });
+  const useOpeningWeave =
+    (openingCheckpoint || quietOpeningPeer) && !mistakeTakesOver;
+  const mgAggregate =
+    args.request?.structuralKind === "middlegame_aggregate" ||
+    args.moment?.structuralKind === "middlegame_aggregate";
+  const egAggregate =
+    args.request?.structuralKind === "endgame_advantage" ||
+    args.moment?.structuralKind === "endgame_advantage";
+  const useMgWeave = mgAggregate && !mistakeTakesOver;
+  const useEgWeave = egAggregate && !mistakeTakesOver;
+  const usePeerWeave = useOpeningWeave || useMgWeave || useEgWeave;
+  const pawnBreakKind =
+    args.request?.structuralKind === "decisive_pawn_break" ||
+    args.moment?.structuralKind === "decisive_pawn_break";
+  const preferPawnBreakStrategic =
+    pawnBreakKind &&
+    !isBadMoveMark(args.mark) &&
+    hasMiddlegameStrategicLead(
+      args.request?.inputs || args.moment?.inputs
+    );
+  const allowedKeys = softKeysForNoteRequest({
+    structuralKind: args.request?.structuralKind || args.moment?.structuralKind,
+    inputs: args.request?.inputs || args.moment?.inputs,
+    playedMetricDelta: args.request?.playedMetricDelta,
+    playedLineMetricDelta: args.request?.playedLineMetricDelta,
+    engineLineMetricDelta: args.request?.engineLineMetricDelta,
+    engineVsPlayedMetricDelta: args.request?.engineVsPlayedMetricDelta,
+    kind: args.request?.kind,
+    openingKeyId: args.openingKeyId,
+    phase: args.phase,
+    phaseMetricKeys: usePeerWeave
+      ? []
+      : [
+          ...(args.metrics.themesByPhase[args.phase] || []),
+          ...(lineExplain?.softKeys || []),
+        ],
+    situations: args.request?.situations,
+    planKeys: args.gamePlan?.stickyKeys,
+    tacticalFact: args.request?.tacticalFact,
+    deltaCp: args.deltaCp,
+  });
+  const tacticalKeys = softKeysForTacticalFact(args.request?.tacticalFact);
+  const pool = poolEntriesForMetricKeys(
+    args.entries,
+    allowedKeys,
+    excludeKeys,
+    args.byKey
+  );
+  const openingPeerRank = useOpeningWeave
+    ? softKeysFromOpeningPeerGaps(
+        args.request?.inputs || args.moment?.inputs
+      )
+    : useMgWeave
+      ? softKeysFromMiddlegamePeerGaps(
+          args.request?.inputs || args.moment?.inputs
+        )
+      : useEgWeave
+        ? softKeysFromEndgameContext(
+            args.request?.inputs || args.moment?.inputs
+          )
+        : [];
+  const coordinate = buildTipCoordinate({
+    phase: args.phase,
+    mark: args.mark,
+    deltas: args.request?.engineVsPlayedMetricDelta,
+    situations: args.request?.situations,
+    inputs: args.request?.inputs,
+    gamePlan: args.gamePlan,
+    openingKeyId: args.openingKeyId,
+    bestSan: args.moment?.bestSan || args.request?.moment?.bestSan,
+    playedSan: args.moment?.playedSan || args.request?.moment?.playedSan,
+    engineLineSans: args.request?.engineLineSans,
+  });
+  const ranked = (pool.length ? pool : []).map((entry) => {
+      const keyId = entry.keyId || entry.id || "";
+      const weight = weightKeyForMoment({
+        entry,
+        phase: args.phase,
+        themes,
+        mark: args.mark,
+        deltaCp: args.deltaCp,
+        moment: args.moment,
+        openingKeyId: args.openingKeyId,
+        eco: args.eco,
+        opening: args.opening,
+        request: args.request,
+        gamePlan: args.gamePlan,
+      });
+      const inPool = allowedKeys.includes(keyId) ? 4 : 0;
+      const primaryBoost =
+        !usePeerWeave && lineExplain?.primarySoftKeys?.includes(keyId)
+          ? 8
+          : 0;
+      const tacticalBoost =
+        !usePeerWeave && tacticalKeys.includes(keyId) ? 10 : 0;
+      const openingLockBoost =
+        useOpeningWeave && args.openingKeyId && keyId === args.openingKeyId
+          ? 12
+          : 0;
+      const peerRankIdx = openingPeerRank.indexOf(keyId);
+      const peerRankBoost =
+        usePeerWeave && peerRankIdx >= 0
+          ? Math.max(4, 14 - peerRankIdx * 2)
+          : 0;
+      const total =
+        weight +
+        inPool +
+        primaryBoost +
+        tacticalBoost +
+        openingLockBoost +
+        peerRankBoost;
+      if (total <= -500) return null;
+      if (total < METRIC_TIP_MIN_WEIGHT && !requestAlwaysAttaches(args.request?.kind)) {
+        return null;
+      }
+      return {
+        entry,
+        keyId,
+        weight:
+          total < METRIC_TIP_MIN_WEIGHT
+            ? Math.max(total, METRIC_TIP_MIN_WEIGHT)
+            : total,
+      };
+    })
+    .filter((r): r is { entry: DerivedCoachEntry; keyId: string; weight: number } =>
+      Boolean(r)
+    )
+    .sort((a, b) => {
+      if (useOpeningWeave && args.openingKeyId) {
+        const aOpen = a.keyId === args.openingKeyId ? 1 : 0;
+        const bOpen = b.keyId === args.openingKeyId ? 1 : 0;
+        if (aOpen !== bOpen) return bOpen - aOpen;
+      }
+      if (usePeerWeave && openingPeerRank.length) {
+        const aGap = openingPeerRank.indexOf(a.keyId);
+        const bGap = openingPeerRank.indexOf(b.keyId);
+        const aRank = aGap < 0 ? 999 : aGap;
+        const bRank = bGap < 0 ? 999 : bGap;
+        if (aRank !== bRank) return aRank - bRank;
+      }
+      if (!usePeerWeave && tacticalKeys.length) {
+        const aTac = tacticalKeys.indexOf(a.keyId);
+        const bTac = tacticalKeys.indexOf(b.keyId);
+        const aRank = aTac < 0 ? 999 : aTac;
+        const bRank = bTac < 0 ? 999 : bTac;
+        if (aRank !== bRank) return aRank - bRank;
+      }
+      const aPri =
+        !usePeerWeave &&
+        (coordinate.primarySoftKeys.includes(a.keyId) ||
+          lineExplain?.primarySoftKeys?.includes(a.keyId))
+          ? 1
+          : 0;
+      const bPri =
+        !usePeerWeave &&
+        (coordinate.primarySoftKeys.includes(b.keyId) ||
+          lineExplain?.primarySoftKeys?.includes(b.keyId))
+          ? 1
+          : 0;
+      return (
+        bPri - aPri ||
+        b.weight - a.weight ||
+        a.keyId.localeCompare(b.keyId)
+      );
+    });
+
+  const ERROR_MARKS = new Set<CoachMark>([
+    "blunder",
+    "mistake",
+    "missed",
+  ]);
+
+  const openingPackByKey: PackNoteByKey = {};
+  let openingPrimary:
+    | {
+        entry: DerivedCoachEntry;
+        keyId: string;
+        weight: number;
+        note: DerivedCoachNote;
+        text: string;
+      }
+    | null = null;
+
+  const situations = (args.request?.situations || []).map((s) =>
+    typeof s === "string" ? s : s.id
+  );
+  const pickJudgment: PackPickContext["judgment"] =
+    args.mark === "brilliant" || args.mark === "excellent"
+      ? "good"
+      : args.mark === "mistake" ||
+          args.mark === "blunder" ||
+          args.mark === "missed"
+        ? "bad"
+        : null;
+  const pillarScan = scanPillarConditions(coordinate, {
+    themes,
+    judgment: pickJudgment,
+    openings: args.opening ? [args.opening] : [],
+  });
+  const pickCtxBase: PackPickContext = {
+    phase: args.phase,
+    softKeys: [
+      ...allowedKeys.slice(0, 8),
+      ...openingPeerRank.slice(0, 6),
+      ...(coordinate.primarySoftKeys.length
+        ? coordinate.primarySoftKeys
+        : lineExplain?.primarySoftKeys || []),
+      ...(tacticalKeys || []),
+      ...(pillarScan.ctx.softKeys || []),
+    ].filter(Boolean),
+    metrics: [
+      ...coordinate.liveMetrics,
+      ...(lineExplain?.primaryField ? [lineExplain.primaryField] : []),
+      ...(pillarScan.ctx.metrics || []),
+    ],
+    situations: [
+      ...situations,
+      ...(pillarScan.ctx.situations || []),
+    ],
+    openings: args.opening ? [args.opening] : [],
+    themes,
+    features: [
+      ...coordinate.features,
+      ...(pillarScan.ctx.features || []),
+      ...packConditionFeatures({
+        inputs: args.request?.inputs || args.moment?.inputs,
+        tacticalFact: args.request?.tacticalFact,
+      }),
+      ...String(
+        args.request?.inputs?.features || args.moment?.inputs?.features || ""
+      )
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean),
+    ],
+    judgment: pickJudgment,
+  };
+
+  for (const row of ranked.slice(0, 8)) {
+    if (tacticalKeys.length && row.keyId.startsWith("endgame.")) {
+      continue;
+    }
+    const tail = keyTail(row.keyId);
+    if (
+      STRUCTURE_THEMES.has(tail) &&
+      args.structureThemeUsed?.has(tail) &&
+      !args.moment &&
+      !(args.mark && ERROR_MARKS.has(args.mark)) &&
+      !(args.request && requestAlwaysAttaches(args.request.kind))
+    ) {
+      continue;
+    }
+
+    const picked = pickNoteFromEntry({
+      entry: row.entry,
+      phase: args.phase,
+      excludeNoteIds: args.excludeNoteIds,
+      preferDidactic: true,
+      oneClaim: usePeerWeave,
+      winningKeyId: row.keyId,
+      pickCtx: {
+        ...pickCtxBase,
+        softKeys: [row.keyId, ...(pickCtxBase.softKeys || [])],
+      },
+    });
+    if (!picked) continue;
+    if (
+      usePeerWeave &&
+      String(picked.note.id || "").startsWith("bookwalk:") &&
+      picked.text.length < 60
+    ) {
+      continue;
+    }
+
+    if (usePeerWeave) {
+      openingPackByKey[row.keyId] = picked.note;
+      if (!openingPrimary) {
+        openingPrimary = {
+          entry: row.entry,
+          keyId: row.keyId,
+          weight: row.weight,
+          note: picked.note,
+          text: picked.text,
+        };
+      }
+      continue;
+    }
+
+    if (STRUCTURE_THEMES.has(tail)) {
+      args.structureThemeUsed?.add(tail);
+    }
+
+    let text: string;
+    let tipMeta: {
+      softKeys: string[];
+      metrics: string[];
+      clauses: string[];
+      topics: string[];
+    } | null = null;
+    if (args.request?.tacticalFact?.kind && !preferPawnBreakStrategic) {
+      const woven = composeMomentJudgmentTip({
+        mark: args.mark,
+        deltaCp: args.deltaCp,
+        moment: args.moment,
+        kind: args.request.kind,
+        fact: args.request.tacticalFact,
+        packNote: picked.note,
+        packKeyId: row.keyId,
+        gamePlan: args.gamePlan,
+        situations: args.request.situations,
+        engineLineSans: args.request.engineLineSans,
+        playedMetricDelta: args.request.playedMetricDelta,
+        engineVsPlayedMetricDelta: args.request.engineVsPlayedMetricDelta,
+        priorTopics: args.priorTopics,
+        coordinate,
+      });
+      text = woven.text;
+      tipMeta = woven;
+    } else if (preferPawnBreakStrategic) {
+      const woven = composeMiddlegameStrategicTip({
+        inputs: args.request?.inputs || args.moment?.inputs,
+        packNote: picked.note,
+        packKeyId: row.keyId,
+        priorTopics: args.priorTopics,
+        mark: args.mark,
+      });
+      text = woven.text;
+      tipMeta = woven;
+    } else if (lineExplain?.reasons.length) {
+      const woven = composeMomentJudgmentTip({
+        mark: args.mark,
+        deltaCp: args.deltaCp,
+        moment: args.moment,
+        kind: args.request?.kind,
+        explained: lineExplain,
+        packNote: picked.note,
+        packKeyId: row.keyId,
+        gamePlan: args.gamePlan,
+        situations: args.request?.situations,
+        engineLineSans: args.request?.engineLineSans,
+        playedMetricDelta: args.request?.playedMetricDelta,
+        engineVsPlayedMetricDelta: args.request?.engineVsPlayedMetricDelta,
+        priorTopics: args.priorTopics,
+        coordinate,
+      });
+      text = woven.text;
+      tipMeta = woven;
+    } else if (
+      args.phase === "middlegame" &&
+      hasMiddlegameStrategicLead(
+        args.request?.inputs || args.moment?.inputs
+      )
+    ) {
+      const woven = composeMiddlegameStrategicTip({
+        inputs: args.request?.inputs || args.moment?.inputs,
+        packNote: picked.note,
+        packKeyId: row.keyId,
+        priorTopics: args.priorTopics,
+        mark: args.mark,
+      });
+      text = woven.text;
+      tipMeta = woven;
+    } else if (
+      args.phase === "endgame" &&
+      hasEndgameStrategicLead(args.request?.inputs || args.moment?.inputs)
+    ) {
+      const woven = composeEndgameStrategicTip({
+        inputs: args.request?.inputs || args.moment?.inputs,
+        packNote: picked.note,
+        packKeyId: row.keyId,
+        priorTopics: args.priorTopics,
+      });
+      text = woven.text;
+      tipMeta = woven;
+    } else {
+      text = picked.text;
+    }
+    if (tipMeta) {
+      args.onOpeningTipUsed?.({ text, ...tipMeta });
+    }
+
+    const primaryKey = row.keyId;
+    const keyIds = [
+      ...new Set([
+        primaryKey,
+        ...tacticalKeys,
+        ...coordinate.primarySoftKeys,
+        ...coordinate.axes.flatMap((a) => a.softKeys).slice(0, 4),
+        row.keyId,
+      ]),
+    ].slice(0, OPENING_TIP_KEY_ID_CAP);
+    return {
+      keyId: primaryKey,
+      keyIds,
+      keyType: row.entry.keyType || keyFamily(primaryKey),
+      label: row.entry.label || primaryKey,
+      text,
+      games: row.entry.games || [],
+      score: row.weight,
+      noteId: picked.note.id,
+      principle: picked.note.principle,
+      phase: picked.note.phase || args.phase,
+      compactDefinition: row.entry.compactDefinition,
+      noteCompact: picked.note.compact,
+      modelGame: row.entry.modelGame,
+      tipMeta: tipMeta
+        ? {
+            softKeys: tipMeta.softKeys || [],
+            metrics: tipMeta.metrics || [],
+            clauses: tipMeta.clauses || [],
+            topics: tipMeta.topics || [],
+          }
+        : undefined,
+    };
+  }
+
+  if (usePeerWeave && openingPrimary) {
+    const prim = openingPrimary;
+    const tail = keyTail(prim.keyId);
+    if (STRUCTURE_THEMES.has(tail)) {
+      args.structureThemeUsed?.add(tail);
+    }
+    const woven = useOpeningWeave
+      ? composeOpeningCheckpointTip({
+          inputs: args.request?.inputs || args.moment?.inputs,
+          openingName: args.opening,
+          openingKeyId: args.openingKeyId,
+          packByKey: openingPackByKey,
+          packNote: prim.note,
+          packKeyId: prim.keyId,
+          priorTopics: args.priorTopics,
+        })
+      : useEgWeave
+        ? (() => {
+            const packByKey = { ...openingPackByKey };
+            if (prim.keyId && prim.note) {
+              packByKey[prim.keyId] = prim.note;
+            }
+            return composeEndgameJudgmentTipDetailed({
+              inputs: args.request?.inputs || args.moment?.inputs,
+              packByKey,
+              priorTopics: args.priorTopics,
+            });
+          })()
+        : (() => {
+            const packByKey = { ...openingPackByKey };
+            if (prim.keyId && prim.note) {
+              packByKey[prim.keyId] = prim.note;
+            }
+            return composeMiddlegameJudgmentTipDetailed({
+              inputs: args.request?.inputs || args.moment?.inputs,
+              packByKey,
+              priorTopics: args.priorTopics,
+            });
+          })();
+    args.onOpeningTipUsed?.(woven);
+    const keyIds = useOpeningWeave
+      ? rankOpeningTipKeyIds({
+          wovenSoftKeys: woven.softKeys,
+          peerSoftKeys: openingPeerRank,
+          openingKeyId: args.openingKeyId,
+          openingName: args.opening,
+        })
+      : [...new Set([...woven.softKeys, ...openingPeerRank, prim.keyId])].slice(
+          0,
+          OPENING_TIP_KEY_ID_CAP
+        );
+    const primaryKey =
+      keyIds[0] ||
+      (args.openingKeyId === prim.keyId && prim.keyId) ||
+      prim.keyId;
+    return {
+      keyId: primaryKey,
+      keyIds,
+      keyType: prim.entry.keyType || keyFamily(primaryKey),
+      label: prim.entry.label || primaryKey,
+      text: woven.text,
+      games: prim.entry.games || [],
+      score: prim.weight,
+      noteId: prim.note.id,
+      principle: prim.note.principle,
+      phase: prim.note.phase || args.phase,
+      compactDefinition: prim.entry.compactDefinition,
+      noteCompact: prim.note.compact,
+      modelGame: prim.entry.modelGame,
+      tipMeta: {
+        softKeys: woven.softKeys || [],
+        metrics: woven.metrics || [],
+        clauses: woven.clauses || [],
+        topics: woven.topics || [],
+      },
+    };
+  }
+
+  if (
+    (args.request && requestAlwaysAttaches(args.request.kind)) ||
+    args.moment ||
+    (args.mark && ERROR_MARKS.has(args.mark)) ||
+    args.deltaCp >= 80 ||
+    args.allowStructureQuiet
+  ) {
+    const text = metricFallbackText({
+      mark: args.mark,
+      deltaCp: args.deltaCp,
+      moment: args.moment,
+      themes,
+      request: args.request,
+      openingKeyId: args.openingKeyId,
+      openingName: args.opening,
+      phase: args.phase,
+      priorTopics: args.priorTopics,
+      gamePlan: args.gamePlan,
+    });
+    const openingFallbackKey =
+      useOpeningWeave
+        ? args.openingKeyId ||
+          softKeysFromOpeningPeerGaps(
+            args.request?.inputs || args.moment?.inputs
+          )[0] ||
+          null
+        : null;
+    return {
+      keyId:
+        openingFallbackKey ||
+        tacticalKeys[0] ||
+        lineExplain?.primarySoftKeys?.[0] ||
+        lineExplain?.softKeys?.[0] ||
+        args.openingKeyId ||
+        (tacticalKeys.length
+          ? tacticalKeys[0]
+          : (args.metrics.themesByPhase[args.phase] || [])[0]) ||
+        `piece.centralization`,
+      keyType: "methodology",
+      label: "Game metrics",
+      text,
+      games: [],
+      score: 3,
+      phase: args.phase,
+    };
+  }
+
+  return null;
+}
+
+function uniqThemes(themes: string[]): string[] {
+  return [...new Set(themes.filter(Boolean))];
+}
+
+function coordinateFromRequest(
+  request?: CoachNoteRequest | null,
+  mark?: CoachMark | null,
+  phase?: PhaseName | null,
+  extra?: {
+    gamePlan?: GamePlanState | null;
+    openingKeyId?: string | null;
+    moment?: CoachMetricMoment | null;
+  }
+) {
+  if (!request) return null;
+  const moment = extra?.moment || request.moment;
+  return buildTipCoordinate({
+    phase: phase || request.phase,
+    mark: mark || request.mark,
+    deltas: request.engineVsPlayedMetricDelta,
+    situations: request.situations,
+    inputs: request.inputs,
+    gamePlan: extra?.gamePlan,
+    openingKeyId: extra?.openingKeyId || extra?.gamePlan?.openingKeyId,
+    bestSan: moment?.bestSan,
+    playedSan: moment?.playedSan,
+    engineLineSans: request.engineLineSans,
+  });
+}
+
+function lineExplainFromRequest(
+  request: CoachNoteRequest | null | undefined,
+  opts?: {
+    phase?: PhaseName;
+    openingKeyId?: string | null;
+    openingName?: string | null;
+  }
+) {
+  if (!request) return null;
+  return explainEngineLineVsPlayed({
+    bestSan: request.moment?.bestSan,
+    engineLineSans: request.engineLineSans,
+    playedLineSans: request.playedLineSans,
+    engineVsPlayedMetricDelta: request.engineVsPlayedMetricDelta,
+    engineLineMetricDelta: request.engineLineMetricDelta,
+    playedLineMetricDelta: request.playedLineMetricDelta,
+    phase: opts?.phase || request.phase,
+    openingKeyId: opts?.openingKeyId,
+    openingName:
+      opts?.openingName ||
+      (typeof request.inputs?.opening_name === "string"
+        ? request.inputs.opening_name
+        : null),
+    punishFrame: request.structuralKind === "opponent_mistake",
+  });
+}
+
+/** Primary = board-true tactic + polished weave (situations / plan / lesson). */
+function composeTacticalTip(args: {
+  fact: TacticalFact;
+  packNote?: DerivedCoachNote | null;
+  packKeyId?: string | null;
+  mark: CoachMark | null;
+  deltaCp: number;
+  moment?: CoachMetricMoment | null;
+  gamePlan?: GamePlanState | null;
+  request?: CoachNoteRequest | null;
+  priorTopics?: OpeningTipPrior | null;
+}): string {
+  return composeMomentJudgmentTip({
+    mark: args.mark,
+    deltaCp: args.deltaCp,
+    moment: args.moment,
+    kind: args.request?.kind || "bad_move",
+    fact: args.fact,
+    packNote: args.packNote,
+    packKeyId: args.packKeyId,
+    gamePlan: args.gamePlan,
+    situations: args.request?.situations,
+    engineLineSans: args.request?.engineLineSans,
+    playedMetricDelta: args.request?.playedMetricDelta,
+    engineVsPlayedMetricDelta: args.request?.engineVsPlayedMetricDelta,
+    priorTopics: args.priorTopics,
+    coordinate: coordinateFromRequest(args.request, args.mark, undefined, {
+      gamePlan: args.gamePlan,
+      moment: args.moment,
+    }),
+  }).text;
+}
+
+/** Primary = why_better reasons woven into natural dialogue + pack lesson. */
+function composeWhyBetterTip(args: {
+  explained: NonNullable<ReturnType<typeof lineExplainFromRequest>>;
+  packNote?: DerivedCoachNote | null;
+  packKeyId?: string | null;
+  mark: CoachMark | null;
+  deltaCp: number;
+  moment?: CoachMetricMoment | null;
+  kind?: string | null;
+  gamePlan?: GamePlanState | null;
+  request?: CoachNoteRequest | null;
+  priorTopics?: OpeningTipPrior | null;
+}): string {
+  return composeMomentJudgmentTip({
+    mark: args.mark,
+    deltaCp: args.deltaCp,
+    moment: args.moment,
+    kind: args.kind || args.request?.kind,
+    explained: args.explained,
+    packNote: args.packNote,
+    packKeyId: args.packKeyId,
+    gamePlan: args.gamePlan,
+    situations: args.request?.situations,
+    engineLineSans: args.request?.engineLineSans,
+    playedMetricDelta: args.request?.playedMetricDelta,
+    engineVsPlayedMetricDelta: args.request?.engineVsPlayedMetricDelta,
+    priorTopics: args.priorTopics,
+    coordinate: coordinateFromRequest(args.request, args.mark, undefined, {
+      gamePlan: args.gamePlan,
+      moment: args.moment,
+    }),
+  }).text;
+}
+
+export type { PhaseGameKeys };

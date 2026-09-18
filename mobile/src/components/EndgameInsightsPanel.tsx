@@ -1,0 +1,911 @@
+import React, { useMemo, useState } from "react";
+import {
+  Modal,
+  Pressable,
+  ScrollView,
+  StyleSheet,
+  Text,
+  View,
+} from "react-native";
+import { useAnalytics } from "../context/AnalyticsContext";
+import { useFilters } from "../context/FilterContext";
+import {
+  lookupBaseline,
+  normalizeSpeed,
+  peerDeltaLabel,
+  ratingBand,
+  type BaselineMetricHit,
+  type BaselineStore,
+} from "../data/baselines";
+import { peerImpactColor } from "../data/metricPolarity";
+import {
+  THEORETICAL_KEYS,
+  type TheoreticalKey,
+  type TheoreticalOutcome,
+} from "../engine/endgamePhase";
+import { Info, X } from "lucide-react-native";
+import { AppIcon } from "../icons";
+import { EdgeCard, SectionLabel } from "./ui";
+import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
+
+type MetricScale =
+  | { kind: "fixed"; max: number }
+  | { kind: "benchmark"; fallback: number }
+  | { kind: "signed"; fallback: number };
+
+type MetricDef = {
+  name: string;
+  key: string;
+  unit: string;
+  summary: string;
+  detail: string;
+  format: (v: number) => string;
+  scale: MetricScale;
+};
+
+const BLUNDER_METRIC: MetricDef = {
+  name: "Blunder Rate on Endgames",
+  key: "endgame_blunder_avg",
+  unit: "per game",
+  summary: "Average blunders per endgame.",
+  detail:
+    "In the endgame phase (≤7 non-king non-pawn pieces), a blunder is a move that drops win probability by 20pp or more. Reported as the mean blunder count per game that reached an endgame.",
+  format: (v) => v.toFixed(1),
+  scale: { kind: "benchmark", fallback: 2 },
+};
+
+const PRACTICAL_AFTER_SAVED: MetricDef[] = [
+  {
+    name: "King Centralization",
+    key: "endgame_king_centralization",
+    unit: "score",
+    summary: "How close your king sits to the center.",
+    detail:
+      "Score max(0, 4 − Chebyshev distance) from your king to the nearest of d4/e4/d5/e5. Sampled every 3 endgame plies, then averaged. Higher means a more central king.",
+    format: (v) => v.toFixed(2),
+    scale: { kind: "benchmark", fallback: 4 },
+  },
+  {
+    name: "King Distance",
+    key: "endgame_king_distance",
+    unit: "moves",
+    summary: "King moves to fight enemy pawns.",
+    detail:
+      "Minimum Chebyshev king-moves to any enemy pawn, or to the promotion square of a clear passer. Sampled every 3 endgame plies with king centralization. Lower means your king is closer to stopping enemy pawns.",
+    format: (v) => v.toFixed(2),
+    scale: { kind: "benchmark", fallback: 4 },
+  },
+  {
+    name: "Pawn Difference",
+    key: "endgame_pawn_diff",
+    unit: "pawns",
+    summary: "Net pawn captures for you after the endgame starts.",
+    detail:
+      "Starts at 0 when the endgame begins (≤7 non-pawn pieces). Each time you capture an enemy pawn: +1. Each time the opponent captures one of yours: −1. Promotions do not change the counter. Reported value is the final total for the game (not a mean of positions).",
+    format: (v) => (v >= 0 ? `+${v.toFixed(0)}` : v.toFixed(0)),
+    scale: { kind: "signed", fallback: 2 },
+  },
+  {
+    name: "Beneficial Trades",
+    key: "endgame_beneficial_trade_pct",
+    unit: "% trades",
+    summary: "Piece trades that raise winning chances.",
+    detail:
+      "Among endgame piece trades (one exchange = two pieces off; minor/major captures completed within three plies). Pawn may finish a trade only if a rook/queen is involved; minor-for-minor finished by a pawn does not count. Share where your win probability or eval improves across the trade.",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "fixed", max: 100 },
+  },
+  {
+    name: "Simplification Trades",
+    key: "endgame_simplification_trade_pct",
+    unit: "% trades",
+    summary: "Trading down while already winning.",
+    detail:
+      "Among endgame trades that start with win probability ≥ 0.7, the share where you give a higher-value piece for a lower-value one and the WP drop stays below the blunder threshold (0.2). Separate from winning-material trades (net material gain including pawns).",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "fixed", max: 100 },
+  },
+];
+
+const MATE_METRICS: MetricDef[] = [
+  {
+    name: "Conversion Rate",
+    key: "endgame_mate_conversion_pct",
+    unit: "% mates",
+    summary: "Mate evaluations that become real mates.",
+    detail:
+      "A mate episode starts when the engine eval is mate for you in the endgame. It converts only if every later sample stays mate-for-you until you deliver checkmate. Reported as converted episodes ÷ mate episodes.",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "fixed", max: 100 },
+  },
+  {
+    name: "Stalemate",
+    key: "endgame_stalemate_pct",
+    unit: "% games",
+    summary: "Winning positions that end in accidental stalemate.",
+    detail:
+      "Share of endgame games that finish in stalemate when the position immediately before the final move had your win probability ≥ 0.7.",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "fixed", max: 100 },
+  },
+  {
+    name: "Mate Tempo",
+    key: "endgame_mate_avg_seconds",
+    unit: "sec/move",
+    summary: "Think time during mate sequences.",
+    detail:
+      "Average seconds per move on your turns while a mate-for-you episode is active (from PGN clock tags).",
+    format: (v) => v.toFixed(1),
+    scale: { kind: "benchmark", fallback: 5 },
+  },
+];
+
+const THEORETICAL_LABELS: Record<TheoreticalKey, string> = {
+  te_pawn_endings: "Pawn Endings",
+  te_queen_vs_pawn: "Queen vs Pawn",
+  te_rook_vs_pawn: "Rook vs Pawn",
+  te_bishop_pawn_vs_knight: "Bishop + Pawn vs Knight",
+  te_opp_bishop_two_pawns: "Two Pawns + Opposite Bishops",
+  te_pawn_vs_knight: "Pawn vs Knight",
+  te_two_pawns_vs_rook: "Two Pawns vs Rook",
+  te_knight_pawn_vs_bishop: "Knight + Pawn vs Bishop",
+  te_rook_pawn_vs_rook: "Rook + Pawn vs Rook",
+};
+
+function fmt(v: number | null | undefined, digits = 1): string {
+  if (v == null || !Number.isFinite(v)) return "—";
+  return v.toFixed(digits);
+}
+
+function projectBenchmarkMax(
+  hit: BaselineMetricHit | null,
+  fallback: number
+): number {
+  if (hit?.mean != null && Number.isFinite(hit.mean) && Math.abs(hit.mean) > 0) {
+    return Math.abs(hit.mean) * 2;
+  }
+  return fallback;
+}
+
+function projectSignedHalf(
+  hit: BaselineMetricHit | null,
+  fallback: number
+): number {
+  const parts = [fallback];
+  for (const raw of [hit?.p10, hit?.p90, hit?.p75, hit?.p25, hit?.mean]) {
+    if (raw == null || !Number.isFinite(raw)) continue;
+    const abs = Math.abs(raw);
+    if (abs > 0) parts.push(abs * 1.35);
+  }
+  return Math.max(...parts);
+}
+
+function resolveScaleMax(
+  scale: MetricScale,
+  hit: BaselineMetricHit | null
+): number {
+  if (scale.kind === "fixed") return scale.max;
+  if (scale.kind === "signed") return projectSignedHalf(hit, scale.fallback);
+  return projectBenchmarkMax(hit, scale.fallback);
+}
+
+function MetricBulletGraph({
+  value,
+  peerMean,
+  scaleMax,
+  signed = false,
+  fillColor,
+}: {
+  value: number | null | undefined;
+  peerMean: number | null | undefined;
+  scaleMax: number;
+  signed?: boolean;
+  fillColor: string;
+}) {
+  if (value == null || !Number.isFinite(value) || !(scaleMax > 0)) return null;
+
+  if (signed) {
+    const half = scaleMax;
+    const toPct = (n: number) =>
+      Math.max(0, Math.min(100, ((n + half) / (2 * half)) * 100));
+    const zeroPct = 50;
+    const valuePct = toPct(value);
+    const left = Math.min(zeroPct, valuePct);
+    const width = Math.abs(valuePct - zeroPct);
+    const peerPct =
+      peerMean != null && Number.isFinite(peerMean) ? toPct(peerMean) : null;
+    return (
+      <View style={styles.bulletWrap}>
+        <View style={styles.bulletTrack}>
+          <View style={[styles.bulletZero, { left: `${zeroPct}%` }]} />
+          <View
+            style={[
+              styles.bulletFill,
+              {
+                left: `${left}%`,
+                width: `${width}%`,
+                backgroundColor: fillColor,
+              },
+            ]}
+          />
+          {peerPct != null ? (
+            <View style={[styles.bulletPeer, { left: `${peerPct}%` }]} />
+          ) : null}
+        </View>
+      </View>
+    );
+  }
+
+  const fillPct = Math.max(0, (Math.abs(value) / scaleMax) * 100);
+  const peerPct =
+    peerMean != null && Number.isFinite(peerMean)
+      ? Math.max(0, (Math.abs(peerMean) / scaleMax) * 100)
+      : null;
+  return (
+    <View style={styles.bulletWrap}>
+      <View style={styles.bulletTrack}>
+        <View
+          style={[
+            styles.bulletFill,
+            {
+              width: `${Math.min(fillPct, 100)}%`,
+              backgroundColor: fillColor,
+            },
+          ]}
+        />
+        {peerPct != null ? (
+          <View
+            style={[
+              styles.bulletPeer,
+              { left: `${Math.min(peerPct, 100)}%` },
+            ]}
+          />
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function HelpModal({
+  content,
+  onClose,
+}: {
+  content: { title: string; summary: string; detail: string } | null;
+  onClose: () => void;
+}) {
+  if (!content) return null;
+  return (
+    <Modal visible transparent animationType="fade" onRequestClose={onClose}>
+      <Pressable style={styles.helpBackdrop} onPress={onClose}>
+        <Pressable style={styles.helpCard} onPress={() => {}}>
+          <View style={styles.helpHeader}>
+            <Text style={styles.helpTitle}>{content.title}</Text>
+            <Pressable
+              onPress={onClose}
+              hitSlop={12}
+              accessibilityRole="button"
+              accessibilityLabel="Close"
+            >
+              <AppIcon icon={X} size={20} color={colors.textMuted} />
+            </Pressable>
+          </View>
+          <ScrollView
+            style={styles.helpScroll}
+            showsVerticalScrollIndicator={false}
+          >
+            <Text style={styles.helpSummary}>{content.summary}</Text>
+            <Text style={styles.helpDetailLabel}>How we measure it</Text>
+            <Text style={styles.helpDetail}>{content.detail}</Text>
+          </ScrollView>
+        </Pressable>
+      </Pressable>
+    </Modal>
+  );
+}
+
+function MetricBanner({
+  name,
+  value,
+  unit,
+  userNum,
+  baselineKey,
+  scale,
+  baselines,
+  peerBand,
+  peerSpeed,
+  peerMeanOverride,
+  onHelp,
+}: {
+  name: string;
+  value: string;
+  unit: string;
+  userNum: number | null;
+  baselineKey: string;
+  scale: MetricScale;
+  baselines: BaselineStore | null;
+  peerBand: string | null;
+  peerSpeed: string | null;
+  peerMeanOverride?: number | null;
+  onHelp?: () => void;
+}) {
+  const hit =
+    baselineKey && peerBand && peerSpeed
+      ? lookupBaseline(baselines, baselineKey, peerBand, peerSpeed)
+      : null;
+  const peerMean =
+    peerMeanOverride !== undefined ? peerMeanOverride : (hit?.mean ?? null);
+  const scaleMax = resolveScaleMax(
+    scale,
+    peerMeanOverride !== undefined
+      ? peerMeanOverride != null && Number.isFinite(peerMeanOverride)
+        ? ({ mean: peerMeanOverride } as BaselineMetricHit)
+        : null
+      : hit
+  );
+  const deltaLabel = peerDeltaLabel(userNum, peerMean, unit);
+  const signed = scale.kind === "signed";
+  const impactColor = peerImpactColor(
+    userNum,
+    peerMean,
+    baselineKey,
+    signed ? scaleMax * 2 : scaleMax
+  );
+  return (
+    <EdgeCard style={styles.card}>
+      <View style={styles.cardRow}>
+        <View style={styles.cardBody}>
+          <Text style={styles.name}>{name}</Text>
+          <View style={styles.valueRow}>
+            <Text style={styles.value}>
+              {value}
+              {unit ? <Text style={styles.unit}> {unit}</Text> : null}
+            </Text>
+            {deltaLabel ? (
+              <Text style={[styles.peerDelta, { color: impactColor }]}>
+                {deltaLabel}
+              </Text>
+            ) : null}
+          </View>
+          <MetricBulletGraph
+            value={userNum}
+            peerMean={peerMean}
+            scaleMax={scaleMax}
+            signed={signed}
+            fillColor={impactColor}
+          />
+        </View>
+        {onHelp ? (
+          <Pressable
+            onPress={onHelp}
+            hitSlop={10}
+            accessibilityRole="button"
+            accessibilityLabel={`About ${name}`}
+            style={styles.helpButton}
+          >
+            <AppIcon icon={Info} size={20} color={colors.textDim} />
+          </Pressable>
+        ) : null}
+      </View>
+    </EdgeCard>
+  );
+}
+
+function sumPeerMeans(
+  baselines: BaselineStore | null,
+  peerBand: string | null,
+  peerSpeed: string | null,
+  winKey: string,
+  drawKey: string
+): number | null {
+  if (!peerBand || !peerSpeed) return null;
+  const winHit = lookupBaseline(baselines, winKey, peerBand, peerSpeed);
+  const drawHit = lookupBaseline(baselines, drawKey, peerBand, peerSpeed);
+  const win = winHit?.mean;
+  const draw = drawHit?.mean;
+  const hasWin = win != null && Number.isFinite(win);
+  const hasDraw = draw != null && Number.isFinite(draw);
+  if (!hasWin && !hasDraw) return null;
+  return (hasWin ? (win as number) : 0) + (hasDraw ? (draw as number) : 0);
+}
+
+function TheoreticalOutcomeBar({
+  winPct,
+  drawPct,
+  peerSaved,
+}: {
+  winPct: number;
+  drawPct: number;
+  peerSaved: number | null;
+}) {
+  const winW = Math.max(0, Math.min(100, winPct));
+  const drawW = Math.max(0, Math.min(100 - winW, drawPct));
+  const peerPct =
+    peerSaved != null && Number.isFinite(peerSaved)
+      ? Math.max(0, Math.min(100, peerSaved))
+      : null;
+  return (
+    <View style={styles.bulletWrap}>
+      <View style={styles.bulletTrack}>
+        <View style={[styles.stackWin, { width: `${winW}%` }]} />
+        <View
+          style={[styles.stackDraw, { left: `${winW}%`, width: `${drawW}%` }]}
+        />
+        {peerPct != null ? (
+          <View style={[styles.bulletPeer, { left: `${peerPct}%` }]} />
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+function TheoreticalCard({
+  label,
+  outcome,
+  baselineKey,
+  baselines,
+  peerBand,
+  peerSpeed,
+}: {
+  label: string;
+  outcome: TheoreticalOutcome;
+  baselineKey: string;
+  baselines: BaselineStore | null;
+  peerBand: string | null;
+  peerSpeed: string | null;
+}) {
+  const drawKey = baselineKey.replace("_win_rate_pct", "_draw_rate_pct");
+  const peerSaved = sumPeerMeans(
+    baselines,
+    peerBand,
+    peerSpeed,
+    baselineKey,
+    drawKey
+  );
+  const userSaved = outcome.win_rate_pct + outcome.draw_rate_pct;
+  const deltaLabel = peerDeltaLabel(userSaved, peerSaved, "% games");
+  const impactColor = peerImpactColor(userSaved, peerSaved, baselineKey, 100);
+  return (
+    <EdgeCard style={styles.card}>
+      <Text style={styles.name}>{label}</Text>
+      <View style={styles.valueRow}>
+        <Text style={styles.value}>
+          {fmt(userSaved)}
+          <Text style={styles.unit}> % saved</Text>
+        </Text>
+        {deltaLabel ? (
+          <Text style={[styles.peerDelta, { color: impactColor }]}>
+            {deltaLabel}
+          </Text>
+        ) : null}
+      </View>
+      <Text style={styles.familyMeta}>
+        {outcome.games} games · {fmt(outcome.win_rate_pct)}% W ·{" "}
+        {fmt(outcome.draw_rate_pct)}% D
+      </Text>
+      <TheoreticalOutcomeBar
+        winPct={outcome.win_rate_pct}
+        drawPct={outcome.draw_rate_pct}
+        peerSaved={peerSaved}
+      />
+    </EdgeCard>
+  );
+}
+
+function cardsFromDefs(
+  defs: MetricDef[],
+  values: Record<string, number | null>
+) {
+  return defs
+    .map((def) => {
+      const raw = values[def.key];
+      const userNum =
+        raw == null || !Number.isFinite(raw) ? null : Number(raw);
+      return {
+        ...def,
+        value: userNum == null ? "—" : def.format(userNum),
+        userNum,
+      };
+    })
+    .filter((m) => m.userNum != null);
+}
+
+export function EndgameInsightsPanel() {
+  const { speed } = useFilters();
+  const {
+    games,
+    gamesLoading,
+    endgamePhase,
+    endgamePhaseLoading,
+    baselines,
+  } = useAnalytics();
+  const [helpContent, setHelpContent] = useState<{
+    title: string;
+    summary: string;
+    detail: string;
+  } | null>(null);
+
+  const peerBand = useMemo(() => {
+    const ratings = games
+      .map((g) => Number(g.user_rating))
+      .filter((n) => Number.isFinite(n));
+    if (!ratings.length) return null;
+    const mid = [...ratings].sort((a, b) => a - b)[
+      Math.floor(ratings.length / 2)
+    ];
+    return ratingBand(mid);
+  }, [games]);
+
+  const inferredSpeed = useMemo(() => {
+    const speedCounts = new Map<string, number>();
+    for (const g of games) {
+      const s = String(g.speed || "").toLowerCase();
+      if (!s) continue;
+      speedCounts.set(s, (speedCounts.get(s) || 0) + 1);
+    }
+    return (
+      [...speedCounts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] || null
+    );
+  }, [games]);
+
+  const peerSpeed = normalizeSpeed(speed) || normalizeSpeed(inferredSpeed);
+  const agg = endgamePhase?.aggregate ?? null;
+  const profileReady = !!agg && !endgamePhaseLoading;
+
+  const blunderCard = useMemo(() => {
+    if (!agg || agg.endgame_blunder_avg == null) return null;
+    return {
+      ...BLUNDER_METRIC,
+      value: BLUNDER_METRIC.format(agg.endgame_blunder_avg),
+      userNum: agg.endgame_blunder_avg,
+    };
+  }, [agg]);
+
+  const practicalAfterCards = useMemo(() => {
+    if (!agg) return [];
+    return cardsFromDefs(PRACTICAL_AFTER_SAVED, {
+      endgame_king_centralization: agg.endgame_king_centralization,
+      endgame_king_distance: agg.endgame_king_distance,
+      endgame_pawn_diff: agg.endgame_pawn_diff,
+      endgame_beneficial_trade_pct: agg.endgame_beneficial_trade_pct,
+      endgame_simplification_trade_pct: agg.endgame_simplification_trade_pct,
+    });
+  }, [agg]);
+
+  const mateCards = useMemo(() => {
+    if (!agg) return [];
+    return cardsFromDefs(MATE_METRICS, {
+      endgame_mate_conversion_pct: agg.endgame_mate_conversion_pct,
+      endgame_stalemate_pct: agg.endgame_stalemate_pct,
+      endgame_mate_avg_seconds: agg.endgame_mate_avg_seconds,
+    });
+  }, [agg]);
+
+  const theoreticalCards = useMemo(() => {
+    if (!agg?.outcomes) return [];
+    return THEORETICAL_KEYS.map((key) => {
+      const outcome = agg.outcomes[key];
+      if (!outcome || outcome.games < 1) return null;
+      return { key, label: THEORETICAL_LABELS[key], outcome };
+    }).filter(Boolean) as Array<{
+      key: TheoreticalKey;
+      label: string;
+      outcome: TheoreticalOutcome;
+    }>;
+  }, [agg]);
+
+  const savedGames = agg?.endgame_theoretical_saved_games ?? 0;
+  const savedWins = agg?.endgame_theoretical_saved_wins ?? 0;
+  const savedDraws = agg?.endgame_theoretical_saved_draws ?? 0;
+  const savedRatePct =
+    savedGames > 0
+      ? Math.round(((savedWins + savedDraws) / savedGames) * 1000) / 10
+      : null;
+  const showSaved = !!agg && savedGames > 0;
+  const savedPeerMean = sumPeerMeans(
+    baselines,
+    peerBand,
+    peerSpeed,
+    "endgame_theoretical_saved_win_pct",
+    "endgame_theoretical_saved_draw_pct"
+  );
+
+  if (!agg && (gamesLoading || endgamePhaseLoading)) {
+    return <Text style={styles.hint}>Loading endgame metrics…</Text>;
+  }
+  if (!gamesLoading && games.length <= 0 && !agg) {
+    return <Text style={styles.hint}>No games in this filter set.</Text>;
+  }
+
+  return (
+    <View>
+      <HelpModal
+        content={helpContent}
+        onClose={() => setHelpContent(null)}
+      />
+
+      {blunderCard || showSaved || practicalAfterCards.length ? (
+        <View style={styles.section}>
+          <SectionLabel>Practical endgames</SectionLabel>
+          {blunderCard ? (
+            <MetricBanner
+              name={blunderCard.name}
+              value={blunderCard.value}
+              unit={blunderCard.unit}
+              userNum={blunderCard.userNum}
+              baselineKey={blunderCard.key}
+              scale={blunderCard.scale}
+              baselines={baselines}
+              peerBand={peerBand}
+              peerSpeed={peerSpeed}
+              onHelp={() =>
+                setHelpContent({
+                  title: blunderCard.name,
+                  summary: blunderCard.summary,
+                  detail: blunderCard.detail,
+                })
+              }
+            />
+          ) : null}
+          {showSaved && agg && savedRatePct != null ? (
+            <MetricBanner
+              name="Theoretical Endgames Saved"
+              value={savedRatePct.toFixed(1)}
+              unit="% games"
+              userNum={savedRatePct}
+              baselineKey="endgame_theoretical_saved_win_pct"
+              scale={{ kind: "benchmark", fallback: 50 }}
+              peerMeanOverride={savedPeerMean}
+              baselines={baselines}
+              peerBand={peerBand}
+              peerSpeed={peerSpeed}
+              onHelp={() =>
+                setHelpContent({
+                  title: "Theoretical Endgames Saved",
+                  summary:
+                    "Share of weaker-side theoretical endings you won or drew.",
+                  detail:
+                    "Covers Queen vs Pawn, Rook vs Pawn, Bishop + Pawn vs Knight, and Two Pawns + Opposite Bishops when you held the disadvantaged side (not shown in Theoretical). Drawish types kept for both sides are excluded. Value is (wins + draws) / total such games × 100. Peer marker uses peer win% + draw%.",
+                })
+              }
+            />
+          ) : null}
+          {practicalAfterCards.map((metric) => (
+            <MetricBanner
+              key={metric.key}
+              name={metric.name}
+              value={metric.value}
+              unit={metric.unit}
+              userNum={metric.userNum}
+              baselineKey={metric.key}
+              scale={metric.scale}
+              baselines={baselines}
+              peerBand={peerBand}
+              peerSpeed={peerSpeed}
+              onHelp={() =>
+                setHelpContent({
+                  title: metric.name,
+                  summary: metric.summary,
+                  detail: metric.detail,
+                })
+              }
+            />
+          ))}
+        </View>
+      ) : null}
+
+      {mateCards.length ? (
+        <View style={styles.section}>
+          <SectionLabel>Mates</SectionLabel>
+          {mateCards.map((metric) => (
+            <MetricBanner
+              key={metric.key}
+              name={metric.name}
+              value={metric.value}
+              unit={metric.unit}
+              userNum={metric.userNum}
+              baselineKey={metric.key}
+              scale={metric.scale}
+              baselines={baselines}
+              peerBand={peerBand}
+              peerSpeed={peerSpeed}
+              onHelp={() =>
+                setHelpContent({
+                  title: metric.name,
+                  summary: metric.summary,
+                  detail: metric.detail,
+                })
+              }
+            />
+          ))}
+        </View>
+      ) : null}
+
+      <View style={styles.section}>
+        <SectionLabel>Theoretical endgames</SectionLabel>
+        {theoreticalCards.length ? (
+          theoreticalCards.map((card) => (
+            <TheoreticalCard
+              key={card.key}
+              label={card.label}
+              outcome={card.outcome}
+              baselineKey={`${card.key}_win_rate_pct`}
+              baselines={baselines}
+              peerBand={peerBand}
+              peerSpeed={peerSpeed}
+            />
+          ))
+        ) : profileReady ? (
+          <Text style={styles.hint}>
+            No theoretical endgame fingerprints in this sample yet.
+          </Text>
+        ) : null}
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  hint: {
+    ...type.bodySmall,
+    color: colors.textDim,
+    marginBottom: spacing.md,
+  },
+  section: { marginBottom: spacing.xl },
+  familyBlock: {
+    marginBottom: spacing.lg,
+  },
+  familyHeader: {
+    marginBottom: spacing.sm,
+  },
+  familyName: {
+    ...type.heading,
+    color: colors.text,
+    marginBottom: 2,
+  },
+  familyMeta: {
+    ...type.caption,
+    color: colors.textDim,
+    marginTop: 2,
+  },
+  card: { marginBottom: spacing.sm },
+  cardRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  cardBody: {
+    flex: 1,
+    flexShrink: 1,
+  },
+  name: {
+    ...type.label,
+    color: colors.textMuted,
+    marginBottom: 4,
+  },
+  helpButton: {
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  value: {
+    ...type.numberSm,
+    color: colors.text,
+  },
+  valueRow: {
+    flexDirection: "row",
+    alignItems: "baseline",
+    gap: spacing.sm,
+    marginBottom: 2,
+    flexWrap: "wrap",
+  },
+  unit: {
+    ...type.caption,
+    color: colors.textMuted,
+  },
+  peerDelta: {
+    ...type.caption,
+    fontFamily: font.sansMedium,
+  },
+  bulletWrap: {
+    marginTop: 10,
+    paddingVertical: 4,
+  },
+  bulletTrack: {
+    height: 6,
+    borderRadius: radius.pill,
+    backgroundColor: withAlpha("#ffffff", 0.08),
+    position: "relative",
+    justifyContent: "center",
+  },
+  bulletFill: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    borderRadius: radius.pill,
+  },
+  stackWin: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    left: 0,
+    borderRadius: radius.pill,
+    backgroundColor: result.win,
+  },
+  stackDraw: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    borderRadius: radius.pill,
+    backgroundColor: colors.textDim,
+  },
+  bulletOverflow: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    right: 0,
+    width: 3,
+    borderRadius: radius.pill,
+    backgroundColor: colors.text,
+  },
+  bulletPeer: {
+    position: "absolute",
+    top: -4,
+    bottom: -4,
+    width: 3,
+    marginLeft: -1.5,
+    borderRadius: radius.pill,
+    backgroundColor: colors.cream,
+    borderWidth: 1,
+    borderColor: withAlpha("#000000", 0.35),
+  },
+  bulletZero: {
+    position: "absolute",
+    top: 0,
+    bottom: 0,
+    width: 1,
+    marginLeft: -0.5,
+    backgroundColor: withAlpha("#ffffff", 0.24),
+  },
+  helpBackdrop: {
+    flex: 1,
+    backgroundColor: withAlpha("#000000", 0.68),
+    justifyContent: "flex-end",
+  },
+  helpCard: {
+    backgroundColor: colors.surfaceRaised,
+    borderTopLeftRadius: radius.xl,
+    borderTopRightRadius: radius.xl,
+    paddingHorizontal: spacing.lg,
+    paddingTop: spacing.lg,
+    paddingBottom: spacing.xl,
+    maxHeight: "78%",
+  },
+  helpHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  helpTitle: {
+    ...type.title,
+    color: colors.text,
+    flex: 1,
+  },
+  helpScroll: { flexGrow: 0, maxHeight: 420 },
+  helpSummary: {
+    ...type.body,
+    color: colors.textSoft,
+    marginBottom: spacing.lg,
+  },
+  helpDetailLabel: {
+    ...type.label,
+    color: colors.text,
+    marginBottom: spacing.xs,
+  },
+  helpDetail: {
+    ...type.bodySmall,
+    color: colors.textDim,
+    lineHeight: 20,
+  },
+});
