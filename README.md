@@ -2,25 +2,16 @@
 
 [![Verify](https://github.com/isaiapedro/chess-app/actions/workflows/verify.yml/badge.svg)](https://github.com/isaiapedro/chess-app/actions/workflows/verify.yml)
 
-Chess Wrapped is a privacy-first mobile companion for reviewing your chess
-games. It imports games from Chess.com or Lichess, builds Recap, Games, Study,
-and Insights views on the device, and uses Stockfish only where analysis adds
-value. The accompanying FastAPI service is intentionally thin: it serves peer
-baselines, opening-study proxies, and a minimal account registry rather than a
-copy of a player's game history.
+Chess Wrapped is a privacy-first mobile companion for reviewing games from
+Chess.com and Lichess. Recaps, study tools, and Stockfish analysis run primarily
+on the device; a small FastAPI service provides only shared resources.
 
 ## What the app does
 
-- Builds a time-filtered recap of games, results, activity, ratings, and streaks.
-- Explains opening, middlegame, endgame, and style metrics from locally held games.
-- Lets players revisit analyzed games with evaluation graphs, coach annotations,
-  and engine variations.
-- Provides on-device mistake study and opening preparation.
-- Compares selected aggregate metrics to bundled or API-supplied peer baselines.
-
-The mobile navigation currently contains **Recap**, **Games**, **Study**,
-**Insights**, and **Profile**. The global period and speed filters shape the
-local view without re-downloading the full game archive.
+- Summarizes results, activity, ratings, and streaks.
+- Explains opening, middlegame, endgame, and play-style patterns.
+- Replays analyzed games with evaluations and coach notes.
+- Supports mistake review and opening preparation on the device.
 
 ## Privacy and data boundary
 
