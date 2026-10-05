@@ -22,6 +22,7 @@ import type { OpeningSideCard } from "../engine/openingPhase";
 import { Info, X } from "lucide-react-native";
 import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
+import { MetricPanelLoading } from "./LoadingSkeletons";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
@@ -202,8 +203,15 @@ export function countOpeningCatalogBanners(openingPhase: {
       if (raw != null && Number.isFinite(raw)) general += 1;
     }
   }
-  const families =
-    openingPhase.sides.white.length + openingPhase.sides.black.length;
+  // Older cached phase payloads predate `sides`. Catalog counts are optional
+  // UI decoration and must not make a valid cached Insights view unrenderable.
+  const white = Array.isArray(openingPhase.sides?.white)
+    ? openingPhase.sides.white
+    : [];
+  const black = Array.isArray(openingPhase.sides?.black)
+    ? openingPhase.sides.black
+    : [];
+  const families = white.length + black.length;
   return general + families * OPENING_FAMILY_METRIC_COUNT;
 }
 
@@ -493,7 +501,13 @@ export function OpeningInsightsPanel() {
   }, [agg]);
 
   if ((gamesLoading || openingPhaseLoading) && !agg) {
-    return <Text style={styles.hint}>Loading opening metrics…</Text>;
+    return (
+      <MetricPanelLoading
+        label="Loading opening metrics…"
+        completed={openingPhase?.analyzedCount ?? 0}
+        total={openingPhase?.totalGames ?? games.length}
+      />
+    );
   }
   if (!gamesLoading && games.length <= 0 && !agg) {
     return <Text style={styles.hint}>No games in this filter set.</Text>;

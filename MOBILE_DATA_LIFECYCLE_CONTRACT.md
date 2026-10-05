@@ -131,7 +131,7 @@ All generic cache records are `{ savedAt, data }` in AsyncStorage under
 | Opening mix, phase payloads, style view | full filter slice | 7 d for phase/mix; derived from durable rows when possible | Corresponding rows/cache exist | New games or view remesh |
 | Heuristic store | platform + user | Permanent | Game ID has opening/MG/EG rows | Missing game, explicit force, cache-version change |
 | Engine/eval vault | platform + user | Permanent | Game record exists | Missing game, incompatible cache-version change, explicit scan |
-| Game coach result | platform + user + game ID | Permanent | `game-coach:v169` record has plies and a stored top-line-vs-played comparison when both evaluations exist | Cache-version change, missing result, or lazy mark/comparison repair on review open |
+| Game coach result | platform + user + game ID | Permanent | `game-coach:v170` record has plies and a root-comparable top-line-vs-played record when both evaluations exist | Cache-version change, missing result, or lazy mark/comparison repair on review open |
 | Study mistakes/openings and solved state | full study filter | Permanent | Queue/session key is valid | No usable moments, user advances queue, cache-version change |
 | Peer baselines | shared | Permanent | Bundled or API store available | Baseline store version change or manual clear of baseline-specific state |
 

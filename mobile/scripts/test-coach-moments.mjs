@@ -679,7 +679,7 @@ console.log(
       aggPly: byKind.opening_aggregate.ply,
       mgAggPly: byKind.middlegame_aggregate.ply,
       egAdvPly: byKind.endgame_advantage.ply,
-      cache: "game-coach:v168",
+      cache: "game-coach:v170",
     },
     null,
     2

@@ -21,6 +21,7 @@ import { peerImpactColor } from "../data/metricPolarity";
 import { Info, X } from "lucide-react-native";
 import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
+import { MetricPanelLoading } from "./LoadingSkeletons";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
@@ -510,7 +511,13 @@ export function MiddlegameInsightsPanel() {
   }, [values]);
 
   if (!agg && (gamesLoading || middlegamePhaseLoading)) {
-    return <Text style={styles.hint}>Loading middlegame metrics…</Text>;
+    return (
+      <MetricPanelLoading
+        label="Loading middlegame metrics…"
+        completed={middlegamePhase?.analyzedCount ?? 0}
+        total={middlegamePhase?.totalGames ?? games.length}
+      />
+    );
   }
   if (!gamesLoading && games.length <= 0 && !agg) {
     return <Text style={styles.hint}>No games in this filter set.</Text>;

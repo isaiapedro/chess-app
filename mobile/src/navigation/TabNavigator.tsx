@@ -4,10 +4,10 @@ import { BlurView } from "expo-blur";
 import type { LucideIcon } from "lucide-react-native";
 import {
   ChartBarBig,
+  Gamepad2,
   GraduationCap,
-  RefreshCw,
+  House,
   User,
-  Zap,
 } from "lucide-react-native";
 import PagerView from "react-native-pager-view";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -22,7 +22,7 @@ import { ProfileScreen } from "../screens/ProfileScreen";
 import { studyFiltersKey } from "../storage/studyCacheKeys";
 import { colors } from "../theme";
 
-const TAB_ORDER = ["Wrapped", "Insights", "Study", "Games", "Profile"] as const;
+const TAB_ORDER = ["Wrapped", "Games", "Study", "Insights", "Profile"] as const;
 const TAB_BAR_PADDING = 6;
 const TAB_GAP = 10;
 const TAB_PILL_SCALE = 0.945;
@@ -41,10 +41,10 @@ type TabFrame = {
 };
 
 const TAB_ICONS: Record<TabName, LucideIcon> = {
-  Wrapped: RefreshCw,
+  Wrapped: House,
   Insights: ChartBarBig,
   Study: GraduationCap,
-  Games: Zap,
+  Games: Gamepad2,
   Profile: User,
 };
 
@@ -199,9 +199,9 @@ export function TabNavigator() {
             <RecapScreen />
           </TabFadePage>
         </View>
-        <View key="Insights" collapsable={false}>
+        <View key="Games" collapsable={false}>
           <TabFadePage active={activeIndex === 1} visitKey={visitKey}>
-            <InsightsScreen />
+            <GamesScreen />
           </TabFadePage>
         </View>
         <View key="Study" collapsable={false}>
@@ -209,9 +209,9 @@ export function TabNavigator() {
             <StudyScreen />
           </TabFadePage>
         </View>
-        <View key="Games" collapsable={false}>
+        <View key="Insights" collapsable={false}>
           <TabFadePage active={activeIndex === 3} visitKey={visitKey}>
-            <GamesScreen />
+            <InsightsScreen />
           </TabFadePage>
         </View>
         <View key="Profile" collapsable={false}>

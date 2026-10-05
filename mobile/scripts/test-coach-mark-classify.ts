@@ -1,13 +1,55 @@
 import {
+  buildTopLineVsPlayed,
   classifyCoachMark,
+  confirmedSacrificeMaterialLoss,
   isRoutineExcellentMove,
   isSimpleThreatEscape,
+  mergeRestampedCoachMark,
+  potentialSacrificeMaterialLoss,
   type CoachEngineLine,
 } from "../src/engine/gameCoach/coachMarkClassify";
 import { shouldDropNoiseCoachMoment } from "../src/engine/gameCoach/coachMomentNoise";
 
 function assert(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
+}
+
+// PV1 is the same move as the played move, so its root comparison is exactly
+// zero even when a separate child-position search has horizon drift.
+{
+  const fen =
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+  const comparison = buildTopLineVsPlayed({
+    side: "white",
+    topLineSan: "Bxf7",
+    playedSan: "Bxf7",
+    topLineCpWhite: -300,
+    playedCpWhite: -700,
+    fenBefore: fen,
+    lines: [{ rank: 1, san: "Bxf7", cpWhite: -300 }],
+    playedBest: true,
+  });
+  assert(comparison, "PV1 comparison should be available");
+  assert(comparison.winProbabilityGap === 0, "PV1 compared with itself must have zero gap");
+  assert(
+    comparison.playedEvaluationSource === "top-line",
+    `PV1 source should be top-line, got ${comparison.playedEvaluationSource}`
+  );
+
+  const mark = classifyCoachMark({
+    side: "white",
+    evalBeforeCp: -300,
+    evalAfterCp: -700,
+    playedBest: true,
+    topLineVsPlayed: comparison,
+    fenBefore: fen,
+    playedSan: "Bxf7",
+    opponentReplySan: "Kxf7",
+  });
+  assert(
+    mark === "brilliant",
+    `best sacrifice above the completely-lost floor should survive child-search drift, got ${mark}`
+  );
 }
 
 {
@@ -420,6 +462,160 @@ assert(
     lesserImportant === "best",
     `QxN lesser trade must not be important, got ${lesserImportant}`
   );
+}
+
+// Fresh review: a bishop-for-pawn offer may lose up to 10 percentage points
+// against the engine's top line and still receive a Brilliant mark.
+{
+  const sacrificeFen =
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+  assert(
+    potentialSacrificeMaterialLoss({
+      fenBefore: sacrificeFen,
+      playedSan: "Bxf7",
+    }) === 2,
+    "declined bishop-for-pawn offer should expose two net material points"
+  );
+  assert(
+    confirmedSacrificeMaterialLoss({
+      fenBefore: sacrificeFen,
+      playedSan: "Bxf7",
+      opponentReplySan: "Kxf7",
+    }) === 2,
+    "Bishop-for-pawn captured by the king confirms a two-point sacrifice"
+  );
+  const comparison = buildTopLineVsPlayed({
+    side: "white",
+    topLineSan: "d3",
+    playedSan: "Bxf7",
+    topLineCpWhite: 150,
+    playedCpWhite: 80,
+  });
+  assert(comparison, "comparison should be available with both evaluations");
+  assert(
+    comparison.winProbabilityGap < 0.1,
+    `expected a sub-10pp gap, got ${comparison.winProbabilityGap}`
+  );
+  const freshMark = classifyCoachMark({
+    side: "white",
+    evalBeforeCp: 150,
+    evalAfterCp: 80,
+    playedBest: false,
+    topLineVsPlayed: comparison,
+    fenBefore: sacrificeFen,
+    playedSan: "Bxf7",
+    opponentReplySan: "Kxf7",
+  });
+  assert(freshMark === "brilliant", `fresh sacrifice should be brilliant, got ${freshMark}`);
+
+  // Cached review: an existing positive mark must be promoted rather than
+  // skipped when the stored evaluations now qualify.
+  const cachedMark = mergeRestampedCoachMark("best", freshMark);
+  assert(cachedMark === "brilliant", `cached best should promote, got ${cachedMark}`);
+
+  // A Brilliant from an older classifier is not authoritative.  Reopening a
+  // cached review must be able to replace a stale false positive.
+  const repairedCachedMark = mergeRestampedCoachMark("brilliant", "good");
+  assert(
+    repairedCachedMark === "good",
+    `stale brilliant should be demoted, got ${repairedCachedMark}`
+  );
+}
+
+{
+  const sacrificeFen =
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+  const comparison = buildTopLineVsPlayed({
+    side: "white",
+    topLineSan: "d3",
+    playedSan: "Bxf7",
+    topLineCpWhite: 900,
+    playedCpWhite: 650,
+  });
+  assert(comparison, "comparison should be available with both evaluations");
+  const mark = classifyCoachMark({
+    side: "white",
+    evalBeforeCp: 900,
+    evalAfterCp: 650,
+    playedBest: false,
+    topLineVsPlayed: comparison,
+    fenBefore: sacrificeFen,
+    playedSan: "Bxf7",
+    opponentReplySan: "Kxf7",
+  });
+  assert(
+    mark === "brilliant",
+    `a winning-position sacrifice with a small gap should be brilliant, got ${mark}`
+  );
+}
+
+// A queen taking an offered rook is not a sacrifice when the queen is
+// immediately recaptured for more material.
+{
+  const exchangeFen = "4k3/4q3/8/8/3P4/8/4R3/4K3 w - - 0 1";
+  assert(
+    confirmedSacrificeMaterialLoss({
+      fenBefore: exchangeFen,
+      playedSan: "Re5",
+      opponentReplySan: "Qxe5",
+    }) === 0,
+    "a legal queen recapture must prevent a defended rook offer from counting as a sacrifice"
+  );
+  assert(
+    potentialSacrificeMaterialLoss({
+      fenBefore: exchangeFen,
+      playedSan: "Re5",
+    }) === 0,
+    "declining a losing queen capture must not turn a defended rook move into a sacrifice"
+  );
+}
+
+// A declined piece-for-pawn offer remains Brilliant if it is the engine's
+// forced mate move and the resulting win probability is sound.
+{
+  const sacrificeFen =
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+  const comparison = buildTopLineVsPlayed({
+    side: "white",
+    topLineSan: "Bxf7",
+    playedSan: "Bxf7",
+    topLineCpWhite: 98000,
+    playedCpWhite: 97000,
+  });
+  assert(comparison, "mate comparison should be available");
+  const mark = classifyCoachMark({
+    side: "white",
+    evalBeforeCp: 98000,
+    evalAfterCp: 97000,
+    playedBest: true,
+    topLineVsPlayed: comparison,
+    fenBefore: sacrificeFen,
+    playedSan: "Bxf7",
+  });
+  assert(mark === "brilliant", `declined forced-mate sacrifice should be brilliant, got ${mark}`);
+}
+
+{
+  const sacrificeFen =
+    "r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4";
+  const comparison = buildTopLineVsPlayed({
+    side: "white",
+    topLineSan: "d3",
+    playedSan: "Bxf7",
+    topLineCpWhite: 150,
+    playedCpWhite: 40,
+  });
+  assert(comparison, "comparison should be available with both evaluations");
+  const mark = classifyCoachMark({
+    side: "white",
+    evalBeforeCp: 150,
+    evalAfterCp: 40,
+    playedBest: false,
+    topLineVsPlayed: comparison,
+    fenBefore: sacrificeFen,
+    playedSan: "Bxf7",
+  });
+  assert(mark !== "brilliant", "a greater-than-10pp top-line gap must reject Brilliant");
 }
 
 console.log("test-coach-mark-classify: ok");

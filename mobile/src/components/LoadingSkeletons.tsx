@@ -1,5 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import {
+  ActivityIndicator,
   Animated,
   Easing,
   ScrollView,
@@ -11,7 +12,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import type { Period } from "../api/types";
-import { colors, radius, spacing, withAlpha } from "../theme";
+import { colors, radius, spacing, type, withAlpha } from "../theme";
 
 export const PAGE_FADE_WAIT_MS = 3000;
 export const PAGE_LONG_LOADER_MIN_MS = 4000;
@@ -224,6 +225,10 @@ export function OpeningChoiceSkeleton() {
   const pulse = usePulse();
   return (
     <View style={styles.choice}>
+      <View style={styles.choiceLoadingStatus} accessibilityRole="progressbar">
+        <ActivityIndicator color={colors.red} size="small" />
+        <Text style={styles.choiceLoadingLabel}>Loading your games…</Text>
+      </View>
       <Bone pulse={pulse} width="72%" height={16} />
       <View style={[styles.row, styles.gapMd]}>
         <Bone pulse={pulse} width="48%" height={48} />
@@ -389,10 +394,69 @@ export function PageLoadingTransition({
   );
 }
 
+/**
+ * An immediate status for the short interval before a cached analytics view is
+ * ready. Keeping this separate from the longer skeleton avoids a blank page
+ * without forcing the user to wait for an artificial loader duration.
+ */
+export function PageLoadingStatus({
+  label = "Loading analytics…",
+}: {
+  label?: string;
+}) {
+  return (
+    <View style={styles.pageLoadingStatus} accessibilityRole="progressbar">
+      <ActivityIndicator color={colors.red} />
+      <Text style={styles.pageLoadingLabel}>{label}</Text>
+      <Text style={styles.pageLoadingDetail}>
+        Checking saved data and preparing this view.
+      </Text>
+    </View>
+  );
+}
+
+/** A compact, phase-specific progress state for data-backed metric panels. */
+export function MetricPanelLoading({
+  label,
+  completed = 0,
+  total = 0,
+}: {
+  label: string;
+  completed?: number;
+  total?: number;
+}) {
+  const safeTotal = Math.max(0, total);
+  const safeCompleted = Math.min(Math.max(0, completed), safeTotal || completed);
+  const hasProgress = safeTotal > 0;
+
+  return (
+    <View style={styles.metricPanelLoading} accessibilityRole="progressbar">
+      <View style={styles.metricPanelLoadingHead}>
+        <ActivityIndicator color={colors.red} size="small" />
+        <Text style={styles.metricPanelLoadingLabel}>{label}</Text>
+      </View>
+      <Text style={styles.metricPanelLoadingDetail}>
+        {hasProgress
+          ? `${safeCompleted}/${safeTotal} games processed`
+          : "Preparing game data…"}
+      </Text>
+      {hasProgress ? (
+        <AnalysisLoadingBars
+          selected={safeCompleted}
+          candidates={Math.max(safeTotal, safeCompleted, 1)}
+          target={Math.max(safeTotal, 1)}
+          progressRatio={safeCompleted / safeTotal}
+        />
+      ) : null}
+    </View>
+  );
+}
+
 export function AnalyticsPageShell({
   loadKey,
   contentReady,
   period,
+  loadingLabel,
   error,
   errorNode,
   skeleton,
@@ -401,6 +465,7 @@ export function AnalyticsPageShell({
   loadKey: string;
   contentReady: boolean;
   period: Period;
+  loadingLabel?: string;
   error?: boolean;
   errorNode?: React.ReactNode;
   skeleton: React.ReactNode;
@@ -412,12 +477,14 @@ export function AnalyticsPageShell({
   });
   const kind = longLoaderKindForPeriod(period);
   const waiting = !revealContent && !error;
-  const loader =
-    showLongLoader
-      ? kind === "pawn"
-        ? <ChessPieceLoader />
-        : skeleton
-      : undefined;
+  const loader = showLongLoader ? (
+    <View style={styles.pageLongLoading}>
+      <PageLoadingStatus label={loadingLabel} />
+      {kind === "pawn" ? <ChessPieceLoader /> : skeleton}
+    </View>
+  ) : (
+    <PageLoadingStatus label={loadingLabel} />
+  );
 
   const contentKey = error
     ? `error:${loadKey}`
@@ -719,6 +786,16 @@ const styles = StyleSheet.create({
     width: "100%",
     paddingVertical: spacing.md,
   },
+  choiceLoadingStatus: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    marginBottom: spacing.md,
+  },
+  choiceLoadingLabel: {
+    ...type.bodySmall,
+    color: colors.textMuted,
+  },
   boot: {
     flex: 1,
     alignItems: "center",
@@ -735,18 +812,58 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: colors.bg,
   },
+  pageLoadingStatus: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    padding: spacing.xl,
+    backgroundColor: colors.bg,
+  },
+  pageLoadingLabel: {
+    ...type.subheading,
+    color: colors.text,
+    textAlign: "center",
+  },
+  pageLoadingDetail: {
+    ...type.caption,
+    color: colors.textDim,
+    textAlign: "center",
+  },
+  pageLongLoading: {
+    flex: 1,
+    backgroundColor: colors.bg,
+  },
+  metricPanelLoading: {
+    gap: spacing.sm,
+    paddingVertical: spacing.md,
+  },
+  metricPanelLoadingHead: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  metricPanelLoadingLabel: {
+    ...type.bodySmall,
+    color: colors.text,
+  },
+  metricPanelLoadingDetail: {
+    ...type.caption,
+    color: colors.textMuted,
+  },
   pieceLoaderTrack: {
     width: 54,
     height: 54,
+    alignItems: "center",
+    justifyContent: "center",
   },
   pieceLoaderOrbit: {
     width: "100%",
     height: "100%",
     alignItems: "center",
+    justifyContent: "center",
   },
   pieceLoaderPiece: {
-    position: "absolute",
-    top: -22,
     color: "#050505",
     fontSize: 44,
     lineHeight: 48,

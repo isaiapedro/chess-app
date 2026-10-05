@@ -1,6 +1,6 @@
-import Constants from "expo-constants";
 import React, { useEffect } from "react";
 import { InteractionManager } from "react-native";
+import { useAnalytics } from "../context/AnalyticsContext";
 import { useAuth } from "../context/AuthContext";
 import { useFilters } from "../context/FilterContext";
 import { useScanLog } from "../context/ScanLogContext";
@@ -9,57 +9,25 @@ import { DEBUG_DISABLE_BACKGROUND_JOBS } from "./debugFlags";
 import { useStockfish } from "./StockfishProvider";
 import { cancelStudyPrefetch, prefetchStudyContent } from "./studyPrefetch";
 
-function debugLog(
-  location: string,
-  message: string,
-  hypothesisId: string,
-  data: Record<string, unknown>
-) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "sf-post-ready",
-      hypothesisId,
-      location,
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-}
-
 export function StudyPrefetch() {
   const auth = useAuth();
+  const { games, gamesLoading } = useAnalytics();
   const { queryFilters, refreshToken } = useFilters();
   const { ready, evaluate } = useStockfish();
   const { setScanProgress, clearLog, appendLog } = useScanLog();
 
   useEffect(() => {
-    // #region agent log
-    debugLog("StudyPrefetch.tsx:effect", "prefetch effect", "H-bg", {
+    agentLog("H-bg", "StudyPrefetch:effect", "prefetch effect", {
       ready,
       user: queryFilters.username,
       period: queryFilters.timeframe,
       disabled: DEBUG_DISABLE_BACKGROUND_JOBS,
-      runId: "bg-off",
     });
-    // #endregion
     if (!auth.ready || !auth.isLoggedIn || !queryFilters.username.trim()) {
       return;
     }
     if (DEBUG_DISABLE_BACKGROUND_JOBS) {
-      console.log("[bg-off] StudyPrefetch skipped");
+      agentLog("H-bg", "StudyPrefetch:disabled", "prefetch skipped by debug flag");
       clearLog();
       setScanProgress({
         status: "Background jobs disabled (debug)",
@@ -71,6 +39,9 @@ export function StudyPrefetch() {
       });
       return;
     }
+    // Local hydration and heuristic scoring own the first useful render. Do not
+    // start a CPU-heavy engine scan until that work has produced a game view.
+    if (gamesLoading || games.length === 0) return;
     if (!ready) return;
 
     cancelStudyPrefetch();
@@ -88,14 +59,8 @@ export function StudyPrefetch() {
     const task = InteractionManager.runAfterInteractions(() => {
       if (signal.cancelled) return;
       void (async () => {
-        // #region agent log
-        agentLog("G", "StudyPrefetch.tsx:start", "prefetch started", {
+        agentLog("H-bg", "StudyPrefetch:start", "prefetch started", {
           user: queryFilters.username,
-        });
-        // #endregion
-        debugLog("StudyPrefetch.tsx:start", "prefetch started", "H-bg", {
-          user: queryFilters.username,
-          runId: "bg-off",
         });
 
         try {
@@ -109,26 +74,12 @@ export function StudyPrefetch() {
                 progress.phase === "done" ||
                 progress.phase === "style"
               ) {
-                // #region agent log
-                agentLog("G", "StudyPrefetch.tsx:progress", "prefetch progress", {
+                agentLog("H-bg", "StudyPrefetch:progress", "prefetch progress", {
                   status: progress.status,
                   phase: progress.phase,
                   done: progress.gamesDone,
                   total: progress.gamesTotal,
                 });
-                // #endregion
-                debugLog(
-                  "StudyPrefetch.tsx:progress",
-                  "prefetch progress",
-                  "H-bg",
-                  {
-                    status: progress.status,
-                    phase: progress.phase,
-                    done: progress.gamesDone,
-                    total: progress.gamesTotal,
-                    runId: "bg-off",
-                  }
-                );
               }
               setScanProgress({
                 status: progress.status,
@@ -141,9 +92,7 @@ export function StudyPrefetch() {
             },
           });
           if (signal.cancelled) return;
-          debugLog("StudyPrefetch.tsx:done", "prefetch finished", "H-bg", {
-            runId: "bg-off",
-          });
+          agentLog("H-bg", "StudyPrefetch:done", "prefetch finished");
           appendLog("Background scan idle", "done");
           setScanProgress({
             status: "Background scan idle",
@@ -154,9 +103,8 @@ export function StudyPrefetch() {
           if (signal.cancelled) return;
           const message =
             err instanceof Error ? err.message : "Background scan failed";
-          debugLog("StudyPrefetch.tsx:catch", "prefetch failed", "H-bg", {
+          agentLog("H-bg", "StudyPrefetch:catch", "prefetch failed", {
             err: message,
-            runId: "bg-off",
           });
           appendLog(message, "error");
           setScanProgress({
@@ -178,6 +126,8 @@ export function StudyPrefetch() {
     auth.isLoggedIn,
     ready,
     evaluate,
+    gamesLoading,
+    games.length,
     queryFilters,
     refreshToken,
     setScanProgress,

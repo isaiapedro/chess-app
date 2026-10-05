@@ -15,31 +15,44 @@ import type { RatingCurve } from "../api/selectors";
 const MONTH_INITIALS = ["J", "F", "M", "A", "M", "J", "J", "A", "S", "O", "N", "D"];
 const X_LABELS_HEIGHT_PCT = 0.75;
 
-const RATING_LINE = "rgb(48, 222, 112)";
+function hexToRgba(hex: string, opacity: number): string {
+  const cleaned = hex.replace("#", "");
+  const value = cleaned.length === 3
+    ? cleaned.split("").map((ch) => ch + ch).join("")
+    : cleaned;
+  const num = parseInt(value, 16);
+  const r = (num >> 16) & 255;
+  const g = (num >> 8) & 255;
+  const b = num & 255;
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`;
+}
 
-const chartConfig = {
-  backgroundGradientFrom: colors.surface,
-  backgroundGradientTo: colors.surface,
-  color: (opacity = 1) => `rgba(48, 222, 112, ${opacity})`,
-  labelColor: (opacity = 1) => `rgba(160, 160, 160, ${opacity})`,
-  decimalPlaces: 0,
-  strokeWidth: 3,
-  propsForDots: {
-    r: "0",
-  },
-  propsForLabels: {
-    fontFamily: font.sans,
-    fontSize: 11,
-  },
-  propsForBackgroundLines: {
-    stroke: "rgba(255,255,255,0.05)",
-    strokeDasharray: "",
-  },
-  fillShadowGradientFrom: RATING_LINE,
-  fillShadowGradientFromOpacity: 0.42,
-  fillShadowGradientTo: colors.surface,
-  fillShadowGradientToOpacity: 0.02,
-};
+function ratingChartConfig(color: string) {
+  return {
+    backgroundGradientFrom: colors.surface,
+    backgroundGradientTo: colors.surface,
+    color: (opacity = 1) => hexToRgba(color, opacity),
+    labelColor: (opacity = 1) => `rgba(160, 160, 160, ${opacity})`,
+    decimalPlaces: 0,
+    strokeWidth: 3,
+    propsForDots: {
+      r: "0",
+    },
+    propsForLabels: {
+      fontFamily: font.sans,
+      fontSize: 11,
+    },
+    propsForBackgroundLines: {
+      stroke: "rgba(255,255,255,0.05)",
+      strokeDasharray: "",
+    },
+    // Chart Kit then derives each dataset's shadow from its own color, which
+    // keeps multi-format fills aligned with their corresponding rating lines.
+    useShadowColorFromDataset: true,
+    fillShadowGradientFromOpacity: 0.42,
+    fillShadowGradientToOpacity: 0.02,
+  };
+}
 
 function useEntranceAnimation() {
   const opacity = useRef(new Animated.Value(0)).current;
@@ -99,10 +112,12 @@ export function RatingChart({
   points,
   curves = [],
   period = "all",
+  color = colors.sage,
 }: {
   points: RatingPoint[];
   curves?: RatingCurve[];
   period?: Period;
+  color?: string;
 }) {
   const { width } = useWindowDimensions();
   const animation = useEntranceAnimation();
@@ -158,25 +173,16 @@ export function RatingChart({
           .filter((mark): mark is { index: number; year: string } => mark != null)
       : [];
 
-  const hexToRgba = (hex: string, opacity: number) => {
-    const cleaned = hex.replace("#", "");
-    const value = cleaned.length === 3
-      ? cleaned.split("").map((ch) => ch + ch).join("")
-      : cleaned;
-    const num = parseInt(value, 16);
-    const r = (num >> 16) & 255;
-    const g = (num >> 8) & 255;
-    const b = num & 255;
-    return `rgba(${r}, ${g}, ${b}, ${opacity})`;
-  };
-
   const datasets = multi
     ? curves.map((curve) => ({
         data: curve.points.map((point) => point.user_rating),
         color: (opacity = 1) => hexToRgba(curve.color, opacity),
         strokeWidth: 2,
       }))
-    : [{ data: series.map((point) => point.user_rating) }];
+    : [{
+        data: series.map((point) => point.user_rating),
+        color: (opacity = 1) => hexToRgba(color, opacity),
+      }];
 
   const chartWidth = Math.max(280, width - spacing.md * 4);
   const chartHeight = yearMarks.length ? 270 : 250;
@@ -191,7 +197,7 @@ export function RatingChart({
         }}
         width={chartWidth}
         height={chartHeight}
-        chartConfig={chartConfig}
+        chartConfig={ratingChartConfig(color)}
         bezier
         withInnerLines
         withOuterLines={false}
@@ -359,7 +365,7 @@ export function DonutChart({
         paddingLeft="10"
         center={[0, 0]}
         absolute
-        chartConfig={chartConfig}
+        chartConfig={ratingChartConfig(colors.sage)}
       />
     </Animated.View>
   );

@@ -1,39 +1,10 @@
-import Constants from "expo-constants";
 import type { BaselineStore } from "../data/baselines";
+import { agentLog } from "../debug/agentLog";
 import { lookupBaseline, STYLE_BASELINE_METRIC } from "../data/baselines";
 import type { OpeningMixStats } from "./openingMix";
 import type { StyleMetricsAggregate } from "./styleMetrics";
 
 let archetypeCallCount = 0;
-
-function debugArchetypeLog(
-  message: string,
-  data: Record<string, unknown>
-) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "traits-timing",
-      hypothesisId: "H-traits",
-      location: "archetypeScores.ts",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  console.log(`[traits] ${message}`, data);
-  // #endregion
-}
 
 export type ArchetypeName =
   | "Technical"
@@ -486,7 +457,7 @@ export function computeStyleDimensionScores(options: {
     score: Math.round((merged[key] ?? 50) * 10) / 10,
   }));
   const totalMs = performance.now() - t0;
-  debugArchetypeLog("computeStyleDimensionScores", {
+  agentLog("H-traits", "archetypeScores:computeStyleDimensionScores", "computed style dimensions", {
     callCount: archetypeCallCount,
     styleGames: options.style.games,
     dimCount: result.length,

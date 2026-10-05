@@ -163,6 +163,7 @@ export type BaselinesResponse = {
         p50?: number | null;
         p75?: number | null;
         p90?: number | null;
+        values?: number[] | null;
       }
     >
   >;

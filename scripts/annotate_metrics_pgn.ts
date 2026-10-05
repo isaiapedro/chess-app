@@ -2,7 +2,7 @@
  * Annotate a PGN with full app metrics + 3-stage coach comment dump.
  *
  * Usage:
- *   node scripts/annotate_metrics_pgn.mjs [path/to/game.pgn] [--ignore-silence]
+ *   node scripts/annotate_metrics_pgn.mjs [path/to/game.pgn] [--ignore-silence] [--llm]
  *   USER_COLOR=black|white  STOCKFISH_PATH=...  OUT_ALL=...  OUT_JSON=...
  *
  * Writes:
@@ -10,7 +10,7 @@
  *   samples/metrics_all.json  — full structured dump (all metric rows + candidates)
  *   optional split heur/eval PGNs when WRITE_SPLIT!=0
  *
- * Comments: classifyMoment → selectNote (fact guards) → interpolate templates.
+ * Comments: classifyMoment → selectNote → catalog/stitch, optional --llm via API.
  * Silence: ply gap < 2 and unique keyId/note.id; bypass brilliant or dropCp>=300.
  * --ignore-phase-limits is an alias for --ignore-silence.
  */
@@ -66,6 +66,7 @@ import {
   type PhaseName,
 } from "../mobile/src/engine/gameCoach/metricNoteWeights";
 import { attachCoachComment } from "../mobile/src/engine/gameCoach/attachCoachComment";
+import { resolveLlmComments } from "../mobile/src/engine/gameCoach/llmComment";
 import { CoachSilenceManager } from "../mobile/src/engine/gameCoach/coachSilence";
 import { loadNotesSchema } from "../mobile/src/engine/gameCoach/loadNotesSchema";
 import { phaseForCoachMoment } from "../mobile/src/engine/gameCoach/phaseSplits";
@@ -281,6 +282,8 @@ const IGNORE_SILENCE =
   process.argv.includes("--ignore-phase-limits") ||
   process.env.IGNORE_SILENCE === "1" ||
   process.env.IGNORE_PHASE_LIMITS === "1";
+const USE_LLM =
+  process.argv.includes("--llm") || process.env.COACH_LLM === "1";
 const SRC =
   process.env.PGN_PATH?.trim() ||
   positional[0] ||
@@ -1174,7 +1177,7 @@ function coachHeaders(
   ];
 }
 
-function buildAllMoveText(args: {
+async function buildAllMoveText(args: {
   raw: string;
   metrics: Awaited<ReturnType<typeof analyzeHeuristicGame>>;
   coach: CoachGameMetrics;
@@ -1190,7 +1193,8 @@ function buildAllMoveText(args: {
   mistakeCands: RankedCandidate[];
   eventsByPly: Map<number, MetricTimelineEvent[]>;
   ignoreSilence?: boolean;
-}): string {
+  useLlmComments?: boolean;
+}): Promise<string> {
   const chess = new Chess();
   chess.loadPgn(args.raw, { strict: false });
   const history = chess.history({ verbose: true });
@@ -1216,7 +1220,13 @@ function buildAllMoveText(args: {
   const commentSilence = new CoachSilenceManager({
     ignoreSilence: Boolean(args.ignoreSilence),
   });
-  const parts: string[] = [];
+  const slots: Array<{
+    ply: number;
+    san: string;
+    bits: string[];
+    payload: import("../mobile/src/engine/gameCoach/llmComment").CoachLlmPayload | null;
+    commentText: string | null;
+  }> = [];
   let pendingOppKind: "mistake" | "blunder" | null = null;
   let pendingOppWp: number | null = null;
 
@@ -1333,6 +1343,7 @@ function buildAllMoveText(args: {
       pendingOppWp = gift ? wpAfter : null;
     }
 
+    let attached: ReturnType<typeof attachCoachComment> = null;
     if (isUser) {
       const structure = structureByPly[ply] || [];
       let stormTempo = 0;
@@ -1453,7 +1464,7 @@ function buildAllMoveText(args: {
         if (!moment.playedSan && playedSan) moment.playedSan = playedSan;
         args.coach.momentsByPly[ply1] = moment;
       }
-      const attached = attachCoachComment({
+      attached = attachCoachComment({
         mark,
         dropCp: deltaCp,
         tacticalFact: noteRequest?.tacticalFact || null,
@@ -1476,6 +1487,11 @@ function buildAllMoveText(args: {
         playedSan,
         notes: notesSchema,
         silence: commentSilence,
+        phase,
+        inputs: {
+          ...(moment?.inputs || {}),
+          ...(noteRequest?.inputs || {}),
+        },
       });
 
       bits.push(`phase=${phase}`);
@@ -1511,6 +1527,14 @@ function buildAllMoveText(args: {
         bits.push(
           `notePick selected=${attached.note.keyId} event=${attached.event.kind} noteId=${attached.note.id}`
         );
+        bits.push(
+          `topNotes=${attached.noteDump
+            .map((n) => `${n.selected ? "*" : ""}${n.id}:${n.topic}:g${n.guards}`)
+            .join(",")}`
+        );
+        bits.push(
+          `topTopics=${attached.topics.length ? attached.topics.join(",") : "none"}`
+        );
         bits.push(`comment=${attached.text}`);
         const tail = attached.note.keyId.split(".").pop() || "";
         if (STRUCTURE_THEMES.has(tail)) structureThemeUsed.add(tail);
@@ -1538,10 +1562,40 @@ function buildAllMoveText(args: {
       );
     }
 
-    const comment = bits.length ? ` {${bits.join(" ")}}` : "";
-    const num = Math.floor(ply / 2) + 1;
-    if (ply % 2 === 0) parts.push(`${num}. ${m.san}${comment}`);
-    else parts.push(`${m.san}${comment}`);
+    slots.push({
+      ply,
+      san: m.san,
+      bits,
+      payload: attached && isUser ? attached.llmPayload : null,
+      commentText: attached && isUser ? attached.text : null,
+    });
+  }
+
+  if (args.useLlmComments) {
+    const pendingIdx = slots
+      .map((s, i) => (s.payload && s.commentText ? i : -1))
+      .filter((i) => i >= 0);
+    if (pendingIdx.length) {
+      const resolved = await resolveLlmComments(
+        pendingIdx.map((i) => slots[i]!.payload!),
+        pendingIdx.map((i) => slots[i]!.commentText || "")
+      );
+      pendingIdx.forEach((slotI, j) => {
+        const slot = slots[slotI]!;
+        const text = resolved.texts[j] || slot.commentText || "";
+        slot.commentText = text;
+        const idx = slot.bits.findIndex((b) => b.startsWith("comment="));
+        if (idx >= 0) slot.bits[idx] = `comment=${text}`;
+      });
+    }
+  }
+
+  const parts: string[] = [];
+  for (const slot of slots) {
+    const comment = slot.bits.length ? ` {${slot.bits.join(" ")}}` : "";
+    const num = Math.floor(slot.ply / 2) + 1;
+    if (slot.ply % 2 === 0) parts.push(`${num}. ${slot.san}${comment}`);
+    else parts.push(`${slot.san}${comment}`);
   }
   return parts.join(" ");
 }
@@ -2281,7 +2335,7 @@ async function main() {
     ),
   ];
 
-  const allBody = buildAllMoveText({
+  const allBody = await buildAllMoveText({
     raw,
     metrics,
     coach,
@@ -2297,6 +2351,7 @@ async function main() {
     mistakeCands: vaultCands.mistake,
     eventsByPly,
     ignoreSilence: IGNORE_SILENCE,
+    useLlmComments: USE_LLM,
   });
   writeFileSync(
     OUT_ALL,

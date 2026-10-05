@@ -8,9 +8,9 @@ import React, {
   useState,
 } from "react";
 import { StyleSheet, View } from "react-native";
-import Constants from "expo-constants";
 import { WebView, type WebViewMessageEvent } from "react-native-webview";
 import { Chess } from "chess.js";
+import { agentLog as emitDiagnostic } from "../debug/agentLog";
 import {
   GLOBAL_DEPTH,
   GLOBAL_MULTIPV,
@@ -76,25 +76,13 @@ type Pending = {
   onPartial?: (value: EvalResult) => void;
 };
 
-function debugIngestUrl(): string {
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0];
-  if (host) {
-    return `http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`;
-  }
-  return "http://127.0.0.1:7677/ingest/217f9228-6275-432a-b240-b52166a932e5";
-}
-
 let evalLogCount = 0;
 
-function agentLog(
+function logStockfishDiagnostic(
   location: string,
   message: string,
   data: Record<string, unknown>
 ) {
-  // #region agent log
   const isEvalNoise =
     message === "eval start" ||
     message === "eval ok" ||
@@ -105,24 +93,10 @@ function agentLog(
     evalLogCount += 1;
     if (evalLogCount > 6 && evalLogCount % 100 !== 0) return;
   }
-  console.log(`[sf-debug] ${message}`, data);
-  fetch(debugIngestUrl(), {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: String(data.runId || "month-freeze"),
-      hypothesisId: String(data.hyp || "K"),
-      location,
-      message,
-      data: { ...data, evalLogCount },
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
+  emitDiagnostic(String(data.hyp || "K"), location, message, {
+    ...data,
+    evalLogCount,
+  });
 }
 
 const SF_BASE = "https://unpkg.com/stockfish@18.0.8/bin/";
@@ -570,7 +544,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   useEffect(() => {
-    agentLog("StockfishProvider.tsx:mount", "provider mounted", {
+    logStockfishDiagnostic("StockfishProvider.tsx:mount", "provider mounted", {
       mode: "stockfish18-lite-cdn",
     });
     return () => {
@@ -608,12 +582,12 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
     // #region agent log
     if (msg.type === "probe") {
       const { type: _t, ...rest } = msg as Record<string, unknown>;
-      agentLog("StockfishProvider.tsx:probe", "webview probe", rest);
+      logStockfishDiagnostic("StockfishProvider.tsx:probe", "webview probe", rest);
       return;
     }
     // #endregion
     if (msg.type === "debug") {
-      agentLog("StockfishProvider.tsx:debug", "webview debug", {
+      logStockfishDiagnostic("StockfishProvider.tsx:debug", "webview debug", {
         stage: msg.stage,
         mode: msg.mode,
         typeofSTOCKFISH: msg.typeofSTOCKFISH,
@@ -626,7 +600,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     if (msg.type === "ready") {
-      agentLog("StockfishProvider.tsx:ready", "stockfish ready", {
+      logStockfishDiagnostic("StockfishProvider.tsx:ready", "stockfish ready", {
         mode: "stockfish18-lite-single",
       });
       setReady(true);
@@ -634,7 +608,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
       return;
     }
     if (msg.type === "error") {
-      agentLog("StockfishProvider.tsx:error", "stockfish error", {
+      logStockfishDiagnostic("StockfishProvider.tsx:error", "stockfish error", {
         error: msg.message || null,
         id: msg.id || null,
       });
@@ -695,7 +669,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         const terminal = terminalEval(fen);
         if (terminal) {
           // #region agent log
-          agentLog("StockfishProvider.tsx:evaluate", "eval terminal", {
+          logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval terminal", {
             hyp: "C",
             fen: fen.slice(0, 40),
           });
@@ -715,7 +689,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
         }
         if (!ready) {
           // #region agent log
-          agentLog("StockfishProvider.tsx:evaluate", "eval not-ready", {
+          logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval not-ready", {
             hyp: "A",
             fen: fen.slice(0, 40),
           });
@@ -728,7 +702,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           ? useMovetime + 5000
           : depthOnlyTimeoutMs(depth);
         // #region agent log
-        agentLog("StockfishProvider.tsx:evaluate", "eval start", {
+        logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval start", {
           hyp: "C",
           id,
           depth,
@@ -743,7 +717,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           resolve: (value) => {
             evalCache.current.set(cacheKey, value);
             // #region agent log
-            agentLog("StockfishProvider.tsx:evaluate", "eval ok", {
+            logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval ok", {
               hyp: "C",
               id,
               cpWhite: value.cpWhite,
@@ -754,7 +728,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           },
           reject: (error) => {
             // #region agent log
-            agentLog("StockfishProvider.tsx:evaluate", "eval fail", {
+            logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval fail", {
               hyp: "D",
               id,
               err: error instanceof Error ? error.message : String(error),
@@ -775,7 +749,7 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           if (!pending.current.has(id)) return;
           pending.current.delete(id);
           // #region agent log
-          agentLog("StockfishProvider.tsx:evaluate", "eval timeout", {
+          logStockfishDiagnostic("StockfishProvider.tsx:evaluate", "eval timeout", {
             hyp: "D",
             id,
             timeoutMs,
@@ -848,12 +822,12 @@ export function StockfishProvider({ children }: { children: React.ReactNode }) {
           source={{ html: ENGINE_HTML, baseUrl: SF_BASE }}
           onMessage={onMessage}
           onLoadEnd={() => {
-            agentLog("StockfishProvider.tsx:onLoadEnd", "webview loaded", {
+            logStockfishDiagnostic("StockfishProvider.tsx:onLoadEnd", "webview loaded", {
               mode: "cdn",
             });
           }}
           onError={(e) => {
-            agentLog("StockfishProvider.tsx:onError", "webview error", {
+            logStockfishDiagnostic("StockfishProvider.tsx:onError", "webview error", {
               desc: e.nativeEvent.description,
             });
             setError(e.nativeEvent.description || "WebView failed");

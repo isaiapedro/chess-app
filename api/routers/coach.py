@@ -4,6 +4,7 @@ from fastapi import APIRouter
 from pydantic import BaseModel, Field
 
 from api.services.async_work import run_study
+from api.services.coach_comment import generate_game_comments
 from api.services.coach_rag import retrieve_coach_nuggets
 
 router = APIRouter(prefix="/coach", tags=["coach"])
@@ -18,6 +19,9 @@ class CoachRetrieveRequest(BaseModel):
     eco: Optional[str] = None
     opening: Optional[str] = None
     wantCount: int = 2
+    narrative: Optional[str] = None
+    tacticalKind: Optional[str] = None
+    tacticalHead: Optional[str] = None
 
 
 class CoachNugget(BaseModel):
@@ -29,6 +33,40 @@ class CoachNugget(BaseModel):
     source: Optional[str] = None
     quality: Optional[str] = None
     score: Optional[float] = None
+
+
+class CoachCommentMoment(BaseModel):
+    ply: Optional[int] = None
+    playedMove: Optional[str] = None
+    bestMove: Optional[str] = None
+    mark: Optional[str] = None
+    dropCp: int = 0
+    tacticalHead: Optional[str] = None
+    tacticalKind: Optional[str] = None
+    selfInflicted: Optional[bool] = None
+    whyBetter: Optional[str] = None
+    playedLine: Optional[str] = None
+    engineLine: Optional[str] = None
+    playedImpact: Optional[str] = None
+    technicalRule: Optional[str] = None
+    structuralKind: Optional[str] = None
+    praiseMark: Optional[str] = None
+    piece: Optional[str] = None
+    square: Optional[str] = None
+    keyId: Optional[str] = None
+
+
+class CoachCommentsRequest(BaseModel):
+    moments: list[CoachCommentMoment] = Field(default_factory=list)
+
+
+class CoachCommentItem(BaseModel):
+    ply: Optional[int] = None
+    text: str
+
+
+class CoachCommentsResponse(BaseModel):
+    comments: list[CoachCommentItem] = Field(default_factory=list)
 
 
 class CoachRetrieveResponse(BaseModel):
@@ -47,6 +85,19 @@ async def coach_retrieve(body: CoachRetrieveRequest):
         eco=body.eco,
         opening=body.opening,
         want_count=body.wantCount,
+        narrative=body.narrative,
+        tactical_kind=body.tacticalKind,
+        tactical_head=body.tacticalHead,
     )
     nuggets = [CoachNugget(**item) for item in raw]
     return CoachRetrieveResponse(nuggets=nuggets)
+
+
+@router.post("/comments", response_model=CoachCommentsResponse)
+async def coach_comments(body: CoachCommentsRequest):
+    raw = await run_study(
+        generate_game_comments,
+        moments=[m.model_dump() for m in body.moments],
+    )
+    comments = [CoachCommentItem(**item) for item in raw]
+    return CoachCommentsResponse(comments=comments)

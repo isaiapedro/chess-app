@@ -1,5 +1,5 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import Constants from "expo-constants";
+import { agentLog } from "../debug/agentLog";
 
 const PREFIX = "@chess-wrapped:v1:";
 export const DAY_TTL_MS = 24 * 60 * 60 * 1000;
@@ -80,32 +80,6 @@ async function removeKeysChunked(keys: string[], chunkSize = 20): Promise<number
     }
   }
   return removed;
-}
-
-function debugClearLog(message: string, data: Record<string, unknown>) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "clear-vault",
-      hypothesisId: "H-clear",
-      location: "cache.ts",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  console.log(`[clear] ${message}`, data);
-  // #endregion
 }
 
 export async function readCache<T>(
@@ -217,7 +191,7 @@ export async function clearAppCache(): Promise<number> {
       key.startsWith("@chess-wrapped:user-games:v1:") ||
       (key.startsWith(PREFIX) && !key.includes("baselines"))
   );
-  debugClearLog("clearAppCache start", {
+  agentLog("H-clear", "cache:clearAppCache", "clearAppCache start", {
     totalKeys: keys.length,
     appKeys: appKeys.length,
   });
@@ -230,7 +204,7 @@ export async function clearAppCache(): Promise<number> {
       k.startsWith("@chess-wrapped:user-games:v1:") ||
       (k.startsWith(PREFIX) && !k.includes("baselines"))
   );
-  debugClearLog("clearAppCache done", {
+  agentLog("H-clear", "cache:clearAppCache", "clearAppCache done", {
     removed,
     leftoverApp: leftoverApp.length,
   });

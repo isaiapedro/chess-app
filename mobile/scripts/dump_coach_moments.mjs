@@ -15,8 +15,10 @@
  *   npx --yes tsx scripts/dump_coach_moments.mjs --pgn ../samples/metrics_all.pgn
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --comment-refs
  *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --ignore-silence
- *   # --comment-refs: note id + only coach-moment fields the tip text references
+ *   npx --yes tsx scripts/dump_coach_moments.mjs ../samples/metrics_all.json --llm
+ *   # --comment-refs: top 3 notes + topics + tip-referenced coach fields
  *   # --ignore-silence: skip 2-rule silence manager (debug)
+ *   # --llm: rewrite comments via /api/v1/coach/comments
  */
 import { readFileSync, existsSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
@@ -29,6 +31,7 @@ import {
 } from "../src/engine/gameCoach/coachNoteRequest.ts";
 import { softKeysForNoteRequest } from "../src/engine/gameCoach/metricNoteKeys.ts";
 import { attachCoachComment } from "../src/engine/gameCoach/attachCoachComment.ts";
+import { resolveLlmComments } from "../src/engine/gameCoach/llmComment.ts";
 import { CoachSilenceManager } from "../src/engine/gameCoach/coachSilence.ts";
 import { loadNotesSchema } from "../src/engine/gameCoach/loadNotesSchema.ts";
 import {
@@ -75,9 +78,10 @@ const DEFAULT_JSON = join(CHESS_ROOT, "samples/metrics_all.json");
 const DEFAULT_PGN = join(CHESS_ROOT, "samples/metrics_all.pgn");
 
 function usage() {
-  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json] [--comment-refs] [--ignore-silence]
-  --comment-refs  note id + only coach-moment refs used by the tip
+  console.error(`Usage: dump_coach_moments.mjs [annotate.json] [--pgn path] [--json] [--comment-refs] [--ignore-silence] [--llm]
+  --comment-refs  top 3 notes + topics + tip-referenced fields
   --ignore-silence  skip ply-gap and unique-key silence
+  --llm  rewrite comments via /api/v1/coach/comments (Ollama through the API)
   Default annotate JSON: ${DEFAULT_JSON}`);
 }
 
@@ -88,6 +92,7 @@ function parseArgs(argv) {
     asJson: false,
     commentRefs: false,
     ignoreSilence: false,
+    llm: false,
   };
   const rest = [];
   for (let i = 0; i < argv.length; i += 1) {
@@ -96,6 +101,8 @@ function parseArgs(argv) {
     else if (a === "--comment-refs") out.commentRefs = true;
     else if (a === "--ignore-silence" || a === "--ignore-phase-limits") {
       out.ignoreSilence = true;
+    } else if (a === "--llm") {
+      out.llm = true;
     }
     else if (a === "--pgn") {
       out.pgnPath = argv[++i];
@@ -444,6 +451,39 @@ function enrichRequestFromMomentInputs(req, moment) {
   };
 }
 
+function formatTopNotesBlock(noteDump, topics) {
+  const lines = ["topNotes:"];
+  if (!noteDump?.length) {
+    lines.push("  (none)");
+  } else {
+    for (const n of noteDump) {
+      const mark = n.selected ? "*" : " ";
+      lines.push(
+        `  ${mark} ${n.id}  key=${n.keyId}  guards=${n.guards}  topic=${n.topic}`
+      );
+    }
+  }
+  lines.push(
+    `topTopics: ${topics?.length ? topics.join(", ") : "(none)"}`
+  );
+  return lines.join("\n");
+}
+
+function gameTopTopics(rows) {
+  const counts = new Map();
+  for (const row of rows) {
+    if (!row.tip) continue;
+    const winner = (row.noteDump || []).find((n) => n.selected);
+    const topic = winner?.topic || row.topTopics?.[0];
+    if (!topic) continue;
+    counts.set(topic, (counts.get(topic) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || String(a[0]).localeCompare(String(b[0])))
+    .slice(0, 3)
+    .map(([topic, n]) => `${topic}×${n}`);
+}
+
 function commentRefsForRow(row) {
   const tip = row.tip;
   if (!tip?.text) return null;
@@ -485,6 +525,7 @@ function dumpMomentCommentRefs(row) {
     `keyId: ${tip.keyId}  keyIds: [${ids}]  score=${tip.score ?? "—"}  noteId=${tip.noteId || "—"}`
   );
   lines.push(tip.text || "(empty)");
+  lines.push(formatTopNotesBlock(row.noteDump, row.topTopics));
   const refs = commentRefsForRow(row);
   if (refs) lines.push(formatCommentRefs(refs));
   lines.push("");
@@ -763,7 +804,7 @@ function dumpMoment(row) {
         ? tip.keyIds.join(", ")
         : tip.keyId || "—";
     lines.push(
-      `keyId: ${tip.keyId}  keyIds: [${ids}]  score=${tip.score ?? "—"}  noteId=${tip.noteId || "—"}`
+      `keyId: ${tip.keyId}  keyIds: [${ids}]  score=${tip.score ?? "—"}  noteId=${tip.noteId || "—"}  source=${row.commentSource || "catalog"}`
     );
     if (row.inputs?.key_ids || row.inputs?.key_id) {
       lines.push(
@@ -771,6 +812,7 @@ function dumpMoment(row) {
       );
     }
     lines.push(tip.text || "(empty)");
+    lines.push(formatTopNotesBlock(row.noteDump, row.topTopics));
     const refs = commentRefsForRow(row);
     if (refs) lines.push(formatCommentRefs(refs));
   }
@@ -778,7 +820,7 @@ function dumpMoment(row) {
   return lines.join("\n");
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv.slice(2));
   const jsonPath = absPath(args.jsonPath);
   if (!existsSync(jsonPath)) {
@@ -1029,6 +1071,11 @@ function main() {
       playedSan: moment.playedSan,
       notes: notesSchema,
       silence: commentSilence,
+      phase,
+      inputs: {
+        ...(moment.inputs || {}),
+        ...(request?.inputs || {}),
+      },
     });
 
     const tip = attached
@@ -1042,7 +1089,7 @@ function main() {
             softKeys: [attached.note.keyId],
             metrics: [],
             clauses: [],
-            topics: [attached.event.kind],
+            topics: attached.topics,
           },
         }
       : null;
@@ -1050,16 +1097,14 @@ function main() {
     const attachLive = attached
       ? { attach: true, reasons: [attached.event.kind] }
       : { attach: false, reasons: ["muted"] };
-    const weightTop = attached
-      ? [
-          {
-            keyId: attached.note.keyId,
-            weight: attached.event.tier,
-            parts: [{ label: attached.event.kind }],
-            formatted: `${attached.event.kind} ${attached.note.id}`,
-          },
-        ]
-      : [];
+    const noteDump = attached?.noteDump || [];
+    const topTopics = attached?.topics || [];
+    const weightTop = noteDump.map((n) => ({
+      keyId: n.keyId,
+      weight: n.guards,
+      parts: [{ label: n.topic }],
+      formatted: `${n.id} guards=${n.guards} topic=${n.topic}`,
+    }));
     if (tip?.keyId) {
       gamePlan = markPlanKeysTaught(gamePlan, [tip.keyId]);
     }
@@ -1168,6 +1213,8 @@ function main() {
       primaryField: explained?.primaryField || null,
       primarySoftKeys: explained?.primarySoftKeys || [],
       attachLive,
+      noteDump,
+      topTopics,
       generatedComment: tip
         ? {
             keyId: tip.keyId,
@@ -1176,6 +1223,8 @@ function main() {
             score: tip.score ?? null,
             text: tip.text,
             tipMeta: tip.tipMeta || null,
+            topNotes: noteDump,
+            topTopics,
           }
         : null,
       silenceReason,
@@ -1183,7 +1232,25 @@ function main() {
       moment,
       request,
       tip,
+      llmPayload: attached?.llmPayload || null,
     });
+  }
+
+  if (args.llm) {
+    const pending = rows.filter((r) => r.generatedComment && r.llmPayload);
+    if (pending.length) {
+      process.stderr.write(`llm comments: ${pending.length} moments…\n`);
+      const resolved = await resolveLlmComments(
+        pending.map((r) => r.llmPayload),
+        pending.map((r) => r.generatedComment.text)
+      );
+      pending.forEach((row, i) => {
+        const text = resolved.texts[i] || row.generatedComment.text;
+        row.generatedComment.text = text;
+        if (row.tip) row.tip.text = text;
+        row.commentSource = resolved.sources[i] || "catalog";
+      });
+    }
   }
 
   for (const row of rows) {
@@ -1206,6 +1273,8 @@ function main() {
         attachLive: r.attachLive,
         eventKind: r.eventKind || null,
         silenceReason: r.silenceReason || null,
+        topNotes: r.noteDump || [],
+        topTopics: r.topTopics || [],
       };
       if (args.commentRefs) {
         return {
@@ -1244,6 +1313,7 @@ function main() {
           themesByPhase: coach.themesByPhase || {},
           globalThemes: coach.globalThemes || [],
           momentCount: rows.length,
+          topTopics: gameTopTopics(rows),
           commentRefsMode: Boolean(args.commentRefs),
           moments: rows.map(momentPayload),
         },
@@ -1263,8 +1333,11 @@ function main() {
   console.log(
     `game_plan(final): ${formatGamePlanShort(gamePlan) || "—"}`
   );
+  console.log(
+    `topTopics (game): ${gameTopTopics(rows).join(", ") || "—"}`
+  );
   if (args.commentRefs) {
-    console.log("mode: --comment-refs (top choices + tip-referenced coach fields only)");
+    console.log("mode: --comment-refs (top notes + tip-referenced coach fields only)");
   }
   console.log("");
   for (const row of rows) {
@@ -1272,6 +1345,13 @@ function main() {
       args.commentRefs ? dumpMomentCommentRefs(row) : dumpMoment(row)
     );
   }
+  const gameTopics = gameTopTopics(rows);
+  if (gameTopics.length) {
+    console.log(`topTopics (game): ${gameTopics.join(", ")}`);
+  }
 }
 
-main();
+main().catch((err) => {
+  console.error(err);
+  process.exit(1);
+});

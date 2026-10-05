@@ -220,6 +220,12 @@ export { adaptNoteSquares } from "./adaptNoteSquares";
 export { composeGameSummaryNote } from "./gameSummary";
 export { attachCoachComment } from "./attachCoachComment";
 export {
+  buildCoachLlmPayload,
+  stitchCoachComment,
+  resolveLlmComments,
+  commentIsConcrete,
+} from "./llmComment";
+export {
   classifyMoment,
   CHECKPOINT_KINDS,
   type CoachEvent,
@@ -233,13 +239,17 @@ export {
 } from "./coachSilence";
 export {
   selectNote,
+  rankNotes,
+  describeRankedNotes,
   validateFactGuards,
   buildLiveFacts,
   kingIsCastled,
   countGuardMatches,
+  RANKED_NOTE_LIMIT,
   type GuardedCoachNote,
   type CoachLiveFacts,
   type NoteGuards,
+  type RankedNoteDump,
 } from "./noteGuards";
 export { composeComment } from "./commentComposer";
 export { loadNotesSchema, resetNotesSchemaCache } from "./loadNotesSchema";

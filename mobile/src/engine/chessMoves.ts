@@ -118,7 +118,9 @@ export function sameMove(
 ): boolean {
   if (!a || !b) return false;
   if (a === b) return true;
-  return canonicalUci(fen, a) === canonicalUci(fen, b);
+  const uciA = canonicalUci(fen, a) || sanToUci(fen, a);
+  const uciB = canonicalUci(fen, b) || sanToUci(fen, b);
+  return Boolean(uciA && uciB && uciA === uciB);
 }
 
 export function pvToSanLine(fen: string, pv: string[], maxPlies = 6): string {

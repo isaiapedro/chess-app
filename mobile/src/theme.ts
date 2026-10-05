@@ -12,9 +12,11 @@ export const colors = {
   borderSoft: "rgba(255,255,255,0.05)",
 
   red: "#D32531",
+  redMuted: "#AE4A50",
   redHover: "#a0000f",
   heart: "#FF5A5A",
   sage: "#34C759",
+  sageMuted: "#53A868",
   blue: "#0084d2",
   cream: "#ede7d3",
   creamShadow: "#d8d0b8",

@@ -1,7 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Animated,
-  Easing,
   RefreshControl,
   ScrollView,
   StyleSheet,
@@ -53,7 +51,6 @@ export function InsightsScreen() {
   const [error, setError] = useState<string | null>(null);
   const [refreshing, setRefreshing] = useState(false);
   const [showCatalog, setShowCatalog] = useState(false);
-  const insightsOpacity = useRef(new Animated.Value(1)).current;
   const { setDepth, registerPopHandler } = useInsightsNav();
 
   const loadKey = `${sessionKey || "x"}:${period}:${refreshToken}:${queryFilters.dateFrom || ""}:${queryFilters.dateTo || ""}`;
@@ -133,29 +130,15 @@ export function InsightsScreen() {
 
   const openCatalog = useCallback(() => {
     if (period === "all" || !data) return;
-    Animated.timing(insightsOpacity, {
-      toValue: 0,
-      duration: 160,
-      easing: Easing.out(Easing.quad),
-      useNativeDriver: true,
-    }).start(({ finished }) => {
-      if (!finished) return;
-      setShowCatalog(true);
-    });
-  }, [insightsOpacity, data, period]);
+    // Mount the catalog synchronously. Fading the only visible screen before
+    // this state update could leave the app on its black background if a native
+    // animation was interrupted.
+    setShowCatalog(true);
+  }, [data, period]);
 
   const closeCatalog = useCallback(() => {
     setShowCatalog(false);
-    insightsOpacity.setValue(0);
-    requestAnimationFrame(() => {
-      Animated.timing(insightsOpacity, {
-        toValue: 1,
-        duration: 240,
-        easing: Easing.out(Easing.cubic),
-        useNativeDriver: true,
-      }).start();
-    });
-  }, [insightsOpacity]);
+  }, []);
 
   useEffect(() => {
     setError(null);
@@ -212,6 +195,14 @@ export function InsightsScreen() {
     );
   }
 
+  // The catalog is display-only: its entry button is rendered only after
+  // `metricsReady`, so it must stay visible even if a background remesh starts
+  // after navigation. Render it as the screen rather than an absolute sibling
+  // of an animated/gated Insights view.
+  if (showCatalog && data) {
+    return <CatalogScreen data={data} onBack={closeCatalog} />;
+  }
+
   if (!metricsReady) {
     return (
       <View style={[styles.stack, styles.metricsWait]}>
@@ -224,11 +215,12 @@ export function InsightsScreen() {
     <View style={styles.stack}>
       <AnalyticsScanBanner mode="overlay" />
       <EvalPendingWarning />
-      <Animated.View style={[styles.insightsLayer, { opacity: insightsOpacity }]}>
+      <View style={styles.insightsLayer}>
       <AnalyticsPageShell
         loadKey={loadKey}
         contentReady={!!data}
         period={period}
+        loadingLabel="Loading insights…"
         error={!!(error && !data)}
         skeleton={<InsightsSkeleton />}
         errorNode={
@@ -241,7 +233,7 @@ export function InsightsScreen() {
           <ScrollView
             style={styles.scroll}
             contentContainerStyle={styles.content}
-            scrollEnabled={!showCatalog}
+            scrollEnabled
             refreshControl={
               <RefreshControl
                 refreshing={refreshing}
@@ -350,13 +342,8 @@ export function InsightsScreen() {
           </ScrollView>
         ) : null}
       </AnalyticsPageShell>
-      </Animated.View>
+      </View>
 
-      {showCatalog && data ? (
-        <View style={styles.overlay}>
-          <CatalogScreen data={data} onBack={closeCatalog} />
-        </View>
-      ) : null}
     </View>
   );
 }
@@ -503,10 +490,6 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
     maxWidth: 320,
   },
-  overlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: colors.bg,
-  },
   scroll: { flex: 1, backgroundColor: colors.bg },
   content: { paddingBottom: 100 },
   center: {
@@ -527,7 +510,7 @@ const styles = StyleSheet.create({
     color: colors.textMuted,
   },
   dialCenter: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     alignItems: "center",
     justifyContent: "center",
   },

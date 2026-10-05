@@ -28,9 +28,12 @@ export function composeComment(
   event: CoachEvent,
   live: CoachLiveFacts
 ): string {
-  const attention = interpolate(note.template.attention || "", live);
-  const lesson = interpolate(note.template.lesson || "", live);
-  const plan = interpolate(note.template.plan || "", live);
+  const prewritten = interpolate(note.text || "", live);
+  if (prewritten) return prewritten;
+
+  const attention = interpolate(note.template?.attention || "", live);
+  const lesson = interpolate(note.template?.lesson || "", live);
+  const plan = interpolate(note.template?.plan || "", live);
   const dropCp =
     event.kind === "tactical_blunder" || event.kind === "positional_error"
       ? event.dropCp

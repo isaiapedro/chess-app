@@ -13,10 +13,11 @@ import {
   Vibration,
   View,
 } from "react-native";
+import Svg, { Defs, LinearGradient, Rect, Stop } from "react-native-svg";
 import { Chess } from "chess.js";
 import { Ionicons } from "@expo/vector-icons";
 import * as Haptics from "expo-haptics";
-import { ChessBoard } from "../components/ChessBoard";
+import { ChessBoard, MOVE_ANIM_MS } from "../components/ChessBoard";
 import { GameEvalGraph } from "../components/GameEvalGraph";
 import { OpponentAvatar } from "../components/OpponentAvatar";
 import {
@@ -53,6 +54,7 @@ import {
   sideAccuracyPct,
 } from "../engine/gameCoach/coachMarks";
 import { formatOpeningLabel } from "../engine/gameCoach/ecoLabels";
+import { gameEndKingVisual } from "../engine/gameEndKingBadge";
 import { formatOpponentName } from "../data/opponentAvatar";
 import { computePhaseSplits } from "../engine/gameCoach/phaseSplits";
 import { useStockfish } from "../engine/StockfishProvider";
@@ -65,6 +67,30 @@ import {
 } from "../engine/analysisConfig";
 import { evalBarWhiteShare, toWhiteCp } from "../engine/analyzeMistakes";
 import { sameMove, sanToUci } from "../engine/chessMoves";
+import {
+  buildEngineVariant,
+  engineLineArrowUci,
+  type EngineVariantMove,
+} from "../engine/gameCoach/engineVariant";
+import { AppIcon } from "../icons";
+import {
+  ENGINE_VARIANT_COLOR,
+  GAME_LINE_COLOR,
+  activeLineColor,
+  applyBoardMove,
+  enterUserVariant,
+  leaveSidelineToGame,
+  lineFen,
+  lineSwitchAnims,
+  sidelinesVisibleAt,
+  stepUserExplore,
+  truncateUserVariant,
+  userVariantsAt,
+  type BoardAnimStep,
+  type ExploreState,
+  type UserVariantRecord,
+} from "../engine/gameCoach/userVariant";
+import { Trash2 } from "lucide-react-native";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import { ensureStudyGames } from "../storage/analyticsLoaders";
 import type { NormalizedGame } from "../data/platformGames";
@@ -78,9 +104,10 @@ import type { QueryFilters } from "../api/client";
 import { fetchExplorer } from "../api/client";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
-/** Matches TabNavigator order: Wrapped, Insights, Study, Games, Profile */
-const GAMES_TAB_INDEX = 3;
+const GAMES_TAB_INDEX = 1;
 const GAMES_PAGE_SIZE = 20;
+const HOLD_NAV_MAX_MULT = 20;
+const HOLD_NAV_RAMP_MS = 1600;
 
 function viewFilteredGames(
   games: StudyGame[],
@@ -151,19 +178,185 @@ function resultTone(value?: string): string {
   return colors.textMuted;
 }
 
-function userKingBadge(value?: string): "win" | "loss" | null {
-  const v = String(value || "").toLowerCase();
-  if (v.includes("win")) return "win";
-  if (v.includes("loss")) return "loss";
-  return null;
-}
-
 function overlayMatchScore(value?: string): string {
   const v = String(value || "").toLowerCase();
   if (v.includes("win")) return "1 - 0";
   if (v.includes("draw") || v === "1/2-1/2") return "1/2 - 1/2";
   if (v.includes("loss")) return "0 - 1";
   return "–";
+}
+
+function EngineGameFill({
+  active,
+  fillId,
+}: {
+  active: boolean;
+  fillId: string;
+}) {
+  const [box, setBox] = useState({ w: 0, h: 0 });
+  const op = active ? 0.36 : 0.22;
+  return (
+    <View
+      pointerEvents="none"
+      style={StyleSheet.absoluteFill}
+      onLayout={(e) => {
+        const { width, height } = e.nativeEvent.layout;
+        if (width !== box.w || height !== box.h) setBox({ w: width, h: height });
+      }}
+    >
+      {box.w > 0 && box.h > 0 ? (
+        <Svg width={box.w} height={box.h}>
+          <Defs>
+            <LinearGradient
+              id={fillId}
+              x1="0"
+              y1="0"
+              x2={box.w}
+              y2="0"
+              gradientUnits="userSpaceOnUse"
+            >
+              <Stop
+                offset="0"
+                stopColor={ENGINE_VARIANT_COLOR}
+                stopOpacity={op}
+              />
+              <Stop
+                offset="1"
+                stopColor={GAME_LINE_COLOR}
+                stopOpacity={op}
+              />
+            </LinearGradient>
+          </Defs>
+          <Rect width={box.w} height={box.h} fill={`url(#${fillId})`} />
+        </Svg>
+      ) : null}
+    </View>
+  );
+}
+
+function HintedMoveChip({
+  label,
+  active,
+  noted,
+  engineFork,
+  userFork,
+  onPress,
+}: {
+  label: string;
+  active: boolean;
+  noted: boolean;
+  engineFork: boolean;
+  userFork: boolean;
+  onPress: () => void;
+}) {
+  const mixId = `eg${React.useId().replace(/[^a-zA-Z0-9_-]/g, "")}`;
+  const mixed = engineFork && userFork;
+  const outline = mixed || engineFork
+    ? ENGINE_VARIANT_COLOR
+    : userFork
+      ? GAME_LINE_COLOR
+      : null;
+  const fill = mixed
+    ? "transparent"
+    : outline
+      ? withAlpha(outline, active ? 0.28 : 0.16)
+      : undefined;
+  return (
+    <Pressable
+      onPress={onPress}
+      style={[
+        styles.moveChip,
+        active && !outline && styles.moveChipActive,
+        noted && !outline && styles.moveChipNoted,
+        outline && {
+          borderColor: outline,
+          backgroundColor: fill,
+          overflow: "hidden",
+        },
+      ]}
+    >
+      {mixed ? <EngineGameFill active={active} fillId={mixId} /> : null}
+      <Text
+        style={[
+          styles.moveChipText,
+          styles.moveChipLabel,
+          active && styles.moveChipTextActive,
+          Boolean(outline) && !active && { color: colors.cream },
+        ]}
+      >
+        {label}
+      </Text>
+    </Pressable>
+  );
+}
+
+function BranchChips({
+  moves,
+  color,
+  openMark,
+  closeMark,
+  activeDepth,
+  onPressDepth,
+  onDeleteDepth,
+}: {
+  moves: EngineVariantMove[];
+  color: string;
+  openMark: string;
+  closeMark: string;
+  activeDepth: number | null;
+  onPressDepth: (depth: number) => void;
+  onDeleteDepth?: (depth: number) => void;
+}) {
+  if (!moves.length) return null;
+  return (
+    <View style={styles.variantGroup}>
+      <Text style={[styles.variantMark, { color }]}>{openMark}</Text>
+      {moves.map((m, d) => {
+        const vActive = activeDepth === d;
+        return (
+          <View key={`${d}-${m.uci}`} style={styles.variantChipRow}>
+            <Pressable
+              onPress={() => onPressDepth(d)}
+              style={[
+                styles.moveChip,
+                {
+                  borderColor: withAlpha(color, vActive ? 1 : 0.45),
+                  backgroundColor: vActive
+                    ? colors.surfaceRaised
+                    : withAlpha(color, 0.08),
+                },
+              ]}
+            >
+              <Text
+                style={[
+                  styles.moveChipText,
+                  { color: vActive ? colors.cream : color },
+                ]}
+              >
+                {m.side === "white" ? `${m.fullmove}. ` : ""}
+                {m.san}
+              </Text>
+            </Pressable>
+            {vActive && onDeleteDepth ? (
+              <Pressable
+                accessibilityRole="button"
+                accessibilityLabel="Delete from this move"
+                onPress={() => onDeleteDepth(d)}
+                hitSlop={8}
+                style={[
+                  styles.variantDelete,
+                  { borderColor: withAlpha(color, 0.7) },
+                ]}
+              >
+                <AppIcon icon={Trash2} size={13} color={color} />
+              </Pressable>
+            ) : null}
+          </View>
+        );
+      })}
+      <Text style={[styles.variantMark, { color }]}>{closeMark}</Text>
+    </View>
+  );
 }
 
 export function GamesScreen() {
@@ -201,12 +394,27 @@ export function GamesScreen() {
   const [liveCp, setLiveCp] = useState<number | null>(null);
   const [liveBusy, setLiveBusy] = useState(false);
   const [boardAnimUci, setBoardAnimUci] = useState<string | null>(null);
+  const [boardAnimSteps, setBoardAnimSteps] = useState<BoardAnimStep[] | null>(
+    null
+  );
+  const [variantCursor, setVariantCursor] = useState<{
+    plyIndex: number;
+    depth: number;
+  } | null>(null);
+  const [explore, setExplore] = useState<ExploreState | null>(null);
+  const [userVariants, setUserVariants] = useState<UserVariantRecord[]>([]);
   const cancelRef = useRef({ cancelled: false });
   const skipAnimateRef = useRef(false);
   const plyIndexRef = useRef(plyIndex);
   const pliesRef = useRef(plies);
+  const variantCursorRef = useRef(variantCursor);
+  const exploreRef = useRef(explore);
+  const userVariantsRef = useRef(userVariants);
   plyIndexRef.current = plyIndex;
   pliesRef.current = plies;
+  variantCursorRef.current = variantCursor;
+  exploreRef.current = explore;
+  userVariantsRef.current = userVariants;
 
   const filtersKey = useMemo(
     () =>
@@ -233,6 +441,10 @@ export function GamesScreen() {
     setLiveLines([]);
     setLiveCp(null);
     setBoardAnimUci(null);
+    setBoardAnimSteps(null);
+    setVariantCursor(null);
+    setExplore(null);
+    setUserVariants([]);
     setGames([]);
     setHasMore(false);
     setVisibleCount(GAMES_PAGE_SIZE);
@@ -318,6 +530,10 @@ export function GamesScreen() {
       setLiveLines([]);
       setLiveCp(null);
       setBoardAnimUci(null);
+      setBoardAnimSteps(null);
+      setVariantCursor(null);
+      setExplore(null);
+      setUserVariants([]);
       setPlyIndex(-1);
       setPlies([]);
       setAnalysis(null);
@@ -364,6 +580,11 @@ export function GamesScreen() {
     setAnalyzeError(null);
     setLiveLines([]);
     setLiveCp(null);
+    setBoardAnimUci(null);
+    setBoardAnimSteps(null);
+    setVariantCursor(null);
+    setExplore(null);
+    setUserVariants([]);
   }, []);
 
   const runAnalyze = useCallback(async () => {
@@ -386,10 +607,19 @@ export function GamesScreen() {
       if (cancelRef.current.cancelled) return;
       if (cached?.plies?.length) {
         const plies = stampAccuracyMarks(cached.plies);
-        setAnalysis({ ...cached, plies });
+        const refreshed = { ...cached, plies };
+        setAnalysis(refreshed);
         setPlies(plies);
         setShowAccuracyOverlay(true);
         setAnalyzeProgress(null);
+        if (plies !== cached.plies) {
+          // Persist lazy mark/comparison migration without delaying the review.
+          void saveCachedGameAnalysis(
+            queryFilters.platform,
+            queryFilters.username,
+            refreshed
+          );
+        }
         return;
       }
 
@@ -440,13 +670,14 @@ export function GamesScreen() {
       });
       if (cancelRef.current.cancelled) return;
       const plies = stampAccuracyMarks(result.plies);
-      setAnalysis({ ...result, plies });
+      const reviewed = { ...result, plies };
+      setAnalysis(reviewed);
       setPlies(plies);
       setShowAccuracyOverlay(true);
       await saveCachedGameAnalysis(
         queryFilters.platform,
         queryFilters.username,
-        result
+        reviewed
       );
       requestVaultRemesh();
       setAnalyzeProgress(null);
@@ -462,10 +693,41 @@ export function GamesScreen() {
   const orientation =
     selectedGame?.user_color === "black" ? "black" : "white";
 
-  const fen = useMemo(() => {
-    if (plyIndex < 0 || !plies.length) return new Chess().fen();
-    return plies[Math.min(plyIndex, plies.length - 1)]?.fenAfter || new Chess().fen();
-  }, [plies, plyIndex]);
+  const engineVariants = useMemo(
+    () => (analysis ? plies.map((p, i) => buildEngineVariant(p, i)) : []),
+    [analysis, plies]
+  );
+  const engineVariantsRef = useRef(engineVariants);
+  engineVariantsRef.current = engineVariants;
+
+  const activeVariantMoves =
+    variantCursor != null
+      ? engineVariants[variantCursor.plyIndex]?.moves
+      : null;
+  const activeVariantMove =
+    activeVariantMoves && variantCursor != null
+      ? activeVariantMoves[variantCursor.depth] ?? null
+      : null;
+  const exploreMove =
+    explore && explore.depth >= 0
+      ? explore.moves[explore.depth] ?? null
+      : null;
+  const lineMove = exploreMove || activeVariantMove;
+  const startFen = plies[0]?.fenBefore || new Chess().fen();
+  const fen = useMemo(
+    () =>
+      lineFen(
+        { plyIndex, engineCursor: variantCursor, explore },
+        plies,
+        engineVariants,
+        startFen
+      ),
+    [plies, plyIndex, variantCursor, explore, engineVariants, startFen]
+  );
+  const boardRimColor = activeLineColor({
+    engineCursor: variantCursor,
+    explore,
+  });
 
   const currentPly = plyIndex >= 0 ? plies[plyIndex] : null;
 
@@ -483,21 +745,24 @@ export function GamesScreen() {
       setLiveBusy(false);
       return;
     }
-    const fenNow =
-      plyIndex < 0
-        ? plies[0]?.fenBefore || new Chess().fen()
-        : plies[plyIndex]?.fenAfter || fen;
+    const offMain = Boolean(activeVariantMove || explore);
+    const fenNow = fen;
 
-    const stored =
-      plyIndex < 0 ? plies[0]?.lines : plies[plyIndex]?.lines;
-    const seedCp =
-      plyIndex < 0
+    const stored = offMain
+      ? []
+      : plyIndex < 0
+        ? plies[0]?.lines
+        : plies[plyIndex]?.lines;
+    const seedCp = offMain
+      ? null
+      : plyIndex < 0
         ? plies[0]?.evalBeforeCp ?? null
         : plies[plyIndex]?.evalAfterCp ??
           plies[plyIndex]?.evalBeforeCp ??
           null;
     if (seedCp != null) setLiveCp(seedCp);
     if (stored && stored.length) setLiveLines(stored);
+    else if (offMain) setLiveLines([]);
 
     setLiveBusy(true);
     const stop = startLiveEval(fenNow, LIVE_EVAL_MULTIPV, (ev) => {
@@ -517,6 +782,8 @@ export function GamesScreen() {
     plyIndex,
     plies,
     fen,
+    activeVariantMove,
+    explore,
     startLiveEval,
   ]);
 
@@ -588,37 +855,31 @@ export function GamesScreen() {
 
   // Accuracy icons: only from Analyze pass (ply.mark), never from live eval
   const markedPly =
-    plyIndex >= 0 && plies[plyIndex]
-      ? !boardAnimUci ||
-        plies[plyIndex].uci.slice(0, 4) === boardAnimUci.slice(0, 4)
-        ? plies[plyIndex]
-        : null
+    !variantCursor && !explore && plyIndex >= 0 && plies[plyIndex]
+      ? plies[plyIndex]
       : null;
   const currentMark = markedPly?.mark || null;
 
-  // Board last-move glow only when ply has a coach comment.
   const highlightUci =
-    plyIndex >= 0 && plies[plyIndex]?.note?.trim()
+    !lineMove && plyIndex >= 0 && plies[plyIndex]?.note?.trim()
       ? plies[plyIndex].uci
       : null;
 
   const kingBadge =
     plyIndex >= 0 &&
     plyIndex === plies.length - 1 &&
-    !boardAnimUci
-      ? userKingBadge(selectedGame?.result)
+    !variantCursor &&
+    !explore
+      ? gameEndKingVisual(selectedGame?.result, orientation)?.kind ?? null
       : null;
 
-  const holdTimers = useRef<{
-    delay: ReturnType<typeof setTimeout> | null;
-    interval: ReturnType<typeof setInterval> | null;
-  }>({ delay: null, interval: null });
+  const holdNavTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const holdNavGen = useRef(0);
 
   const stopHoldNav = useCallback(() => {
-    if (holdTimers.current.delay) clearTimeout(holdTimers.current.delay);
-    if (holdTimers.current.interval) clearInterval(holdTimers.current.interval);
-    holdTimers.current.delay = null;
-    holdTimers.current.interval = null;
+    holdNavGen.current += 1;
+    if (holdNavTimer.current != null) clearTimeout(holdNavTimer.current);
+    holdNavTimer.current = null;
     skipAnimateRef.current = false;
   }, []);
 
@@ -627,35 +888,208 @@ export function GamesScreen() {
       stopHoldNav();
       navHaptic();
       skipAnimateRef.current = false;
+      const startedAt = Date.now();
+      const gen = holdNavGen.current;
       step();
-      holdTimers.current.delay = setTimeout(() => {
-        skipAnimateRef.current = true;
-        holdTimers.current.interval = setInterval(step, 85);
-      }, 380);
+      if (gen !== holdNavGen.current) return;
+      const schedule = () => {
+        if (gen !== holdNavGen.current) return;
+        const elapsed = Date.now() - startedAt;
+        const progress = Math.min(1, elapsed / HOLD_NAV_RAMP_MS);
+        const delay = MOVE_ANIM_MS / HOLD_NAV_MAX_MULT ** progress;
+        skipAnimateRef.current = delay < MOVE_ANIM_MS;
+        holdNavTimer.current = setTimeout(() => {
+          if (gen !== holdNavGen.current) return;
+          step();
+          schedule();
+        }, delay);
+      };
+      schedule();
     },
     [stopHoldNav]
   );
 
   useEffect(() => () => stopHoldNav(), [stopHoldNav]);
 
+  const playLineNav = useCallback(
+    (
+      next: {
+        plyIndex: number;
+        engineCursor: { plyIndex: number; depth: number } | null;
+        explore: ExploreState | null;
+        userVariants?: UserVariantRecord[];
+      },
+      animate: boolean
+    ) => {
+      const from = {
+        plyIndex: plyIndexRef.current,
+        engineCursor: variantCursorRef.current,
+        explore: exploreRef.current,
+      };
+      const startFen =
+        pliesRef.current[0]?.fenBefore || new Chess().fen();
+      const steps =
+        animate && !skipAnimateRef.current
+          ? lineSwitchAnims(
+              from,
+              next,
+              pliesRef.current,
+              engineVariantsRef.current,
+              startFen
+            )
+          : [];
+      setPlyIndex(next.plyIndex);
+      setVariantCursor(next.engineCursor);
+      setExplore(next.explore);
+      if (next.userVariants) setUserVariants(next.userVariants);
+      setBoardAnimUci(null);
+      setBoardAnimSteps(steps.length ? steps : null);
+    },
+    []
+  );
+
   const jumpPly = useCallback((i: number) => {
-    setBoardAnimUci(null);
-    setPlyIndex(i);
-  }, []);
+    playLineNav({ plyIndex: i, engineCursor: null, explore: null }, false);
+  }, [playLineNav]);
+
+  const enterVariant = useCallback((plyAt: number, depth: number) => {
+    const moves = engineVariantsRef.current[plyAt]?.moves;
+    if (!moves?.[depth]) return;
+    playLineNav(
+      {
+        plyIndex: plyAt,
+        engineCursor: { plyIndex: plyAt, depth },
+        explore: null,
+      },
+      true
+    );
+  }, [playLineNav]);
+
+  const openUserVariant = useCallback((id: string, depth: number) => {
+    const entered = enterUserVariant(userVariantsRef.current, id, depth);
+    if (!entered) return;
+    playLineNav(
+      {
+        plyIndex: entered.baseIdx,
+        engineCursor: null,
+        explore: entered,
+      },
+      true
+    );
+  }, [playLineNav]);
+
+  const deleteFromUserMove = useCallback((id: string, depth: number) => {
+    const next = truncateUserVariant(
+      {
+        plyIndex: plyIndexRef.current,
+        engineCursor: variantCursorRef.current,
+        explore: exploreRef.current,
+        userVariants: userVariantsRef.current,
+      },
+      id,
+      depth
+    );
+    playLineNav(next, false);
+    setUserVariants(next.userVariants);
+  }, [playLineNav]);
 
   const prevPly = useCallback(() => {
+    const exp = exploreRef.current;
+    if (exp) {
+      const stepped = stepUserExplore(exp, -1);
+      if (
+        stepped.explore === exp &&
+        stepped.explore.depth === exp.depth
+      ) {
+        stopHoldNav();
+        return;
+      }
+      playLineNav(
+        {
+          plyIndex: stepped.plyIndex,
+          engineCursor: stepped.engineCursor,
+          explore: stepped.explore,
+        },
+        !skipAnimateRef.current
+      );
+      return;
+    }
+    const cursor = variantCursorRef.current;
+    if (cursor) {
+      if (cursor.depth <= 0) {
+        playLineNav(
+          leaveSidelineToGame({
+            plyIndex: cursor.plyIndex,
+            engineCursor: cursor,
+            explore: null,
+          }),
+          !skipAnimateRef.current
+        );
+        return;
+      }
+      playLineNav(
+        {
+          plyIndex: cursor.plyIndex,
+          engineCursor: { plyIndex: cursor.plyIndex, depth: cursor.depth - 1 },
+          explore: null,
+        },
+        !skipAnimateRef.current
+      );
+      return;
+    }
     const i = plyIndexRef.current;
     if (i <= -1) {
       stopHoldNav();
       return;
     }
-    setBoardAnimUci(null);
     const next = i - 1;
     if (next <= -1) stopHoldNav();
-    setPlyIndex(next);
-  }, [stopHoldNav]);
+    playLineNav(
+      { plyIndex: next, engineCursor: null, explore: null },
+      !skipAnimateRef.current
+    );
+  }, [playLineNav, stopHoldNav]);
 
   const nextPly = useCallback(() => {
+    const exp = exploreRef.current;
+    if (exp) {
+      const stepped = stepUserExplore(exp, 1);
+      if (!stepped.explore || stepped.explore.depth === exp.depth) {
+        stopHoldNav();
+        return;
+      }
+      if (stepped.explore.depth >= stepped.explore.moves.length - 1) {
+        stopHoldNav();
+      }
+      playLineNav(
+        {
+          plyIndex: stepped.plyIndex,
+          engineCursor: null,
+          explore: stepped.explore,
+        },
+        !skipAnimateRef.current
+      );
+      return;
+    }
+    const cursor = variantCursorRef.current;
+    if (cursor) {
+      const moves = engineVariantsRef.current[cursor.plyIndex]?.moves;
+      const next = cursor.depth + 1;
+      if (!moves || next >= moves.length) {
+        stopHoldNav();
+        return;
+      }
+      if (next >= moves.length - 1) stopHoldNav();
+      playLineNav(
+        {
+          plyIndex: cursor.plyIndex,
+          engineCursor: { plyIndex: cursor.plyIndex, depth: next },
+          explore: null,
+        },
+        !skipAnimateRef.current
+      );
+      return;
+    }
     const i = plyIndexRef.current;
     const list = pliesRef.current;
     const max = Math.max(list.length - 1, 0);
@@ -664,19 +1098,25 @@ export function GamesScreen() {
       return;
     }
     const next = i + 1;
-    const uci = list[next]?.uci;
-    if (!skipAnimateRef.current && uci) setBoardAnimUci(uci);
-    else setBoardAnimUci(null);
     if (next >= max) stopHoldNav();
-    setPlyIndex(next);
-  }, [stopHoldNav]);
+    playLineNav(
+      { plyIndex: next, engineCursor: null, explore: null },
+      !skipAnimateRef.current
+    );
+  }, [playLineNav, stopHoldNav]);
 
   const clearBoardAnim = useCallback(() => {
     setBoardAnimUci(null);
+    setBoardAnimSteps(null);
   }, []);
 
   const engineArrowUci = useMemo(() => {
-    if (!analysis || !currentPly) return null;
+    const lineUci = engineLineArrowUci(
+      { plyIndex, engineCursor: variantCursor, explore },
+      engineVariants
+    );
+    if (lineUci) return lineUci;
+    if (explore || variantCursor || !analysis || !currentPly) return null;
     const userColor =
       selectedGame?.user_color === "black" ? "black" : "white";
     if (currentPly.side !== userColor) return null;
@@ -692,7 +1132,101 @@ export function GamesScreen() {
     if (bestUci.length < 4) return null;
     if (sameMove(currentPly.fenBefore, currentPly.uci, bestUci)) return null;
     return bestUci;
-  }, [analysis, currentPly, selectedGame?.user_color]);
+  }, [
+    analysis,
+    currentPly,
+    selectedGame?.user_color,
+    variantCursor,
+    engineVariants,
+    plyIndex,
+    explore,
+  ]);
+
+  const onEngineArrowPress = useCallback(() => {
+    const exp = exploreRef.current;
+    if (exp) {
+      const stepped = stepUserExplore(exp, 1);
+      if (!stepped.explore || stepped.explore.depth === exp.depth) return;
+      playLineNav(
+        {
+          plyIndex: stepped.plyIndex,
+          engineCursor: null,
+          explore: stepped.explore,
+        },
+        true
+      );
+      return;
+    }
+    if (variantCursor) {
+      const next = variantCursor.depth + 1;
+      const moves = engineVariantsRef.current[variantCursor.plyIndex]?.moves;
+      if (moves && next < moves.length) enterVariant(variantCursor.plyIndex, next);
+      return;
+    }
+    if (plyIndex < 0) return;
+    if (!engineVariantsRef.current[plyIndex]?.moves.length) return;
+    enterVariant(plyIndex, 0);
+  }, [variantCursor, plyIndex, enterVariant, playLineNav]);
+
+  const arrowPressable = Boolean(
+    engineArrowUci &&
+      (explore
+        ? explore.depth + 1 < explore.moves.length
+        : variantCursor
+          ? (activeVariantMoves?.length ?? 0) > variantCursor.depth + 1
+          : Boolean(engineVariants[plyIndex]?.moves.length))
+  );
+
+  const atVariantEnd = Boolean(
+    explore
+      ? explore.depth >= explore.moves.length - 1
+      : variantCursor &&
+        variantCursor.depth >=
+          (engineVariants[variantCursor.plyIndex]?.moves.length ?? 1) - 1
+  );
+
+  const navLabelPly = lineMove || currentPly;
+
+  const onBoardMove = useCallback(
+    (uci: string, san: string, fenAfter: string) => {
+      const nav = {
+        plyIndex: plyIndexRef.current,
+        engineCursor: variantCursorRef.current,
+        explore: exploreRef.current,
+        userVariants: userVariantsRef.current,
+      };
+      const currentFen = lineFen(
+        nav,
+        pliesRef.current,
+        engineVariantsRef.current,
+        pliesRef.current[0]?.fenBefore || new Chess().fen()
+      );
+      const next = applyBoardMove(
+        nav,
+        pliesRef.current,
+        engineVariantsRef.current,
+        currentFen,
+        uci,
+        san,
+        fenAfter
+      );
+      if (!next) return;
+      playLineNav(next, true);
+      setUserVariants(next.userVariants);
+    },
+    [playLineNav]
+  );
+
+  const canPrev = explore
+    ? explore.depth >= 0 ||
+      Boolean(explore.stem && explore.stem.through >= 0) ||
+      explore.baseIdx >= 0
+    : plyIndex >= 0 || Boolean(variantCursor);
+
+  const canNext = explore
+    ? explore.depth < explore.moves.length - 1
+    : Boolean(plies.length) &&
+      (variantCursor ? !atVariantEnd : plyIndex < plies.length - 1);
 
   const gameSections = useMemo(() => {
     const byDay = new Map<string, StudyGame[]>();
@@ -747,36 +1281,39 @@ export function GamesScreen() {
               scrollEnabled={!showAccuracyOverlay}
             >
 
-          <View style={styles.analysisHeader}>
-            <OpponentAvatar
-              platform={queryFilters.platform}
-              username={selectedGame.opponent_name}
-              size={44}
-            />
-            <View style={styles.analysisHeaderText}>
-              <DisplayTitle>
-                {formatOpponentName(
-                  selectedGame.opponent_name,
-                  selectedGame.opp_rating
-                )}
-              </DisplayTitle>
-            </View>
-          </View>
-          <Text style={styles.subtitle}>
-            {`${formatGameDate(selectedGame.created_at)} · ${
-              selectedGame.speed || "game"
-            } · ${selectedGame.result || "?"}`}
-          </Text>
-
-          {(() => {
-            const compact = formatOpeningLabel(
-              selectedGame.opening_eco,
-              selectedGame.opening_name
-            );
-            return compact ? (
-              <Text style={styles.openingLine}>{compact}</Text>
-            ) : null;
-          })()}
+          {!analysis ? (
+            <>
+              <View style={styles.analysisHeader}>
+                <OpponentAvatar
+                  platform={queryFilters.platform}
+                  username={selectedGame.opponent_name}
+                  size={44}
+                />
+                <View style={styles.analysisHeaderText}>
+                  <DisplayTitle>
+                    {formatOpponentName(
+                      selectedGame.opponent_name,
+                      selectedGame.opp_rating
+                    )}
+                  </DisplayTitle>
+                </View>
+              </View>
+              <Text style={styles.subtitle}>
+                {`${formatGameDate(selectedGame.created_at)} · ${
+                  selectedGame.speed || "game"
+                } · ${selectedGame.result || "?"}`}
+              </Text>
+              {(() => {
+                const compact = formatOpeningLabel(
+                  selectedGame.opening_eco,
+                  selectedGame.opening_name
+                );
+                return compact ? (
+                  <Text style={styles.openingLine}>{compact}</Text>
+                ) : null;
+              })()}
+            </>
+          ) : null}
 
           {openingGame ? (
             <View style={styles.openingGameRow}>
@@ -835,24 +1372,42 @@ export function GamesScreen() {
             <ChessBoard
               fen={fen}
               orientation={orientation}
-              interactive={false}
+              interactive={!openingGame && plies.length > 0}
+              onMove={onBoardMove}
               highlightUci={highlightUci}
-              animateUci={boardAnimUci}
+              animateUci={boardAnimSteps?.length ? null : boardAnimUci}
+              animateSteps={boardAnimSteps}
               onAnimateEnd={clearBoardAnim}
-              arrowUci={boardAnimUci ? null : engineArrowUci}
+              arrowUci={
+                boardAnimUci || boardAnimSteps?.length ? null : engineArrowUci
+              }
+              arrowColor={boardRimColor || colors.sage}
+              onArrowPress={
+                boardAnimUci || boardAnimSteps?.length || !arrowPressable
+                  ? undefined
+                  : onEngineArrowPress
+              }
               markUci={
                 currentMark && markedPly?.uci ? markedPly.uci : null
               }
               markSource={
                 currentMark ? COACH_MARK_SOURCES[currentMark] : null
               }
-              markKey={
-                currentMark && markedPly?.uci
-                  ? `${plyIndex}:${currentMark}:${markedPly.uci}`
-                  : null
-              }
+              markKey={currentMark}
               kingBadge={kingBadge}
+              kingBadgeUser={orientation}
+              rimColor={boardRimColor}
             />
+            <View pointerEvents="none" style={styles.markPreload}>
+              {COACH_MARK_ORDER.map((mark) => (
+                <Image
+                  key={mark}
+                  source={COACH_MARK_SOURCES[mark]}
+                  fadeDuration={0}
+                  style={styles.markPreloadGif}
+                />
+              ))}
+            </View>
           </EdgeCard>
 
           <View style={styles.navRow}>
@@ -861,22 +1416,22 @@ export function GamesScreen() {
               ghost
               onPressIn={() => startHoldNav(prevPly)}
               onPressOut={stopHoldNav}
-              disabled={plyIndex < 0}
+              disabled={!canPrev}
               style={{ flex: 1 }}
             />
             <Text style={styles.pageCount}>
-              {plyIndex < 0
-                ? ""
-                : `${currentPly?.fullmove}${
-                    currentPly?.side === "white" ? "." : "..."
-                  } ${currentPly?.san || ""}`}
+              {navLabelPly && (explore ? explore.depth >= 0 : plyIndex >= 0)
+                ? `${navLabelPly.fullmove}${
+                    navLabelPly.side === "white" ? "." : "..."
+                  } ${navLabelPly.san || ""}`
+                : ""}
             </Text>
             <BrutalButton
               label="Next"
               ghost
               onPressIn={() => startHoldNav(nextPly)}
               onPressOut={stopHoldNav}
-              disabled={!plies.length || plyIndex >= plies.length - 1}
+              disabled={!canNext}
               style={{ flex: 1 }}
             />
           </View>
@@ -919,29 +1474,95 @@ export function GamesScreen() {
 
           <Text style={styles.movesHeader}>Moves</Text>
           <View style={styles.movesWrap}>
+            {userVariantsAt(userVariants, -1).map((v) =>
+              sidelinesVisibleAt(-1, {
+                plyIndex,
+                engineCursor: variantCursor,
+                explore,
+              }) || explore?.id === v.id ? (
+                <BranchChips
+                  key={v.id}
+                  moves={v.moves}
+                  color={GAME_LINE_COLOR}
+                  openMark="["
+                  closeMark="]"
+                  activeDepth={explore?.id === v.id ? explore.depth : null}
+                  onPressDepth={(d) => openUserVariant(v.id, d)}
+                  onDeleteDepth={
+                    explore?.id === v.id
+                      ? (d) => deleteFromUserMove(v.id, d)
+                      : undefined
+                  }
+                />
+              ) : null
+            )}
             {plies.map((p, i) => {
-              const active = i === plyIndex;
+              const active = !variantCursor && !explore && i === plyIndex;
               const noted = Boolean(p.note?.trim());
+              const engine = engineVariants[i];
+              const custom = [
+                ...userVariantsAt(userVariants, i),
+                ...userVariantsAt(userVariants, i, i),
+              ];
+              const showSides = sidelinesVisibleAt(i, {
+                plyIndex,
+                engineCursor: variantCursor,
+                explore,
+              });
+              const stem = explore?.stem?.ply === i ? explore.stem : null;
+              const engineMoves = !showSides
+                ? null
+                : stem
+                  ? engine?.moves.slice(0, stem.through + 1)
+                  : engine?.moves;
+              const engineActiveDepth = stem
+                ? explore && explore.depth < 0
+                  ? stem.through
+                  : null
+                : variantCursor?.plyIndex === i
+                  ? variantCursor.depth
+                  : null;
               return (
-                <Pressable
-                  key={`${p.ply}-${p.san}`}
-                  onPress={() => jumpPly(i)}
-                  style={[
-                    styles.moveChip,
-                    active && styles.moveChipActive,
-                    noted && styles.moveChipNoted,
-                  ]}
-                >
-                  <Text
-                    style={[
-                      styles.moveChipText,
-                      active && styles.moveChipTextActive,
-                    ]}
-                  >
-                    {p.side === "white" ? `${p.fullmove}. ` : ""}
-                    {p.san}
-                  </Text>
-                </Pressable>
+                <React.Fragment key={`${i}-${p.uci}`}>
+                  <HintedMoveChip
+                    label={`${p.side === "white" ? `${p.fullmove}. ` : ""}${p.san}`}
+                    active={active}
+                    noted={noted}
+                    engineFork={Boolean(engine?.moves.length)}
+                    userFork={custom.length > 0}
+                    onPress={() => jumpPly(i)}
+                  />
+                  {engineMoves?.length ? (
+                    <BranchChips
+                      moves={engineMoves}
+                      color={ENGINE_VARIANT_COLOR}
+                      openMark="("
+                      closeMark=")"
+                      activeDepth={engineActiveDepth}
+                      onPressDepth={(d) => enterVariant(i, d)}
+                    />
+                  ) : null}
+                  {showSides
+                    ? custom.map((v) => (
+                        <BranchChips
+                          key={v.id}
+                          moves={v.moves}
+                          color={GAME_LINE_COLOR}
+                          openMark="["
+                          closeMark="]"
+                          activeDepth={
+                            explore?.id === v.id ? explore.depth : null
+                          }
+                          onPressDepth={(d) => openUserVariant(v.id, d)}
+                          onDeleteDepth={
+                            explore?.id === v.id
+                              ? (d) => deleteFromUserMove(v.id, d)
+                              : undefined
+                          }
+                        />
+                      ))
+                    : null}
+                </React.Fragment>
               );
             })}
           </View>
@@ -969,92 +1590,97 @@ export function GamesScreen() {
                 pointerEvents="auto"
               >
                 <View style={styles.accuracyCard}>
-                  <View style={styles.accuracyBody}>
-                  <View style={styles.accuracyHero}>
-                    <View style={styles.accuracyHeroSide}>
-                      <OpponentAvatar
-                        platform={queryFilters.platform}
-                        username={queryFilters.username}
-                        size={48}
-                      />
-                      <Text style={styles.accuracyHeroName} numberOfLines={1}>
-                        {formatOpponentName(
-                          queryFilters.username,
-                          selectedGame.user_rating
-                        )}
+                  <ScrollView
+                    style={styles.accuracyBody}
+                    contentContainerStyle={styles.accuracyBodyContent}
+                    showsVerticalScrollIndicator={false}
+                  >
+                    <View style={styles.accuracyHero}>
+                      <View style={styles.accuracyHeroSide}>
+                        <OpponentAvatar
+                          platform={queryFilters.platform}
+                          username={queryFilters.username}
+                          size={48}
+                        />
+                        <Text style={styles.accuracyHeroName} numberOfLines={1}>
+                          {formatOpponentName(
+                            queryFilters.username,
+                            selectedGame.user_rating
+                          )}
+                        </Text>
+                        <Text style={styles.accuracyHeroPct}>
+                          {accuracyScores.user == null
+                            ? "—"
+                            : `${accuracyScores.user.toFixed(1)}%`}
+                        </Text>
+                      </View>
+                      <Text style={styles.accuracyHeroScore}>
+                        {overlayMatchScore(selectedGame.result)}
                       </Text>
-                      <Text style={styles.accuracyHeroPct}>
-                        {accuracyScores.user == null
-                          ? "—"
-                          : `${accuracyScores.user.toFixed(1)}%`}
-                      </Text>
+                      <View style={styles.accuracyHeroSide}>
+                        <OpponentAvatar
+                          platform={queryFilters.platform}
+                          username={selectedGame.opponent_name}
+                          size={48}
+                        />
+                        <Text style={styles.accuracyHeroName} numberOfLines={1}>
+                          {formatOpponentName(
+                            selectedGame.opponent_name,
+                            selectedGame.opp_rating
+                          )}
+                        </Text>
+                        <Text style={styles.accuracyHeroPct}>
+                          {accuracyScores.opp == null
+                            ? "—"
+                            : `${accuracyScores.opp.toFixed(1)}%`}
+                        </Text>
+                      </View>
                     </View>
-                    <Text style={styles.accuracyHeroScore}>
-                      {overlayMatchScore(selectedGame.result)}
-                    </Text>
-                    <View style={styles.accuracyHeroSide}>
-                      <OpponentAvatar
-                        platform={queryFilters.platform}
-                        username={selectedGame.opponent_name}
-                        size={48}
-                      />
-                      <Text style={styles.accuracyHeroName} numberOfLines={1}>
-                        {formatOpponentName(
-                          selectedGame.opponent_name,
-                          selectedGame.opp_rating
-                        )}
-                      </Text>
-                      <Text style={styles.accuracyHeroPct}>
-                        {accuracyScores.opp == null
-                          ? "—"
-                          : `${accuracyScores.opp.toFixed(1)}%`}
-                      </Text>
-                    </View>
-                  </View>
-                  <View style={styles.accuracyTable}>
-                    {COACH_MARK_ORDER.map((mark) => {
-                      const color = COACH_MARK_COLORS[mark];
-                      const you = accuracyCounts.user[mark] || 0;
-                      const opp = accuracyCounts.opp[mark] || 0;
-                      return (
-                        <View key={mark} style={styles.accuracyRow}>
-                          <Text
-                            style={[
-                              styles.accuracyNum,
-                              { color: you ? color : colors.textDisabled },
-                            ]}
-                          >
-                            {you}
-                          </Text>
-                          <View style={styles.accuracyMid}>
-                            <View style={styles.accuracyMidInner}>
-                              <Image
-                                source={COACH_MARK_SOURCES[mark]}
-                                fadeDuration={0}
-                                resizeMode="contain"
-                                style={styles.accuracyGif}
-                              />
-                              <Text
-                                style={[styles.accuracyName, { color }]}
-                                numberOfLines={1}
-                              >
-                                {COACH_MARK_LABELS[mark]}
-                              </Text>
+                    <View style={styles.accuracyTable}>
+                      {COACH_MARK_ORDER.map((mark) => {
+                        const color = COACH_MARK_COLORS[mark];
+                        const you = accuracyCounts.user[mark] || 0;
+                        const opp = accuracyCounts.opp[mark] || 0;
+                        if (you + opp === 0) return null;
+                        return (
+                          <View key={mark} style={styles.accuracyRow}>
+                            <Text
+                              style={[
+                                styles.accuracyNum,
+                                { color: you ? color : colors.textDisabled },
+                              ]}
+                            >
+                              {you}
+                            </Text>
+                            <View style={styles.accuracyMid}>
+                              <View style={styles.accuracyMidInner}>
+                                <Image
+                                  source={COACH_MARK_SOURCES[mark]}
+                                  fadeDuration={0}
+                                  resizeMode="contain"
+                                  style={styles.accuracyGif}
+                                />
+                                <Text
+                                  style={[styles.accuracyName, { color }]}
+                                  numberOfLines={1}
+                                >
+                                  {COACH_MARK_LABELS[mark]}
+                                </Text>
+                              </View>
                             </View>
+                            <Text
+                              style={[
+                                styles.accuracyNum,
+                                { color: opp ? color : colors.textDisabled },
+                              ]}
+                            >
+                              {opp}
+                            </Text>
                           </View>
-                          <Text
-                            style={[
-                              styles.accuracyNum,
-                              { color: opp ? color : colors.textDisabled },
-                            ]}
-                          >
-                            {opp}
-                          </Text>
-                        </View>
-                      );
-                    })}
-                  </View>
-                  </View>
+                        );
+                      })}
+                    </View>
+                  </ScrollView>
                   <BrutalButton
                     label="Continue"
                     onPress={() => setShowAccuracyOverlay(false)}
@@ -1089,7 +1715,10 @@ export function GamesScreen() {
               stickySectionHeadersEnabled={false}
               ListEmptyComponent={
                 listLoading ? (
-                  <ActivityIndicator color={colors.cream} style={{ marginTop: 40 }} />
+                  <View style={styles.listLoading} accessibilityRole="progressbar">
+                    <ActivityIndicator color={colors.cream} />
+                    <Text style={styles.listLoadingText}>Loading games…</Text>
+                  </View>
                 ) : (
                   <Text style={styles.emptyText}>
                     No games in this period. Adjust filters or sync from Profile.
@@ -1140,10 +1769,10 @@ export function GamesScreen() {
               )}
               ListFooterComponent={
                 listLoading && games.length ? (
-                  <ActivityIndicator
-                    color={colors.cream}
-                    style={{ marginVertical: 16 }}
-                  />
+                  <View style={styles.listLoadingMore} accessibilityRole="progressbar">
+                    <ActivityIndicator color={colors.cream} />
+                    <Text style={styles.listLoadingText}>Loading more games…</Text>
+                  </View>
                 ) : hasMore ? (
                   <View style={styles.moreRow}>
                     <BrutalButton
@@ -1171,11 +1800,12 @@ const styles = StyleSheet.create({
   gameBody: { flex: 1 },
   gameScroll: { flex: 1 },
   accuracyOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     backgroundColor: withAlpha(colors.bg, 0.88),
     justifyContent: "flex-start",
     paddingHorizontal: spacing.md,
-    paddingBottom: 120,
+    paddingTop: spacing.md,
+    paddingBottom: 96,
   },
   accuracyCard: {
     width: "100%",
@@ -1189,8 +1819,11 @@ const styles = StyleSheet.create({
   },
   accuracyBody: {
     flex: 1,
-    gap: spacing.lg,
     minHeight: 0,
+  },
+  accuracyBodyContent: {
+    gap: spacing.lg,
+    paddingBottom: spacing.xs,
   },
   accuracyHero: {
     flexDirection: "row",
@@ -1223,14 +1856,13 @@ const styles = StyleSheet.create({
     minWidth: 72,
   },
   accuracyTable: {
-    flex: 1,
-    justifyContent: "space-between",
+    gap: spacing.sm,
   },
   accuracyRow: {
-    flex: 1,
     flexDirection: "row",
     alignItems: "center",
     gap: spacing.sm,
+    minHeight: 32,
   },
   accuracyNum: {
     width: 40,
@@ -1277,6 +1909,20 @@ const styles = StyleSheet.create({
   listContent: {
     paddingHorizontal: spacing.md,
     paddingBottom: 120,
+  },
+  listLoading: {
+    alignItems: "center",
+    gap: spacing.sm,
+    marginTop: 40,
+  },
+  listLoadingMore: {
+    alignItems: "center",
+    gap: spacing.xs,
+    marginVertical: spacing.md,
+  },
+  listLoadingText: {
+    ...type.bodySmall,
+    color: colors.textMuted,
   },
   dayHeader: {
     fontFamily: font.sansMedium,
@@ -1358,7 +2004,15 @@ const styles = StyleSheet.create({
   },
   lineRank: { color: colors.textDim },
   lineEval: { color: colors.cream, fontFamily: font.monoMedium },
-  boardCard: { padding: spacing.sm, alignItems: "center" },
+  boardCard: { padding: spacing.sm, alignItems: "center", overflow: "visible" },
+  markPreload: {
+    position: "absolute",
+    width: 1,
+    height: 1,
+    opacity: 0,
+    overflow: "hidden",
+  },
+  markPreloadGif: { width: 1, height: 1 },
   navRow: {
     flexDirection: "row",
     alignItems: "center",
@@ -1434,6 +2088,9 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surface,
     borderWidth: 1,
     borderColor: colors.border,
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
   },
   moveChipActive: {
     borderColor: colors.cream,
@@ -1445,7 +2102,33 @@ const styles = StyleSheet.create({
     fontSize: type.caption.fontSize,
     color: colors.textMuted,
   },
+  moveChipLabel: { zIndex: 1 },
   moveChipTextActive: { color: colors.cream },
+  variantGroup: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    alignItems: "center",
+    gap: 4,
+  },
+  variantChipRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+  },
+  variantDelete: {
+    width: 24,
+    height: 24,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.surface,
+  },
+  variantMark: {
+    fontFamily: font.mono,
+    fontSize: type.caption.fontSize,
+    color: colors.blue,
+  },
   graphBlock: {
     marginTop: spacing.sm,
     marginBottom: spacing.md,

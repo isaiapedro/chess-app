@@ -1,6 +1,13 @@
 import { Chess } from "chess.js";
 import type { TacticalFact } from "./tacticalFact";
 import type { CoachEvent, CoachEventKind } from "./coachEvent";
+import {
+  classifyNoteTopic,
+  topicRank,
+  type NoteTopic,
+} from "./noteTopics";
+
+export const RANKED_NOTE_LIMIT = 3;
 
 export type NoteGuards = {
   tactical_kind?: string;
@@ -9,6 +16,8 @@ export type NoteGuards = {
   opp_castled?: boolean;
   structural_kind?: string;
   praise_kind?: "brilliant" | "great_find";
+  played_san?: string;
+  ply?: number;
 };
 
 export type NoteTemplate = {
@@ -23,6 +32,8 @@ export type GuardedCoachNote = {
   eventKinds: CoachEventKind[];
   guards: NoteGuards;
   template: NoteTemplate;
+  text?: string;
+  source?: string;
 };
 
 export type CoachLiveFacts = {
@@ -145,14 +156,23 @@ export function validateFactGuards(
   ) {
     return false;
   }
+  if (
+    guards.played_san !== undefined &&
+    live.playedSan !== guards.played_san
+  ) {
+    return false;
+  }
+  if (guards.ply !== undefined && live.ply !== Number(guards.ply)) {
+    return false;
+  }
   return true;
 }
 
-export function selectNote(
+export function rankNotes(
   event: CoachEvent,
   live: CoachLiveFacts,
   notes: GuardedCoachNote[]
-): GuardedCoachNote | null {
+): GuardedCoachNote[] {
   const candidates = notes.filter((note) => {
     if (!note.eventKinds?.includes(event.kind)) return false;
     if (event.kind === "tactical_blunder") {
@@ -163,11 +183,73 @@ export function selectNote(
     }
     return validateFactGuards(note.guards, live);
   });
-  if (!candidates.length) return null;
   candidates.sort((a, b) => {
     const d = countGuardMatches(b.guards) - countGuardMatches(a.guards);
     if (d) return d;
     return String(a.id).localeCompare(String(b.id));
   });
-  return candidates[0] || null;
+  return candidates;
+}
+
+export function selectNote(
+  event: CoachEvent,
+  live: CoachLiveFacts,
+  notes: GuardedCoachNote[]
+): GuardedCoachNote | null {
+  return rankNotes(event, live, notes)[0] || null;
+}
+
+export type RankedNoteDump = {
+  id: string;
+  keyId: string;
+  guards: number;
+  topic: NoteTopic;
+  selected: boolean;
+};
+
+function themesFromNote(note: GuardedCoachNote): string[] {
+  const key = note.keyId || "";
+  const parts = key.split(".").filter(Boolean);
+  return [...new Set([key, ...parts, ...(note.eventKinds || [])])];
+}
+
+function noteTopicFromTemplate(
+  note: GuardedCoachNote,
+  commentText?: string | null,
+  phase?: "opening" | "middlegame" | "endgame"
+): NoteTopic {
+  const slots = [
+    note.template?.attention,
+    note.template?.lesson,
+    note.template?.plan,
+    commentText,
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return classifyNoteTopic({
+    text: slots || note.keyId,
+    themes: themesFromNote(note),
+    phase,
+  });
+}
+
+export function describeRankedNotes(args: {
+  ranked: GuardedCoachNote[];
+  selectedId?: string | null;
+  commentText?: string | null;
+  phase?: "opening" | "middlegame" | "endgame";
+  limit?: number;
+}): { notes: RankedNoteDump[]; topics: NoteTopic[] } {
+  const limit = args.limit ?? RANKED_NOTE_LIMIT;
+  const notes = args.ranked.slice(0, limit).map((note, i) => ({
+    id: note.id,
+    keyId: note.keyId,
+    guards: countGuardMatches(note.guards),
+    topic: noteTopicFromTemplate(note, i === 0 ? args.commentText : null, args.phase),
+    selected: Boolean(args.selectedId && note.id === args.selectedId),
+  }));
+  const topics = [...new Set(notes.map((n) => n.topic))].sort(
+    (a, b) => topicRank(a) - topicRank(b)
+  );
+  return { notes, topics };
 }

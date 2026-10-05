@@ -1,4 +1,3 @@
-import Constants from "expo-constants";
 import React, { useCallback, useEffect, useMemo, useState } from "react";
 import {
   Image,
@@ -30,6 +29,7 @@ import {
 } from "../components/ui";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
+import { agentLog } from "../debug/agentLog";
 import {
   normalizeSpeed,
   peerGamesPlayedCaption,
@@ -52,35 +52,6 @@ const COMPARISON_ICONS: Record<string, LucideIcon> = {
   weight: Weight,
   clapperboard: Clapperboard,
 };
-
-function debugRecapLog(
-  message: string,
-  hypothesisId: string,
-  data: Record<string, unknown>
-) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "month-freeze",
-      hypothesisId,
-      location: "RecapScreen.tsx",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-}
 
 const STREAK_OUTLINE_COLOR = "#7C2D12";
 
@@ -106,8 +77,8 @@ function streakTypeSize(n: number): {
   if (n >= 100)
     return { fontSize: 16, lineHeight: 16, letterSpacing: -0.5, outlinePx: 1 };
   if (n >= 10)
-    return { fontSize: 20, lineHeight: 20, letterSpacing: -0.3, outlinePx: 2 };
-  return { fontSize: 26, lineHeight: 26, letterSpacing: -0.3, outlinePx: 2 };
+    return { fontSize: 20, lineHeight: 20, letterSpacing: -0.3, outlinePx: 1.5 };
+  return { fontSize: 23, lineHeight: 23, letterSpacing: -0.3, outlinePx: 1.5 };
 }
 
 const PERIOD_NOUN: Record<Period, string> = {
@@ -150,7 +121,7 @@ export function RecapScreen() {
   useEffect(() => {
     setActiveBadge(0);
     setError(null);
-    debugRecapLog("recap load start", "H2", {
+    agentLog("H2", "RecapScreen:load", "recap load start", {
       period,
       forceNetwork: false,
       user: queryFilters.username,
@@ -159,7 +130,7 @@ export function RecapScreen() {
 
   useEffect(() => {
     if (!data) return;
-    debugRecapLog("recap done", "H2", {
+    agentLog("H2", "RecapScreen:load", "recap done", {
       games: data?.meta?.games_count,
       runId: "post-fix",
     });
@@ -263,6 +234,7 @@ export function RecapScreen() {
       loadKey={loadKey}
       contentReady={contentReady}
       period={period}
+      loadingLabel="Loading recap…"
       error={!!(error && !data)}
       skeleton={<RecapSkeleton />}
       errorNode={
@@ -308,9 +280,9 @@ export function RecapScreen() {
 
       <View style={styles.peakRow}>
         <View style={styles.peakMain}>
-          <Text style={styles.peakLabel}>Peak Rating</Text>
+          <Text style={styles.peakLabel}>Current Rating</Text>
           <View style={styles.peakValueRow}>
-            <Text style={styles.peakValue}>{view.peakRating ?? "—"}</Text>
+            <Text style={styles.peakValue}>{view.currentRating ?? "—"}</Text>
             {view.ratingChange != null ? (
               <Pill color={view.ratingChange >= 0 ? result.win : result.loss}>
                 {view.ratingChange >= 0 ? "+" : ""}
@@ -366,6 +338,7 @@ export function RecapScreen() {
           points={view.ratingSeries}
           curves={view.ratingCurves}
           period={period}
+          color={view.ratingColor}
         />
         {period === "year" || period === "all" ? (
           <MonthlyGamesChart points={view.monthlyActivity} />
@@ -473,7 +446,7 @@ const styles = StyleSheet.create({
   heroPieceWrap: {
     width: 90,
     height: 90,
-    marginTop: 5,
+    marginTop: 17,
     alignItems: "center",
     justifyContent: "flex-start",
     alignSelf: "flex-start",
@@ -533,7 +506,7 @@ const styles = StyleSheet.create({
     bottom: 0,
     alignItems: "center",
     justifyContent: "center",
-    paddingTop: 8,
+    paddingTop: 12,
     overflow: "visible",
     zIndex: 2,
   },

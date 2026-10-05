@@ -338,7 +338,8 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         void refreshVaultMetrics(list, { force: true });
         return;
       }
-      // Warm focus: skip remesh when snapshots already complete (avoid double work).
+      // A complete phase snapshot can still be missing the opening mix that gates
+      // Insights. Remesh it without repeating the heuristic pass.
       const op = openingPhase;
       const mp = middlegamePhase;
       const ep = endgamePhase;
@@ -349,8 +350,13 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
         (op.totalGames === 0 || op.analyzedCount >= op.totalGames) &&
         (mp.totalGames === 0 || mp.analyzedCount >= mp.totalGames) &&
         (ep.totalGames === 0 || ep.analyzedCount >= ep.totalGames);
-      if (complete) return;
-      void refreshVaultRemesh(list);
+      if (complete) {
+        void refreshVaultRemesh(list);
+        return;
+      }
+      // No complete snapshot means the store has games that still need a
+      // heuristic pass; a remesh alone cannot advance the measured count.
+      void refreshVaultMetrics(list, { force: false });
     },
     [
       refreshVaultMetrics,
@@ -695,11 +701,20 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
           filterPeriodGamesBySpeed(softPeriod, queryFilters.speed)
         );
         const softHasGames = softView.length > 0;
+        // Session data is cached per period (all speeds). When a speed filter is
+        // active, derive its dependent cards locally from the same filtered game
+        // list so the first render cannot pair filtered games with all-speed stats.
+        const softRecap = queryFilters.speed
+          ? buildLocalRecap(queryFilters, softView as NormalizedGame[])
+          : soft.recap;
+        const softInsights = queryFilters.speed
+          ? buildLocalInsights(queryFilters, softView as NormalizedGame[])
+          : soft.insights;
         if (softHasGames) {
           gamesRef.current = softView;
           setGames(softView);
-          setRecap(soft.recap);
-          setInsights(soft.insights);
+          setRecap(softRecap);
+          setInsights(softInsights);
           setGamesLoading(false);
           hydratedPeriodKeyRef.current = periodKey;
           lastStyleRefreshKey.current = viewKey;
@@ -755,8 +770,8 @@ export function AnalyticsProvider({ children }: { children: React.ReactNode }) {
             }
           );
         } else {
-          setRecap(soft.recap);
-          setInsights(soft.insights);
+          setRecap(softRecap);
+          setInsights(softInsights);
           setGamesLoading(false);
           hydratedPeriodKeyRef.current = periodKey;
           setOpeningPhaseLoading(false);

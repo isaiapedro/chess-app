@@ -26,6 +26,7 @@ import {
   type GlobalAnalysisProgress,
   type GlobalAnalysisState,
 } from "./globalAnalysis";
+import { waitForPrefetchGate } from "./backgroundWork";
 import {
   capMistakeMoments,
   filterUnsolvedMoments,
@@ -350,6 +351,15 @@ export async function prefetchStudyContent(options: {
   }
   if (signal.cancelled) return;
   activePrefetchSignal = signal;
+  onProgress?.({
+    status: "Waiting for local metrics…",
+    phase: "boot",
+    gamesDone: 0,
+    gamesTotal: 0,
+    engine: ENGINE_LABEL,
+  });
+  await waitForPrefetchGate();
+  if (signal.cancelled) return;
 
   const loaded = await ensureStudyGames(filters, false);
   if (signal.cancelled) return;

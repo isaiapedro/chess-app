@@ -1,0 +1,11 @@
+FASE 1
+comentarios relacionam o que aconteceu na partida
+conferir metricas
+
+FASE 2
+arrumar pagina inicial
+modificar analise
+
+FASE 3
+polir carregamentos e detalhes de UI
+publicar nas lojas virtuais

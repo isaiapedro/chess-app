@@ -1,4 +1,3 @@
-import Constants from "expo-constants";
 import React, { useMemo, useState } from "react";
 import {
   Modal,
@@ -10,6 +9,7 @@ import {
 } from "react-native";
 import { useAnalytics } from "../context/AnalyticsContext";
 import { useFilters } from "../context/FilterContext";
+import { agentLog } from "../debug/agentLog";
 import { extractMoveTimesFromPgn } from "../engine/clockFromPgn";
 import type { StudyGame } from "../engine/analyzeMistakes";
 import { DEBUG_DISABLE_STYLE_METRICS } from "../engine/debugFlags";
@@ -36,6 +36,7 @@ import { peerImpactColor } from "../data/metricPolarity";
 import { Info, X } from "lucide-react-native";
 import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
+import { MetricPanelLoading } from "./LoadingSkeletons";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 const EVAL_DEPENDENT_METRICS = new Set([
@@ -48,33 +49,6 @@ const EVAL_DEPENDENT_METRICS = new Set([
   "Comebacks",
   "Blunders",
 ]);
-
-function debugStyleLog(data: Record<string, unknown>) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  const runId = String(data.runId || "traits-timing");
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId,
-      hypothesisId: "H-traits",
-      location: "StyleOfPlayPanel.tsx",
-      message: "style/traits",
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  console.log("[traits] style/traits", data);
-  // #endregion
-}
 
 type MetricRow = {
   name: string;
@@ -789,6 +763,7 @@ export function StyleOfPlayPanel() {
     gamesLoading,
     mix,
     style,
+    styleScanned,
     styleTotal,
     styleComplete,
     baselines,
@@ -819,7 +794,7 @@ export function StyleOfPlayPanel() {
     () => clockFallbackFromGames(games),
     [games]
   );
-  const loading = gamesLoading && !mix && !style;
+  const loading = !styleComplete && !mix && !style && (gamesLoading || games.length > 0);
   const [helpContent, setHelpContent] = useState<{
     title: string;
     summary: string;
@@ -867,7 +842,7 @@ export function StyleOfPlayPanel() {
       avgTimeFallback: clockFallback.avg_time_per_move_s,
     });
     // #region agent log
-    debugStyleLog({
+    agentLog("H-traits", "StyleOfPlayPanel", "style/traits", {
       phase: "radar-useMemo",
       styleGames: style.games,
       scoreCount: axes.length,
@@ -933,6 +908,16 @@ export function StyleOfPlayPanel() {
       <Text style={styles.hint}>
         Style metrics calculation disabled (debug). Background Stockfish scan can still run.
       </Text>
+    );
+  }
+
+  if (loading) {
+    return (
+      <MetricPanelLoading
+        label="Loading style metrics…"
+        completed={styleScanned}
+        total={styleTotal || games.length}
+      />
     );
   }
 

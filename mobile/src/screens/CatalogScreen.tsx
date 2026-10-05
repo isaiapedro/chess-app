@@ -9,9 +9,12 @@ import {
   Text,
   View,
 } from "react-native";
-import Constants from "expo-constants";
 import { selectMetricsCatalog } from "../api/selectors";
 import type { CatalogMetric, CatalogSection, InsightsResponse } from "../api/types";
+import {
+  AnalyticsScanBanner,
+  EvalPendingWarning,
+} from "../components/AnalyticsScanBanner";
 import { countOpeningCatalogBanners } from "../components/OpeningInsightsPanel";
 import { countMiddlegameCatalogBanners } from "../components/MiddlegameInsightsPanel";
 import { useAnalytics } from "../context/AnalyticsContext";
@@ -27,6 +30,7 @@ import {
   SectionLabel,
 } from "../components/ui";
 import { useInsightsNav } from "../context/InsightsNavContext";
+import { agentLog } from "../debug/agentLog";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type Props = {
@@ -35,31 +39,6 @@ type Props = {
 };
 
 const FADE_IN_MS = 240;
-
-function debugNavLog(message: string, data: Record<string, unknown>) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "insights-nav",
-      hypothesisId: "H-nav",
-      location: "CatalogScreen.tsx",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  // #endregion
-}
 
 export function CatalogScreen({ data, onBack }: Props) {
   const [search, setSearch] = useState("");
@@ -79,20 +58,12 @@ export function CatalogScreen({ data, onBack }: Props) {
   const { setDepth, registerPopHandler } = useInsightsNav();
   const activeSectionRef = useRef(activeSection);
   const onBackRef = useRef(onBack);
-  const contentOpacity = useRef(new Animated.Value(0)).current;
+  // The catalog is local, synchronous UI. Starting it transparent made an
+  // interrupted mount indistinguishable from a frozen black screen.
+  const contentOpacity = useRef(new Animated.Value(1)).current;
   const transitioningRef = useRef(false);
   activeSectionRef.current = activeSection;
   onBackRef.current = onBack;
-
-  useEffect(() => {
-    contentOpacity.setValue(0);
-    Animated.timing(contentOpacity, {
-      toValue: 1,
-      duration: FADE_IN_MS,
-      easing: Easing.out(Easing.cubic),
-      useNativeDriver: true,
-    }).start();
-  }, [contentOpacity]);
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase();
@@ -147,7 +118,7 @@ export function CatalogScreen({ data, onBack }: Props) {
   const finishPopRef = useRef((): boolean => false);
   finishPopRef.current = (): boolean => {
     if (activeSectionRef.current) {
-      debugNavLog("pop to metrics catalog", {
+      agentLog("H-nav", "CatalogScreen:pop", "pop to metrics catalog", {
         from: activeSectionRef.current,
       });
       return runFadeTransition(
@@ -158,7 +129,7 @@ export function CatalogScreen({ data, onBack }: Props) {
         { fadeIn: true }
       );
     }
-    debugNavLog("pop to performance analysis", {});
+    agentLog("H-nav", "CatalogScreen:pop", "pop to performance analysis", {});
     return runFadeTransition(
       () => {
         onBackRef.current();
@@ -174,7 +145,7 @@ export function CatalogScreen({ data, onBack }: Props) {
     const depth = activeSection ? 2 : 1;
     setDepth(depth);
     registerPopHandler(() => animatePopRef.current());
-    debugNavLog("catalog depth", { depth, section: activeSection });
+    agentLog("H-nav", "CatalogScreen:depth", "catalog depth", { depth, section: activeSection });
     return () => {
       registerPopHandler(null);
     };
@@ -187,7 +158,7 @@ export function CatalogScreen({ data, onBack }: Props) {
       onPanResponderRelease: (_evt, gesture) => {
         const shouldPop = gesture.dx > 96 || gesture.vx > 0.55;
         if (shouldPop) {
-          debugNavLog("swipe right pop", {
+          agentLog("H-nav", "CatalogScreen:gesture", "swipe right pop", {
             dx: gesture.dx,
             section: activeSectionRef.current,
           });
@@ -307,6 +278,8 @@ export function CatalogScreen({ data, onBack }: Props) {
               </>
             ) : null}
           </View>
+          <AnalyticsScanBanner mode="overlay" />
+          <EvalPendingWarning />
           {activeSection ? detailBody : categoriesBody}
         </ScrollView>
       </Animated.View>

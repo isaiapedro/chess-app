@@ -348,6 +348,7 @@ export function selectRecapView(
     peakRating: rating.peak,
     currentRating: rating.current,
     ratingChange: rating.change,
+    ratingColor: speed ? FORMAT_COLORS[speed] || colors.sage : colors.sage,
     currentWinStreak: Number(headline.current_win_streak || 0),
     results,
     stats: [
@@ -377,9 +378,9 @@ export function selectRecapView(
               : "Estimated play time",
       },
       {
-        label: "Moves Made",
-        value: Number(headline.total_moves || 0).toLocaleString(),
-        sub: `Undefeated streak ${headline.max_unbeaten_streak ?? 0}`,
+        label: "Peak Rating",
+        value: rating.peak == null ? "—" : String(rating.peak),
+        sub: `Biggest Streak ${headline.max_unbeaten_streak ?? 0}`,
       },
     ],
     ratingSeries: buildEvenRatingSeries(data.rating_series || [], period),

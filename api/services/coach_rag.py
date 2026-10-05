@@ -43,6 +43,9 @@ def retrieve_coach_nuggets(
     eco: str | None = None,
     opening: str | None = None,
     want_count: int = 2,
+    narrative: str | None = None,
+    tactical_kind: str | None = None,
+    tactical_head: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Soft-fail vector retrieve from chess-coach Chroma.
@@ -65,6 +68,9 @@ def retrieve_coach_nuggets(
             eco=eco or "",
             opening=opening or "",
             want_count=max(1, min(int(want_count or 2), 4)),
+            narrative=narrative or "",
+            tactical_kind=tactical_kind or "",
+            tactical_head=tactical_head or "",
         )
         return passages_to_nuggets(passages)
     except Exception:

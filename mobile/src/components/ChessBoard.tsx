@@ -4,18 +4,20 @@ import {
   Easing,
   Image,
   LayoutChangeEvent,
-  Pressable,
+  PanResponder,
   StyleSheet,
   Text,
   View,
+  type GestureResponderEvent,
   type ImageSourcePropType,
 } from "react-native";
 import Svg, { Path } from "react-native-svg";
 import { Chess, Square } from "chess.js";
 import { tryMove, uciFromMove } from "../engine/chessMoves";
 import { AppIcon } from "../icons";
-import { colors, font, radius, withAlpha } from "../theme";
-import { Crown, Skull } from "lucide-react-native";
+import { colors, font, radius, result, withAlpha } from "../theme";
+import { Crown, Handshake, Skull } from "lucide-react-native";
+import type { LucideIcon } from "lucide-react-native";
 import {
   ALPHA_PIECES,
   ALPHA_VIEWBOX,
@@ -26,7 +28,22 @@ const FILES = ["a", "b", "c", "d", "e", "f", "g", "h"] as const;
 const FILES_BLACK = ["h", "g", "f", "e", "d", "c", "b", "a"] as const;
 const RANKS_WHITE = [8, 7, 6, 5, 4, 3, 2, 1] as const;
 const RANKS_BLACK = [1, 2, 3, 4, 5, 6, 7, 8] as const;
-const MOVE_ANIM_MS = 176;
+export const MOVE_ANIM_MS = 176;
+const KING_BADGE_FILL_MS = 240;
+const KING_BADGE_HOLD_MS = 360;
+const KING_BADGE_FLY_MS = 480;
+
+const KING_BADGE_FILL = {
+  win: colors.sageMuted,
+  loss: colors.redMuted,
+  draw: result.draw,
+} as const;
+
+const KING_BADGE_ICON: Record<"win" | "loss" | "draw", LucideIcon> = {
+  win: Crown,
+  loss: Skull,
+  draw: Handshake,
+};
 
 type Props = {
   fen: string;
@@ -39,9 +56,15 @@ type Props = {
   markSource?: ImageSourcePropType | null;
   markKey?: string | null;
   animateUci?: string | null;
+  animateReverse?: boolean;
+  animateSteps?: Array<{ uci: string; reverse?: boolean; fen: string }> | null;
   onAnimateEnd?: () => void;
   arrowUci?: string | null;
-  kingBadge?: "win" | "loss" | null;
+  arrowColor?: string;
+  onArrowPress?: () => void;
+  kingBadge?: "win" | "loss" | "draw" | null;
+  kingBadgeUser?: "white" | "black";
+  rimColor?: string | null;
 };
 
 function parseUciSquares(uci?: string | null): { from: Square; to: Square } | null {
@@ -97,6 +120,20 @@ function squareTopLeft(
   const rankIdx = ranks.findIndex((r) => r === Number(sq[1]));
   if (fileIdx < 0 || rankIdx < 0) return null;
   return { x: fileIdx * sqSize, y: rankIdx * sqSize };
+}
+
+function arrowHitBox(
+  from: { x: number; y: number },
+  to: { x: number; y: number },
+  sqSize: number
+): { left: number; top: number; width: number; height: number } {
+  const pad = sqSize * 0.45;
+  return {
+    left: Math.min(from.x, to.x) - pad,
+    top: Math.min(from.y, to.y) - pad,
+    width: Math.abs(to.x - from.x) + sqSize + pad * 2,
+    height: Math.abs(to.y - from.y) + sqSize + pad * 2,
+  };
 }
 
 function arrowPath(
@@ -170,32 +207,76 @@ export function ChessBoard({
   markSource,
   markKey,
   animateUci,
+  animateReverse = false,
+  animateSteps = null,
   onAnimateEnd,
   arrowUci,
+  arrowColor,
+  onArrowPress,
   kingBadge,
+  kingBadgeUser,
+  rimColor,
 }: Props) {
   const [size, setSize] = useState(320);
+  const [boardLaidOut, setBoardLaidOut] = useState(false);
   const [selected, setSelected] = useState<Square | null>(null);
   const flyXY = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
   const rookXY = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
   const flyGen = useRef(0);
+  const kingFillOp = useRef(new Animated.Value(0)).current;
+  const kingIconOp = useRef(new Animated.Value(0)).current;
+  const kingIconScale = useRef(new Animated.Value(0.18)).current;
+  const kingIconXY = useRef(new Animated.ValueXY({ x: 0, y: 0 })).current;
+  const kingBadgeGen = useRef(0);
   const onAnimateEndRef = useRef(onAnimateEnd);
   onAnimateEndRef.current = onAnimateEnd;
   const prevFenRef = useRef(fen);
-  const settledFenRef = useRef(fen);
-  const lastAnimUciRef = useRef<string | null>(null);
+  const playRef = useRef<{
+    key: string;
+    startFen: string;
+    steps: Array<{ uci: string; reverse?: boolean; fen: string }>;
+    index: number;
+  }>({ key: "", startFen: fen, steps: [], index: 0 });
+  const [animTick, setAnimTick] = useState(0);
 
-  const parsedAnim = parseUciSquares(animateUci);
-  if (!parsedAnim) {
-    settledFenRef.current = fen;
-    lastAnimUciRef.current = null;
-  } else if (lastAnimUciRef.current !== animateUci) {
-    settledFenRef.current = prevFenRef.current;
-    lastAnimUciRef.current = animateUci ?? null;
+  const resolvedSteps =
+    animateSteps && animateSteps.length
+      ? animateSteps
+      : animateUci
+        ? [{ uci: animateUci, reverse: animateReverse, fen }]
+        : [];
+  const stepsKey = resolvedSteps
+    .map((s) => `${s.reverse ? "r" : "f"}:${s.uci}:${s.fen}`)
+    .join("|");
+  if (stepsKey !== playRef.current.key) {
+    playRef.current = {
+      key: stepsKey,
+      startFen: prevFenRef.current,
+      steps: resolvedSteps,
+      index: 0,
+    };
   }
   prevFenRef.current = fen;
-  const animating = Boolean(parsedAnim && settledFenRef.current !== fen);
-  const displayFen = animating ? settledFenRef.current : fen;
+  const play = playRef.current;
+  const currentStep =
+    play.index < play.steps.length ? play.steps[play.index] : null;
+  const parsedOrig = parseUciSquares(currentStep?.uci);
+  const displayFen = !play.steps.length
+    ? fen
+    : play.index >= play.steps.length
+      ? fen
+      : play.index === 0
+        ? play.startFen
+        : play.steps[play.index - 1]?.fen || fen;
+  const animating = Boolean(
+    parsedOrig && currentStep && displayFen !== currentStep.fen
+  );
+  const parsedAnim = parsedOrig
+    ? currentStep?.reverse
+      ? { from: parsedOrig.to, to: parsedOrig.from }
+      : parsedOrig
+    : null;
+  void animTick;
 
   useEffect(() => {
     setSelected(null);
@@ -214,7 +295,10 @@ export function ChessBoard({
 
   const onLayout = (e: LayoutChangeEvent) => {
     const w = e.nativeEvent.layout.width;
-    if (w > 0) setSize(w);
+    if (w > 0) {
+      setSize(w);
+      setBoardLaidOut(true);
+    }
   };
 
   const sqSize = size / 8;
@@ -227,19 +311,27 @@ export function ChessBoard({
   const flyPieceKey = flyPiece
     ? (`${flyPiece.color}${flyPiece.type.toUpperCase()}` as AlphaPieceKey)
     : null;
-  const rookSq =
-    flyFrom && flyTo
-      ? castleRookSquares(flyFrom, flyTo, flyPiece?.type)
+  const rookOrig =
+    parsedOrig && flyPiece
+      ? castleRookSquares(parsedOrig.from, parsedOrig.to, flyPiece.type)
       : null;
-  const rookFrom = rookSq?.from ?? null;
-  const rookTo = rookSq?.to ?? null;
+  const rookFrom = rookOrig
+    ? currentStep?.reverse
+      ? rookOrig.to
+      : rookOrig.from
+    : null;
+  const rookTo = rookOrig
+    ? currentStep?.reverse
+      ? rookOrig.from
+      : rookOrig.to
+    : null;
   const rookPiece = rookFrom ? chess.get(rookFrom) : null;
   const rookPieceKey =
     rookPiece?.type === "r"
       ? (`${rookPiece.color}${rookPiece.type.toUpperCase()}` as AlphaPieceKey)
       : null;
   const captureSq =
-    flyFrom && flyTo
+    flyFrom && flyTo && !currentStep?.reverse
       ? enPassantCaptureSq(
           flyFrom,
           flyTo,
@@ -252,17 +344,25 @@ export function ChessBoard({
   );
 
   useLayoutEffect(() => {
-    if (!animating || !flyFrom || !flyTo || !flyPieceKey || sqSize <= 0) {
+    if (!animating || sqSize <= 0) {
       flyGen.current += 1;
       flyXY.stopAnimation();
       rookXY.stopAnimation();
       return;
     }
+    if (!flyFrom || !flyTo || !flyPieceKey) {
+      playRef.current.index += 1;
+      if (playRef.current.index >= playRef.current.steps.length) {
+        onAnimateEndRef.current?.();
+      }
+      setAnimTick((n) => n + 1);
+      return;
+    }
     const from = squareTopLeft(flyFrom, files, ranks, sqSize);
     const to = squareTopLeft(flyTo, files, ranks, sqSize);
     if (!from || !to) {
-      settledFenRef.current = fen;
-      lastAnimUciRef.current = null;
+      playRef.current.index = playRef.current.steps.length;
+      setAnimTick((n) => n + 1);
       onAnimateEndRef.current?.();
       return;
     }
@@ -294,9 +394,12 @@ export function ChessBoard({
     }
     Animated.parallel(runs).start(({ finished }) => {
       if (gen !== flyGen.current) return;
-      settledFenRef.current = fen;
-      lastAnimUciRef.current = null;
-      if (finished) onAnimateEndRef.current?.();
+      if (!finished) return;
+      playRef.current.index += 1;
+      if (playRef.current.index >= playRef.current.steps.length) {
+        onAnimateEndRef.current?.();
+      }
+      setAnimTick((n) => n + 1);
     });
     return () => {
       flyGen.current += 1;
@@ -317,6 +420,7 @@ export function ChessBoard({
     rookTo,
     rookXY,
     sqSize,
+    animTick,
   ]);
 
   const fromHi = highlightUci?.slice(0, 2) as Square | undefined;
@@ -335,23 +439,115 @@ export function ChessBoard({
     !!markSource &&
     markFileIdx >= 0 &&
     markRankIdx >= 0 &&
-    (!animating
-      ? true
-      : Boolean(flyPieceKey) &&
-        markUci != null &&
-        animateUci != null &&
-        markUci.slice(0, 4) === animateUci.slice(0, 4));
+    (!animating ||
+      Boolean(
+        currentStep &&
+          !currentStep.reverse &&
+          markUci &&
+          markUci.slice(0, 4) === currentStep.uci.slice(0, 4)
+      ));
 
-  const kingColor = orientation === "white" ? "w" : "b";
-  const kingSq =
-    kingBadge && !animating ? findKingSquare(chess, kingColor) : null;
-  const kingFileIdx =
-    kingSq != null ? files.findIndex((f) => f === kingSq[0]) : -1;
-  const kingRankIdx =
-    kingSq != null ? ranks.findIndex((r) => r === Number(kingSq[1])) : -1;
-  const showKingBadge =
-    Boolean(kingBadge) && kingFileIdx >= 0 && kingRankIdx >= 0;
-  const kingBadgeSize = sqSize * 0.38;
+  const kingUser = kingBadgeUser ?? orientation;
+  const kingSides: ("w" | "b")[] =
+    !kingBadge || animating
+      ? []
+      : kingBadge === "draw"
+        ? ["w", "b"]
+        : [kingUser === "black" ? "b" : "w"];
+  const kingSquares = kingSides
+    .map((side) => findKingSquare(chess, side))
+    .filter((sq): sq is Square => sq != null);
+  const kingFillSet = new Set(kingSquares);
+  const flyKingSq =
+    kingBadge && !animating
+      ? findKingSquare(chess, kingUser === "black" ? "b" : "w")
+      : null;
+  const flyKingPos =
+    flyKingSq && sqSize > 0
+      ? squareTopLeft(flyKingSq, files, ranks, sqSize)
+      : null;
+  const showKingBadge = Boolean(kingBadge && flyKingPos && boardLaidOut);
+  const kingFillColor = kingBadge ? KING_BADGE_FILL[kingBadge] : result.draw;
+  const kingBadgeIcon = kingBadge ? KING_BADGE_ICON[kingBadge] : Crown;
+
+  useLayoutEffect(() => {
+    if (!showKingBadge || !flyKingPos || sqSize <= 0) {
+      kingBadgeGen.current += 1;
+      kingFillOp.stopAnimation();
+      kingIconOp.stopAnimation();
+      kingIconScale.stopAnimation();
+      kingIconXY.stopAnimation();
+      kingFillOp.setValue(0);
+      kingIconOp.setValue(0);
+      kingIconScale.setValue(0.18);
+      kingIconXY.setValue({ x: 0, y: 0 });
+      return;
+    }
+    const gen = ++kingBadgeGen.current;
+    const restScale = markSize / sqSize;
+    const toX = sqSize / 2;
+    const toY = -sqSize / 2;
+    kingFillOp.setValue(0);
+    kingIconOp.setValue(0);
+    kingIconScale.setValue(0.18);
+    kingIconXY.setValue({ x: 0, y: 0 });
+    Animated.sequence([
+      Animated.parallel([
+        Animated.timing(kingFillOp, {
+          toValue: 0.72,
+          duration: KING_BADGE_FILL_MS,
+          easing: Easing.out(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.timing(kingIconOp, {
+          toValue: 1,
+          duration: KING_BADGE_FILL_MS,
+          easing: Easing.out(Easing.quad),
+          useNativeDriver: true,
+        }),
+        Animated.spring(kingIconScale, {
+          toValue: 1,
+          friction: 7,
+          tension: 86,
+          useNativeDriver: true,
+        }),
+      ]),
+      Animated.delay(KING_BADGE_HOLD_MS),
+      Animated.parallel([
+        Animated.timing(kingIconXY, {
+          toValue: { x: toX, y: toY },
+          duration: KING_BADGE_FLY_MS,
+          easing: Easing.inOut(Easing.cubic),
+          useNativeDriver: true,
+        }),
+        Animated.timing(kingIconScale, {
+          toValue: restScale,
+          duration: KING_BADGE_FLY_MS,
+          easing: Easing.inOut(Easing.cubic),
+          useNativeDriver: true,
+        }),
+      ]),
+    ]).start(({ finished }) => {
+      if (!finished || gen !== kingBadgeGen.current) return;
+    });
+    return () => {
+      kingBadgeGen.current += 1;
+      kingFillOp.stopAnimation();
+      kingIconOp.stopAnimation();
+      kingIconScale.stopAnimation();
+      kingIconXY.stopAnimation();
+    };
+  }, [
+    flyKingSq,
+    kingFillOp,
+    kingIconOp,
+    kingIconScale,
+    kingIconXY,
+    markSize,
+    orientation,
+    showKingBadge,
+    sqSize,
+  ]);
 
   const arrowParsed = !animating ? parseUciSquares(arrowUci) : null;
   const arrowFrom = arrowParsed
@@ -387,51 +583,172 @@ export function ChessBoard({
     return targets;
   }, [chess, selected]);
 
-  const commitMove = (from: Square, to: Square) => {
-    const moveResult = tryMove(fen, from, to);
-    if (moveResult) {
-      onMove?.(uciFromMove(moveResult), moveResult.san, moveResult.after);
+  const selectedRef = useRef(selected);
+  selectedRef.current = selected;
+  const interactiveRef = useRef(interactive);
+  interactiveRef.current = interactive;
+  const animatingRef = useRef(animating);
+  animatingRef.current = animating;
+  const fenRef = useRef(fen);
+  fenRef.current = fen;
+  const chessRef = useRef(chess);
+  chessRef.current = chess;
+  const filesRef = useRef(files);
+  filesRef.current = files;
+  const ranksRef = useRef(ranks);
+  ranksRef.current = ranks;
+  const sqSizeRef = useRef(sqSize);
+  sqSizeRef.current = sqSize;
+  const legalTargetsRef = useRef(legalTargets);
+  legalTargetsRef.current = legalTargets;
+  const onMoveRef = useRef(onMove);
+  onMoveRef.current = onMove;
+  const onArrowPressRef = useRef(onArrowPress);
+  onArrowPressRef.current = onArrowPress;
+  const arrowFromRef = useRef(arrowFrom);
+  arrowFromRef.current = arrowFrom;
+  const arrowToRef = useRef(arrowTo);
+  arrowToRef.current = arrowTo;
+
+  const tapStartSqRef = useRef<Square | null>(null);
+  const tapMovedRef = useRef(false);
+
+  const pointToSquare = (x: number, y: number): Square | null => {
+    const s = sqSizeRef.current;
+    if (s <= 0) return null;
+    const fileIdx = Math.floor(x / s);
+    const rankIdx = Math.floor(y / s);
+    const fl = filesRef.current;
+    const rk = ranksRef.current;
+    if (fileIdx < 0 || fileIdx >= fl.length || rankIdx < 0 || rankIdx >= rk.length) {
+      return null;
     }
+    return `${fl[fileIdx]}${rk[rankIdx]}` as Square;
+  };
+
+  const inArrowHit = (x: number, y: number): boolean => {
+    const from = arrowFromRef.current;
+    const to = arrowToRef.current;
+    const s = sqSizeRef.current;
+    if (!from || !to || !onArrowPressRef.current) return false;
+    const box = arrowHitBox(from, to, s);
+    return (
+      x >= box.left &&
+      x <= box.left + box.width &&
+      y >= box.top &&
+      y <= box.top + box.height
+    );
+  };
+
+  const playFromTo = (from: Square, to: Square): boolean => {
+    const moveResult = tryMove(fenRef.current, from, to);
+    if (!moveResult) return false;
+    onMoveRef.current?.(uciFromMove(moveResult), moveResult.san, moveResult.after);
+    selectedRef.current = null;
+    setSelected(null);
+    return true;
+  };
+
+  const chooseSquare = (sq: Square) => {
+    selectedRef.current = sq;
+    setSelected(sq);
+  };
+
+  const clearChoice = () => {
+    selectedRef.current = null;
     setSelected(null);
   };
 
-  const handlePress = (sq: Square) => {
-    if (!interactive) return;
-    const piece = chess.get(sq);
-
-    if (!selected) {
-      if (piece && piece.color === chess.turn()) {
-        setSelected(sq);
-      }
+  const tapSquare = (sq: Square) => {
+    const ch = chessRef.current;
+    const piece = ch.get(sq);
+    const sel = selectedRef.current;
+    if (!sel) {
+      if (piece && piece.color === ch.turn()) chooseSquare(sq);
       return;
     }
-
-    if (selected === sq) {
-      setSelected(null);
+    if (sel === sq) {
+      clearChoice();
       return;
     }
-
-    const selectedPiece = chess.get(selected);
+    const selectedPiece = ch.get(sel);
     if (
       piece &&
-      piece.color === chess.turn() &&
+      piece.color === ch.turn() &&
       !(
         selectedPiece?.type === "k" &&
         piece.type === "r" &&
-        legalTargets.has(sq)
+        legalTargetsRef.current.has(sq)
       )
     ) {
-      setSelected(sq);
+      chooseSquare(sq);
       return;
     }
-
-    commitMove(selected, sq);
+    playFromTo(sel, sq) || clearChoice();
   };
+
+  const eventPoint = (e: GestureResponderEvent) => ({
+    x: e.nativeEvent.locationX,
+    y: e.nativeEvent.locationY,
+  });
+
+  const panResponder = useRef(
+    PanResponder.create({
+      onStartShouldSetPanResponder: (e) => {
+        if (!interactiveRef.current || animatingRef.current) return false;
+        const { x, y } = eventPoint(e);
+        const sq = pointToSquare(x, y);
+        if (!sq) return inArrowHit(x, y);
+        const piece = chessRef.current.get(sq);
+        const sel = selectedRef.current;
+        if (piece && piece.color === chessRef.current.turn()) return true;
+        if (sel && (sel === sq || legalTargetsRef.current.has(sq))) return true;
+        return inArrowHit(x, y);
+      },
+      onMoveShouldSetPanResponder: () => false,
+      onPanResponderTerminationRequest: () => true,
+      onShouldBlockNativeResponder: () => false,
+      onPanResponderGrant: (e) => {
+        const { x, y } = eventPoint(e);
+        tapStartSqRef.current = pointToSquare(x, y);
+        tapMovedRef.current = false;
+      },
+      onPanResponderMove: (_e, g) => {
+        if (Math.hypot(g.dx, g.dy) >= 10) tapMovedRef.current = true;
+      },
+      onPanResponderRelease: (e) => {
+        const start = tapStartSqRef.current;
+        const moved = tapMovedRef.current;
+        const { x, y } = eventPoint(e);
+        tapStartSqRef.current = null;
+        tapMovedRef.current = false;
+        if (moved) return;
+        if (start) {
+          tapSquare(start);
+          return;
+        }
+        if (inArrowHit(x, y)) onArrowPressRef.current?.();
+      },
+      onPanResponderTerminate: () => {
+        tapStartSqRef.current = null;
+        tapMovedRef.current = false;
+      },
+    })
+  ).current;
+
+  const arrowFill = withAlpha(arrowColor || colors.sage, 0.4);
 
   return (
     <View style={styles.wrap} onLayout={onLayout}>
-      <View style={[styles.boardShadow]}>
-        <View style={[styles.board, { width: size, height: size }]}>
+      <View style={styles.boardShadow}>
+        <View
+          style={[
+            styles.board,
+            { width: size, height: size },
+          ]}
+          {...panResponder.panHandlers}
+        >
+          <View pointerEvents="none">
           {ranks.map((rank, rankIdx) => (
             <View key={`r${rank}`} style={styles.row}>
               {files.map((file, fileIdx) => {
@@ -447,9 +764,8 @@ export function ChessBoard({
                   !isHi && (sq === fromGuess || sq === toGuess);
                 const isLight = (fileIdx + rankIdx) % 2 === 0;
                 return (
-                  <Pressable
+                  <View
                     key={sq}
-                    onPress={() => handlePress(sq)}
                     style={[
                       styles.square,
                       {
@@ -462,6 +778,19 @@ export function ChessBoard({
                       isHi && styles.highlight,
                     ]}
                   >
+                    {kingFillSet.has(sq) ? (
+                      <Animated.View
+                        pointerEvents="none"
+                        collapsable={false}
+                        style={[
+                          styles.kingFill,
+                          {
+                            backgroundColor: kingFillColor,
+                            opacity: kingFillOp,
+                          },
+                        ]}
+                      />
+                    ) : null}
                     {isTarget && !piece ? <View style={styles.dot} /> : null}
                     {isTarget && piece ? <View style={styles.captureRing} /> : null}
                     {pieceKey && !hideSq.has(sq) ? (
@@ -489,19 +818,20 @@ export function ChessBoard({
                         {file}
                       </Text>
                     ) : null}
-                  </Pressable>
+                  </View>
                 );
               })}
             </View>
           ))}
-          {arrowD ? (
+          </View>
+          {arrowD && arrowFrom && arrowTo ? (
             <Svg
               pointerEvents="none"
               width={size}
               height={size}
               style={styles.overlay}
             >
-              <Path d={arrowD} fill={withAlpha(colors.sage, 0.4)} />
+              <Path d={arrowD} fill={arrowFill} />
             </Svg>
           ) : null}
           {animating && flyPieceKey ? (
@@ -537,9 +867,14 @@ export function ChessBoard({
             </Animated.View>
           ) : null}
         </View>
-        {showMark ? (
+        {rimColor ? (
           <View
-            key={markKey || `${markUci}:${String(markSource)}`}
+            pointerEvents="none"
+            style={[styles.boardRim, { borderColor: rimColor }]}
+          />
+        ) : null}
+        {markSource && markFileIdx >= 0 && markRankIdx >= 0 ? (
+          <View
             pointerEvents="none"
             style={[
               styles.sqMark,
@@ -549,12 +884,13 @@ export function ChessBoard({
                 borderRadius: markSize / 2,
                 left: markFileIdx * sqSize + sqSize - markSize / 2,
                 top: markRankIdx * sqSize - markSize / 2,
+                opacity: showMark ? 1 : 0,
               },
             ]}
           >
             <Image
-              key={markKey || `${markUci}:${String(markSource)}`}
-              source={markSource!}
+              key={markKey || String(markSource)}
+              source={markSource}
               fadeDuration={0}
               resizeMode="contain"
               style={{
@@ -565,27 +901,34 @@ export function ChessBoard({
             />
           </View>
         ) : null}
-        {showKingBadge ? (
-          <View
+        {showKingBadge && flyKingPos ? (
+          <Animated.View
             pointerEvents="none"
+            collapsable={false}
             style={[
               styles.kingBadge,
               {
-                width: kingBadgeSize,
-                height: kingBadgeSize,
-                left:
-                  kingFileIdx * sqSize + (sqSize - kingBadgeSize) / 2,
-                top: kingRankIdx * sqSize - kingBadgeSize * 0.28,
+                width: sqSize,
+                height: sqSize,
+                borderRadius: sqSize / 2,
+                left: flyKingPos.x,
+                top: flyKingPos.y,
+                backgroundColor: kingFillColor,
+                opacity: kingIconOp,
+                transform: [
+                  ...kingIconXY.getTranslateTransform(),
+                  { scale: kingIconScale },
+                ],
               },
             ]}
           >
             <AppIcon
-              icon={kingBadge === "win" ? Crown : Skull}
-              size={kingBadgeSize * 0.78}
-              color={kingBadge === "win" ? colors.sage : colors.red}
+              icon={kingBadgeIcon}
+              size={sqSize * 0.58}
+              color={colors.cream}
               bold
             />
-          </View>
+          </Animated.View>
         ) : null}
       </View>
     </View>
@@ -596,6 +939,7 @@ const styles = StyleSheet.create({
   wrap: {
     width: "100%",
     alignItems: "center",
+    overflow: "visible",
   },
   boardShadow: {
     backgroundColor: "transparent",
@@ -606,6 +950,12 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
     overflow: "hidden",
     backgroundColor: colors.boardDark,
+  },
+  boardRim: {
+    ...StyleSheet.absoluteFill,
+    borderRadius: radius.md,
+    borderWidth: 3,
+    zIndex: 10,
   },
   row: {
     flexDirection: "row",
@@ -648,21 +998,25 @@ const styles = StyleSheet.create({
     backgroundColor: withAlpha(colors.red, 0.45),
   },
   captureRing: {
-    ...StyleSheet.absoluteFillObject,
+    ...StyleSheet.absoluteFill,
     borderRadius: radius.xs,
     borderWidth: 3,
     borderColor: withAlpha(colors.red, 0.55),
   },
   sqMark: {
     position: "absolute",
-    zIndex: 8,
+    zIndex: 11,
     overflow: "hidden",
+  },
+  kingFill: {
+    ...StyleSheet.absoluteFill,
   },
   kingBadge: {
     position: "absolute",
     zIndex: 9,
     alignItems: "center",
     justifyContent: "center",
+    overflow: "hidden",
   },
   overlay: {
     position: "absolute",

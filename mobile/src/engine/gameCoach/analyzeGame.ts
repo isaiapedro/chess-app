@@ -26,12 +26,16 @@ import {
 } from "../globalAnalysis";
 import { upsertHeuristicGame } from "../../storage/analyticsLoaders";
 import type { MistakeItem } from "../../api/client";
+import { getApiBase } from "../../api/client";
 import {
   classifyCoachMark,
+  buildTopLineVsPlayed,
   captureDest,
   coachMissedFromPending,
   COACH_MARKS_KEEP_OVER_BOOK,
+  mergeRestampedCoachMark,
   type CoachMark,
+  type TopLineVsPlayed,
 } from "./coachMarkClassify";
 import { mergeMultiPvGapLines, rankLinesByStm } from "./tacticSharpness";
 import { userWinProbability, WP_INACCURACY_DROP } from "../winProb";
@@ -71,6 +75,7 @@ import {
 import { attachCoachComment } from "./attachCoachComment";
 import { CoachSilenceManager } from "./coachSilence";
 import { loadNotesSchema } from "./loadNotesSchema";
+import { resolveLlmComments, type CoachLlmPayload } from "./llmComment";
 import {
   emptyGamePlanState,
   advanceGamePlan,
@@ -157,6 +162,8 @@ export type GameCoachPly = {
   fenAfter: string;
   evalBeforeCp: number | null;
   evalAfterCp: number | null;
+  /** Player-POV engine comparison used for praise and cache-safe restamping. */
+  topLineVsPlayed: TopLineVsPlayed | null;
   deltaCp: number;
   bestSan: string | null;
   bestPvSan: string[];
@@ -164,6 +171,7 @@ export type GameCoachPly = {
   note: string;
   analyzed: boolean;
   mark: CoachMark | null;
+  noteSource?: "llm" | "stitch" | "catalog";
   /** Coach-moment refs the note actually uses (filtered). */
   noteRefs?: CommentRefs | null;
 };
@@ -823,6 +831,7 @@ export async function analyzeSelectedGame(options: {
   retrieveKnowledge?: VectorRetrieveFn;
   onProgress?: (p: AnalyzeProgress) => void;
   signal?: { cancelled: boolean };
+  useLlmComments?: boolean;
 }): Promise<GameCoachResult> {
   void options.retrieveKnowledge;
   const depth = options.depth ?? COACH_ANALYZE_DEPTH;
@@ -856,6 +865,13 @@ export async function analyzeSelectedGame(options: {
   const selectedNotes: string[] = [];
   const commentSilence = new CoachSilenceManager();
   const structureThemeUsed = new Set<string>();
+  const pendingLlm: Array<{
+    ply: GameCoachPly;
+    tip: KeyTip;
+    noteIndex: number;
+    payload: CoachLlmPayload;
+    noteRefArgs: Omit<Parameters<typeof buildCommentRefs>[0], "tipText">;
+  }> = [];
 
   // ——— Pass A: recalculate heuristics + bundled peers (tips later) ———
   options.onProgress?.({
@@ -1080,6 +1096,7 @@ export async function analyzeSelectedGame(options: {
     let bestSan: string | null = null;
     let bestPvSan: string[] = [];
     let lines: EngineLine[] = [];
+    let topLineVsPlayed: TopLineVsPlayed | null = null;
     let deltaCp = 0;
     let note = "";
     let analyzed = false;
@@ -1145,6 +1162,16 @@ export async function analyzeSelectedGame(options: {
       }
 
       let playedBest = sameMove(sk.fenBefore, sk.san, bestSan);
+      topLineVsPlayed = buildTopLineVsPlayed({
+        side: sk.side,
+        topLineSan: bestSan || lines[0]?.san || null,
+        playedSan: sk.san,
+        topLineCpWhite: evalBefore ?? lines[0]?.cpWhite ?? null,
+        playedCpWhite: evalAfter,
+        fenBefore: sk.fenBefore,
+        lines,
+        playedBest,
+      });
       if (isUserPly) userPlyCount += 1;
 
       let missedOpportunity = false;
@@ -1182,8 +1209,11 @@ export async function analyzeSelectedGame(options: {
               evalAfterCp: evalAfter,
               playedBest,
               lines,
+              topLineVsPlayed,
               fenBefore: sk.fenBefore,
               playedSan: sk.san,
+              opponentReplySan: skeleton[i + 1]?.san || null,
+              userReplySan: skeleton[i + 2]?.san || null,
               missedOpportunity: isUserPly ? missedOpportunity : false,
               prevCaptureTo: i > 0 ? captureDest(skeleton[i - 1].fenBefore, skeleton[i - 1].san) : null,
             })
@@ -1291,6 +1321,16 @@ export async function analyzeSelectedGame(options: {
         }
 
         playedBest = sameMove(sk.fenBefore, sk.san, bestSan);
+        topLineVsPlayed = buildTopLineVsPlayed({
+          side: sk.side,
+          topLineSan: bestSan || lines[0]?.san || null,
+          playedSan: sk.san,
+          topLineCpWhite: evalBefore ?? lines[0]?.cpWhite ?? null,
+          playedCpWhite: evalAfter,
+          fenBefore: sk.fenBefore,
+          lines,
+          playedBest,
+        });
       };
 
       let usedStrongEngine = false;
@@ -1318,8 +1358,11 @@ export async function analyzeSelectedGame(options: {
           evalAfterCp: evalAfter,
           playedBest,
           lines,
+          topLineVsPlayed,
           fenBefore: sk.fenBefore,
           playedSan: sk.san,
+          opponentReplySan: skeleton[i + 1]?.san || null,
+          userReplySan: skeleton[i + 2]?.san || null,
           missedOpportunity,
           prevCaptureTo: i > 0 ? captureDest(skeleton[i - 1].fenBefore, skeleton[i - 1].san) : null,
         });
@@ -1745,6 +1788,7 @@ export async function analyzeSelectedGame(options: {
       ...sk,
       evalBeforeCp: evalBefore,
       evalAfterCp: evalAfter,
+      topLineVsPlayed,
       deltaCp,
       bestSan,
       bestPvSan,
@@ -2057,6 +2101,11 @@ export async function analyzeSelectedGame(options: {
       playedSan: ply.san,
       notes: notesSchema,
       silence: commentSilence,
+      phase,
+      inputs: {
+        ...(moment?.inputs || {}),
+        ...(noteRequest?.inputs || {}),
+      },
     });
     if (!attached) continue;
     gamePlan = markPlanKeysTaught(gamePlan, [attached.note.keyId]);
@@ -2069,17 +2118,21 @@ export async function analyzeSelectedGame(options: {
       };
     }
     ply.note = attached.text;
-    ply.noteRefs = buildCommentRefs({
-      tipText: attached.text,
-      keyIds: [attached.note.keyId],
+    ply.noteSource = "catalog";
+    const noteRefArgs = {
+      keyIds: [attached.note.keyId] as string[],
       tipMeta: {
         softKeys: [attached.note.keyId],
-        metrics: [],
-        clauses: [],
-        topics: [attached.event.kind],
+        metrics: [] as string[],
+        clauses: [] as string[],
+        topics: attached.topics,
       },
-      weightTop: [],
-      softKeysPool: [attached.note.keyId],
+      weightTop: attached.noteDump.map((n) => ({
+        keyId: n.keyId,
+        weight: n.guards,
+        formatted: `${n.id} guards=${n.guards} topic=${n.topic}`,
+      })),
+      softKeysPool: [attached.note.keyId] as string[],
       inputs: {
         ...(moment?.inputs || {}),
         ...(noteRequest?.inputs || {}),
@@ -2087,9 +2140,13 @@ export async function analyzeSelectedGame(options: {
       situations: noteRequest?.situations || null,
       tacticalFact: noteRequest?.tacticalFact || null,
       primaryField,
-      primarySoftKeys: [attached.note.keyId],
+      primarySoftKeys: [attached.note.keyId] as string[],
+    };
+    ply.noteRefs = buildCommentRefs({
+      tipText: attached.text,
+      ...noteRefArgs,
     });
-    usedKeyTips.push({
+    const tip: KeyTip = {
       keyId: attached.note.keyId,
       keyIds: [attached.note.keyId],
       keyType: attached.note.keyId.split(".")[0] || "motif",
@@ -2099,9 +2156,42 @@ export async function analyzeSelectedGame(options: {
       score: attached.event.tier,
       noteId: attached.note.id,
       phase,
-    });
+    };
+    usedKeyTips.push(tip);
     selectedNotes.push(attached.text);
+    pendingLlm.push({
+      ply,
+      tip,
+      noteIndex: selectedNotes.length - 1,
+      payload: attached.llmPayload,
+      noteRefArgs,
+    });
     for (const t of structure) structureThemeUsed.add(t);
+  }
+
+  if (pendingLlm.length && options.useLlmComments !== false) {
+    options.onProgress?.({
+      ply: skeleton.length,
+      total: skeleton.length,
+      status: `Writing coach comments (${pendingLlm.length})…`,
+    });
+    const resolved = await resolveLlmComments(
+      pendingLlm.map((p) => p.payload),
+      pendingLlm.map((p) => p.ply.note),
+      { apiBase: getApiBase() }
+    );
+    for (let i = 0; i < pendingLlm.length; i += 1) {
+      const item = pendingLlm[i]!;
+      const text = resolved.texts[i] || item.ply.note;
+      item.ply.note = text;
+      item.ply.noteSource = resolved.sources[i] || "catalog";
+      item.tip.text = text;
+      selectedNotes[item.noteIndex] = text;
+      item.ply.noteRefs = buildCommentRefs({
+        tipText: text,
+        ...item.noteRefArgs,
+      });
+    }
   }
 
   if (plies.length) {
@@ -2181,23 +2271,42 @@ export async function analyzeSelectedGame(options: {
 export function stampAccuracyMarks(plies: GameCoachPly[]): GameCoachPly[] {
   let changed = false;
   const next = plies.map((ply, i) => {
-    if (ply.mark != null) return ply;
-    if (ply.evalBeforeCp == null || ply.evalAfterCp == null) return ply;
     const playedBest = sameMove(ply.fenBefore, ply.san, ply.bestSan);
+    const topLineVsPlayed = buildTopLineVsPlayed({
+      side: ply.side,
+      topLineSan: ply.bestSan || ply.lines[0]?.san || null,
+      playedSan: ply.san,
+      topLineCpWhite: ply.evalBeforeCp ?? ply.lines[0]?.cpWhite ?? null,
+      playedCpWhite: ply.evalAfterCp,
+      fenBefore: ply.fenBefore,
+      lines: ply.lines,
+      playedBest,
+    });
+    if (ply.evalBeforeCp == null || ply.evalAfterCp == null) {
+      if (topLineVsPlayed === ply.topLineVsPlayed) return ply;
+      changed = true;
+      return { ...ply, topLineVsPlayed };
+    }
     const prev = i > 0 ? plies[i - 1] : null;
-    const mark = classifyCoachMark({
+    const recomputed = classifyCoachMark({
       side: ply.side,
       evalBeforeCp: ply.evalBeforeCp,
       evalAfterCp: ply.evalAfterCp,
       playedBest,
       lines: ply.lines,
+      topLineVsPlayed,
       fenBefore: ply.fenBefore,
       playedSan: ply.san,
+      opponentReplySan: plies[i + 1]?.san || null,
+      userReplySan: plies[i + 2]?.san || null,
       prevCaptureTo: prev ? captureDest(prev.fenBefore, prev.san) : null,
     });
-    if (!mark) return ply;
+    const mark = mergeRestampedCoachMark(ply.mark, recomputed);
+    if (mark === ply.mark && topLineVsPlayed === ply.topLineVsPlayed) {
+      return ply;
+    }
     changed = true;
-    return { ...ply, mark };
+    return { ...ply, topLineVsPlayed, mark };
   });
   return changed ? next : plies;
 }
@@ -2207,6 +2316,7 @@ export function buildReplayPlies(pgnOrMoves: string): GameCoachPly[] {
     ...p,
     evalBeforeCp: null,
     evalAfterCp: null,
+    topLineVsPlayed: null,
     deltaCp: 0,
     bestSan: null,
     bestPvSan: [],

@@ -27,12 +27,10 @@ function sacrificeOfferAfterMove(boardAfter, move, color) {
   return 0;
 }
 
-/** Mirrors coachMarks brilliantSacrifice WP gates (no RN import). */
-function brilliantWpOk(wpBefore, wpAfter) {
-  if (wpBefore >= 0.85) return false;
-  if (wpAfter < 0.2) return false;
-  if (wpBefore < 0.25 && wpAfter < 0.45) return false;
-  return true;
+/** Mirrors the universal Brilliant comparison gates (no RN import). */
+function brilliantComparisonOk(topLineWp, playedWp) {
+  if (playedWp < 0.1) return false;
+  return Math.max(0, topLineWp - playedWp) <= 0.1;
 }
 
 function assert(cond, msg) {
@@ -69,18 +67,16 @@ function tryMove(board, san) {
   assert(offered === 0, `Nxc6 equal trade must be 0, got ${offered}`);
 }
 
-// Lost + still lost after sac → not brilliant.
-assert(!brilliantWpOk(0.1, 0.22), "lost→still-lost must reject");
-assert(!brilliantWpOk(0.1, 0.4), "lost→below-equal must reject");
-assert(brilliantWpOk(0.1, 0.45), "lost→equal must allow");
-assert(brilliantWpOk(0.4, 0.35), "not-lost small drop ok if after≥0.2");
-assert(!brilliantWpOk(0.9, 0.5), "already-winning must reject");
+assert(!brilliantComparisonOk(0.1, 0.09), "completely lost after move must reject");
+assert(brilliantComparisonOk(0.2, 0.1), "exact 10pp gap and 10% floor must allow");
+assert(brilliantComparisonOk(0.4, 0.35), "small top-line gap must allow");
 
 function brilliantDropOk(wpDrop) {
-  return wpDrop < 0.05;
+  return wpDrop <= 0.1;
 }
 assert(brilliantDropOk(0.023), "PV2 sac 2.3pp drop still brilliant");
-assert(!brilliantDropOk(0.05), "inaccuracy drop not brilliant");
+assert(brilliantDropOk(0.1), "exact 10pp drop still brilliant");
+assert(!brilliantDropOk(0.101), "greater-than-10pp drop not brilliant");
 
 {
   const board = new Chess(

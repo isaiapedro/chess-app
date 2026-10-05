@@ -26,6 +26,7 @@ import {
 import { Info, X } from "lucide-react-native";
 import { AppIcon } from "../icons";
 import { EdgeCard, SectionLabel } from "./ui";
+import { MetricPanelLoading } from "./LoadingSkeletons";
 import { colors, font, radius, result, spacing, type, withAlpha } from "../theme";
 
 type MetricScale =
@@ -610,7 +611,13 @@ export function EndgameInsightsPanel() {
   );
 
   if (!agg && (gamesLoading || endgamePhaseLoading)) {
-    return <Text style={styles.hint}>Loading endgame metrics…</Text>;
+    return (
+      <MetricPanelLoading
+        label="Loading endgame metrics…"
+        completed={endgamePhase?.analyzedCount ?? 0}
+        total={endgamePhase?.totalGames ?? games.length}
+      />
+    );
   }
   if (!gamesLoading && games.length <= 0 && !agg) {
     return <Text style={styles.hint}>No games in this filter set.</Text>;

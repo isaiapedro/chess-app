@@ -1,7 +1,7 @@
 import { PERMANENT_CACHE_TTL_MS, readCache, writeCache } from "../../storage/cache";
 import type { GameCoachResult } from "./analyzeGame";
 
-export const GAME_COACH_CACHE_VERSION = "v168";
+export const GAME_COACH_CACHE_VERSION = "v170";
 
 export function gameCoachAnalysisCacheKey(
   platform: string,

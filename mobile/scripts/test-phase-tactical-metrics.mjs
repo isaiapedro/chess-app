@@ -81,10 +81,17 @@ import {
 } from "../src/engine/gameCoach/coachSilence.ts";
 import {
   selectNote,
+  rankNotes,
+  describeRankedNotes,
   buildLiveFacts,
   kingIsCastled,
 } from "../src/engine/gameCoach/noteGuards.ts";
 import { loadNotesSchema } from "../src/engine/gameCoach/loadNotesSchema.ts";
+import { composeComment } from "../src/engine/gameCoach/commentComposer.ts";
+import {
+  stitchCoachComment,
+  commentIsConcrete,
+} from "../src/engine/gameCoach/llmComment.ts";
 import {
   FEATURE_POLARITY_MATCH,
   METRIC_POLARITY_MATCH,
@@ -2304,6 +2311,17 @@ function play(fen, san) {
     picked.keyId === "motif.trapped_piece",
     `winning keyId must stay trapped_piece, got ${picked.keyId}`
   );
+  const ranked = rankNotes(eventTrap, liveTrap, notes);
+  assert(ranked[0]?.id === picked.id, "rankNotes[0] must match selectNote");
+  assert(ranked.length >= 1, "rankNotes must list passing notes");
+  const dump = describeRankedNotes({
+    ranked: ranked.slice(0, 3),
+    selectedId: picked.id,
+    commentText: "Your knight on d2 has no escape.",
+  });
+  assert(dump.notes.length <= 3, "dump must cap at 3 notes");
+  assert(dump.notes[0]?.selected, "winner must be marked selected");
+  assert(dump.topics.length >= 1, "dump must list topics");
 
   const slotText = formatTacticalSlotComment({
     note: trapNote,
@@ -2535,6 +2553,78 @@ function testCoach3Stage() {
     silence: unique,
   });
   assert(!trapTwice, "second motif.trapped_piece in the same game must mute");
+
+  const generated = {
+    id: "generated:motif.trapped_piece#exact",
+    keyId: "motif.trapped_piece",
+    eventKinds: ["tactical_blunder"],
+    guards: { tactical_kind: "trapped_piece", self_inflicted: true, played_san: "h4" },
+    text: "{playedSan} leaves your {piece} on {square} trapped. Best was {bestSan}.",
+    template: { attention: "{playedSan} leaves your {piece} on {square} trapped." },
+  };
+  const liveGen = buildLiveFacts({
+    ply: 37,
+    fen: startFen,
+    userColor: "white",
+    dropCp: 343,
+    bestSan: "Re1",
+    playedSan: "h4",
+    tacticalFact: trapFact,
+  });
+  const eventGen = classifyMoment({
+    mark: "blunder",
+    dropCp: 343,
+    tacticalFact: trapFact,
+  });
+  const llmText = composeComment(generated, eventGen, liveGen);
+  assert(
+    /h4/.test(llmText) && /knight/.test(llmText) && /Re1/.test(llmText),
+    `prewritten LLM text must interpolate board facts, got ${llmText}`
+  );
+  assert(
+    !/forcing replies/i.test(llmText),
+    "prewritten comment must not fall back to generic filler"
+  );
+  assert(
+    selectNote(eventGen, liveGen, [generated])?.id === generated.id,
+    "played_san guard must accept matching SAN"
+  );
+  assert(
+    !selectNote(
+      eventGen,
+      { ...liveGen, playedSan: "a3" },
+      [generated]
+    ),
+    "played_san guard must reject a different move"
+  );
+
+  const stitched = stitchCoachComment({
+    ply: 37,
+    playedMove: "h4",
+    bestMove: "Re1",
+    mark: "blunder",
+    dropCp: 343,
+    tacticalHead: "Your knight on d2 has no escape.",
+    tacticalKind: "trapped_piece",
+    selfInflicted: true,
+    whyBetter: "save the knight",
+    playedLine: null,
+    engineLine: null,
+    playedImpact: null,
+    technicalRule: null,
+    structuralKind: null,
+    praiseMark: null,
+    piece: "knight",
+    square: "d2",
+    keyId: "motif.trapped_piece",
+    eventKind: "tactical_blunder",
+    task: "mistake",
+  });
+  assert(/h4/.test(stitched) && /knight on d2/.test(stitched) && /Re1/.test(stitched),
+    `stitch must name the board fact, got ${stitched}`);
+  assert(commentIsConcrete(stitched), "stitched comment must pass the concrete filter");
+  assert(!commentIsConcrete("Compare forcing replies before committing."),
+    "generic filler must fail the concrete filter");
 }
 
 

@@ -1,6 +1,6 @@
 import { Chess, type Move } from "chess.js";
-import Constants from "expo-constants";
 import type { MistakeItem, QueryFilters } from "../api/client";
+import { agentLog } from "../debug/agentLog";
 import {
   loadLocalGamesPage,
   toStudyGameList,
@@ -28,37 +28,6 @@ import {
 import { waitForPuzzleIdle, yieldForUi } from "./backgroundWork";
 import { DEBUG_DISABLE_STYLE_METRICS } from "./debugFlags";
 
-function debugScanLog(
-  message: string,
-  hypothesisId: string,
-  data: Record<string, unknown>
-) {
-  // #region agent log
-  const hostUri =
-    Constants.expoConfig?.hostUri ||
-    Constants.linkingUri?.replace(/^exp:\/\//, "").replace(/\/.*$/, "");
-  const host = hostUri?.split(":")[0] || "127.0.0.1";
-  fetch(`http://${host}:7677/ingest/217f9228-6275-432a-b240-b52166a932e5`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      "X-Debug-Session-Id": "6d2375",
-    },
-    body: JSON.stringify({
-      sessionId: "6d2375",
-      runId: "traits-timing",
-      hypothesisId,
-      location: "globalAnalysis.ts",
-      message,
-      data,
-      timestamp: Date.now(),
-    }),
-  }).catch(() => {});
-  if (hypothesisId === "H-traits") {
-    console.log(`[traits] ${message}`, data);
-  }
-  // #endregion
-}
 import {
   clampCp,
   toWhiteCp,
@@ -682,14 +651,12 @@ export async function resolveStyleMetricsForPeriod(options: {
     await writeCache(studyStyleCacheKey(filters), fromVault.style);
     onPartial?.(fromVault.style, fromVault.scanned, fromVault.total);
   }
-  // #region agent log
-  debugScanLog("style from vault bucket", "H-style", {
+  agentLog("H-style", "globalAnalysis:styleFromVault", "style from vault bucket", {
     total: fromVault.total,
     scanned: fromVault.scanned,
     styleGames: fromVault.style?.games ?? 0,
     periodComplete: fromVault.periodComplete,
   });
-  // #endregion
   return fromVault;
 }
 
@@ -885,8 +852,7 @@ async function scanOneGame(
   };
   const style = styleSession ? styleScanFinalize(styleSession, extras) : null;
 
-  // #region agent log
-  debugScanLog("scanOneGame done", "H1", {
+  agentLog("H1", "globalAnalysis:scanOneGame", "scanOneGame done", {
     gameId: String(game.id).slice(0, 12),
     plies: sans.length,
     evalCalls,
@@ -895,7 +861,6 @@ async function scanOneGame(
     style: Boolean(style),
     fused: true,
   });
-  // #endregion
 
   return {
     gameId: String(game.id),
@@ -1180,8 +1145,7 @@ export async function runGlobalPeriodAnalysis(options: {
     const total = games.length;
     const periodIds = games.map((g) => String(g.id));
     const cachedCount = games.filter((g) => vault.games[String(g.id)]).length;
-    // #region agent log
-    debugScanLog("global analysis start", "H1", {
+    agentLog("H1", "globalAnalysis:start", "global analysis start", {
       total,
       cachedCount,
       max: scanLimit,
@@ -1189,7 +1153,6 @@ export async function runGlobalPeriodAnalysis(options: {
       owner,
       user: filters.username,
     });
-    // #endregion
 
     const report = (
       status: string,
